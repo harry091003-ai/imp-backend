@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>incident-management-platform</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>Incident Management Platform</name>
+    <description>Microservices-based incident management platform</description>
+
+    <modules>
+        <module>shared-events</module>
+        <module>common-security</module>
+        <module>AuthService</module>
+        <module>UserService</module>
+        <module>APIGateway</module>
+        <module>Eureka</module>
+    </modules>
+<!--central configuration for all microservices-->
+    <properties>
+        <java.version>21</java.version>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <spring-boot.version>3.5.11</spring-boot.version>
+        <spring-cloud.version>2025.0.1</spring-cloud.version>
+    </properties>
+
+</project>
+

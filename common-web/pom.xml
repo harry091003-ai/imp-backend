@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Spring Boot parent, kept on the SAME version as the services (3.5.11).
+         Note: common-security is still on 3.3.2 - that drift is a known issue and is
+         deliberately NOT repeated here. -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.11</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.project.web</groupId>
+    <artifactId>common-web</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>common-web</name>
+    <description>Shared HTTP error-handling contract: exception family, ErrorResponse shape,
+        global @RestControllerAdvice and traceId filter. Used by all Spring MVC services.</description>
+
+    <properties>
+        <!-- IMPORTANT: compiled for Java 17, not 21.
+             Ai-Service still targets Java 17. A library compiled for 21 CANNOT be read by a
+             module compiling against 17 ("class file has wrong version"). Targeting 17 here
+             makes this module usable by every service (** 17 bytecode runs fine on a 21 JVM **).
+             When Ai-Service is moved to Java 21, this can be raised to 21. -->
+        <maven.compiler.release>17</maven.compiler.release>
+        <lombok.version>1.18.38</lombok.version>
+    </properties>
+
+    <dependencies>
+
+        <!-- All dependencies below are 'provided': this module needs them to COMPILE, but every
+             consuming service already brings its own copy at runtime. Keeping them non-transitive
+             stops this library from dragging the servlet web stack into anything that shouldn't
+             have it (e.g. the reactive APIGateway). -->
+
+        <!-- @RestControllerAdvice, ResponseEntity, MethodArgumentNotValidException,
+             HttpMessageNotReadableException, MethodArgumentTypeMismatchException -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- jakarta.validation ConstraintViolationException -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Spring Security AccessDeniedException (thrown by @PreAuthorize) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- org.springframework.dao.DataIntegrityViolationException lives in spring-tx -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-tx</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- HttpServletRequest, used by TraceIdFilter -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>${lombok.version}</version>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Needed by GlobalExceptionHandlerTest, which locks down the error contract
+             (status codes, JSON field names, and that unexpected exceptions do not leak
+             their message). Runs with MockMvc standalone - no database, Kafka or Eureka.
+             test scope = never ends up in the jar, adds nothing to any service at runtime. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

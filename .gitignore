@@ -1,0 +1,69 @@
+# =============================================================================
+# Incident Management Platform - root .gitignore
+#
+# This repo is LOCAL ONLY. It has no remote and is not meant to get one.
+# Its purpose is an undo button and a readable diff of every change.
+#
+# That second purpose is why this file matters: ~750 MB of build output lives
+# under the target/ folders. If those were tracked, every "git diff" would be
+# unreadable and the repo would be useless for reviewing changes.
+# =============================================================================
+
+# --- Maven build output (~750 MB across 11 modules) --------------------------
+target/
+# The negations below are inherited from the Spring Initializr templates: they
+# stop the rule above from accidentally ignoring a real source folder that
+# happens to be called "target".
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+# --- IntelliJ ----------------------------------------------------------------
+# IntelliJ's own compile output at the project root.
+out/
+# .idea/ holds per-machine state (window layout, local run configs, caches).
+# It changes constantly and would add noise to every diff.
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# --- Other IDEs ---------------------------------------------------------------
+.vscode/
+.classpath
+.project
+.settings/
+.apt_generated/
+.factorypath
+.springBeans
+.sts4-cache/
+
+# --- Maven wrapper -----------------------------------------------------------
+# NOTE: this project uses distributionType=only-script, so no jar exists today.
+# The rule is kept in case a future wrapper upgrade starts downloading one.
+# mvnw, mvnw.cmd and .mvn/wrapper/maven-wrapper.properties MUST stay tracked.
+.mvn/wrapper/maven-wrapper.jar
+
+# --- Secrets ------------------------------------------------------------------
+# This project reads ${user}, ${password}, ${secretkey} and ${apikey} from real
+# environment variables, so there is nothing to ignore yet. These rules exist so
+# that IF a .env file is ever added, it cannot be committed by accident.
+.env
+.env.*
+*.env
+!.env.example
+
+# --- Logs and runtime noise ---------------------------------------------------
+*.log
+logs/
+*.pid
+
+# --- OS files -----------------------------------------------------------------
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Scratch ------------------------------------------------------------------
+# Ad hoc scripts and scratch files that are not part of the build.
+*.tmp
+*.bak
+scratch/

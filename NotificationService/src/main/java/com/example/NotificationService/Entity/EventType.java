@@ -1,0 +1,12 @@
+package com.example.NotificationService.Entity;
+
+public enum EventType {
+    INCIDENT_CREATED,
+    INCIDENT_STATUS_UPDATED,
+    INCIDENT_METADATA_UPDATED,
+    INCIDENT_ASSIGNED,
+    INCIDENT_RESOLVED,
+    INCIDENT_REOPENED,
+    USER_REGISTERED,
+    USER_UPDATED
+}
