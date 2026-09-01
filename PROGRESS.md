@@ -1,394 +1,591 @@
-# PROGRESS.md — Modernization Tracker
+# PROGRESS.md — What we are fixing in this project
 
-> This project has **no git**. This file is the source of truth for what has been decided,
-> what is done, and what is pending. Read this file first in any new session before touching
-> code. Update it — Status + Change Log — every time work actually lands.
->
-> Companion file: [CLAUDE.md](CLAUDE.md) describes the codebase as it currently is (stack,
-> conventions, domain model, full catalogue of known issues). This file tracks the **plan to
-> fix things**, in order, with status.
+**Read this file first when you come back to this project.**
 
-Last updated: 2026-08-28 · 
+It says three things:
+1. What we already fixed.
+2. What we have not fixed yet.
+3. Why we made each choice.
 
----
+Other files that go with this one:
+- `CLAUDE.md` — what the code looks like today, and a list of known problems.
+- `BUGS-TO-FIX-LATER.md` — problems we found but chose not to fix yet.
+- `FLYWAY-NOTES.md` — how database migrations work here.
+- `ERROR_HANDLING_FLOW.md` — how errors work here.
 
-## Ground rules for this engagement
-
-1. **No code changes without an explicit go-ahead on the item being worked.** Understanding
-   and planning happens first; this file gets updated with the plan before any file is touched.
-2. **No git/GitHub.** Every session, for every file changed, I must explicitly tell the user:
-   which file, what changed, and why — with enough detail that they could review it like a
-   diff, since there is no diff tool doing that for them. This is not optional politeness,
-   it's the only review mechanism this project has.
-3. Work proceeds **one numbered track item at a time**, in the order agreed below. Don't jump
-   ahead to a later item because it looks easy or related — surface it and ask instead.
-4. This file's **Status table** and **Change Log** are the durable record. CLAUDE.md's
-   "Known issues" section (§9) should get its matching item marked resolved/superseded when a
-   track item ships — don't let the two documents contradict each other.
+Last updated: 2026-09-01
 
 ---
 
-## Track A — in progress now
+## Where we are right now
 
-Agreed order: **A1 → A2 → A4**. A3 is explicitly deferred (see below).
+| Task | What it is | Status |
+|---|---|---|
+| A1 | Error handling | ✅ Done — 2026-08-28 |
+| A2 | Database migrations (Flyway) | ✅ Done — 2026-09-01 |
+| A3 | Config and profiles | ⏸️ Skipped on purpose |
+| A4 | Fix the build | ✅ Done — 2026-09-01 |
+| Track B | Not decided yet | ❓ Need to discuss |
+| Track C | Not decided yet | ❓ Need to discuss |
+| Track D | Not decided yet | ❓ Need to discuss |
 
-### A1. Error handling & API response contract — 🔴 top priority — STATUS: ✅ DONE (2026-08-28)
-
-**Why first (agreed rationale):** every endpoint written before this exists gets touched again
-when it lands; every client integrating against today's ad hoc error shapes breaks when it's
-fixed. Highest rework multiplier in the codebase, cost doesn't decrease by waiting.
-
-**Problem today:** zero `@ControllerAdvice` across all 8 services. Every failure path is
-`throw new RuntimeException("...")` (~26 sites, see CLAUDE.md §9 item 40). Spring turns that
-into a generic 500 + HTML Whitelabel page. Client can't distinguish "not found" from "DB is on
-fire"; can't tell if retrying helps.
-
-**Target shape (agreed direction, not yet built):**
-- Small exception hierarchy: `NotFoundException`, `ConflictException`, `ForbiddenException`,
-  `ValidationException` (exact set/names TBD when we scope this).
-- One shared `@ControllerAdvice` mapping each exception type → correct HTTP status.
-- One consistent error response body used everywhere, roughly:
-  `{ timestamp, status, error, message, path, traceId }` (exact fields TBD).
-- Lives in a **shared module** so all 8 services get it for free rather than 8 copies —
-  candidate location TBD: either inside `common-security` or a new `shared-core`/`shared-web`
-  module. This decision affects A4 (build/reactor) too, so make it together with that track.
-
-**Open questions to resolve before writing code:**
-- New shared module vs. extending `common-security`?
-- Exact exception → status mapping table, and which of the ~26 `RuntimeException` call sites
-  map to which exception type (this is effectively a per-service audit).
-- Whether `traceId` needs real correlation-id propagation across Kafka/WebClient calls, or is a
-  per-request UUID for now (local-machine scope suggests the latter is enough for now).
-
-**DELIVERED.** New `common-web` module (9 main classes + 1 test class), rolled out to all 5
-Spring MVC services, plus a hand-matched error shape in the reactive APIGateway.
-NotificationService correctly skipped (no controllers). See the Change Log at the bottom of this
-file for the exact per-file list. All 11 modules build clean; 12/12 contract tests pass.
+**Track A is finished.**
 
 ---
 
-### A2. Database migrations — 🔴 — STATUS: ✅ DONE (2026-09-01)
+## Rules we agreed
 
-**Why second:** cost of delay compounds fastest of anything on this list — `ddl-auto=update`
-silently orphans data on renames (adds a new column, leaves the old one full of stale data,
-no error) and flatly refuses on incompatible changes (service won't start, no rollback path).
-An afternoon fix today becomes a scary weekend later.
+1. **Ask before changing code.** Plan first. Write the plan here. Then change code.
+2. **Explain every file we change.** Say which file, what changed, and why. This is how you
+   review the work.
+3. **One task at a time.** Do not jump ahead to a later task because it looks easy.
+4. **Keep this file up to date.** When a task finishes, update it here and in `CLAUDE.md` too.
+   The two files must not disagree.
+5. **This git repo stays on this laptop.** No remote. No GitHub. No pull requests.
+6. **Write simply.** Short sentences. Plain words. This applies to code comments too.
 
-**Problem today:** all 6 JPA-using services (`AuthService`, `UserService`, `IncidentService`,
-`NotificationService`, `ReportingService`, `Ai-Service`) run
-`spring.jpa.hibernate.ddl-auto=update`, no Flyway/Liquibase anywhere, no migration history.
+---
 
-**Target direction (agreed, not yet built):** introduce Flyway (or Liquibase — tool choice
-still open) per service, baseline the current schema as `V1__baseline.sql` generated from
-each service's actual current DB state, switch `ddl-auto` to `validate`. Ai-Service's Postgres
-usage is a bit different — it has both a `vector_db` with plain JPA tables *and* the
-hand-created `resolved_incidents_vectors` pgvector table (`initializeSchema(false)`) — migration
-approach there needs to respect that the vector table is intentionally not Hibernate-managed.
+# A1 — Error handling ✅ Done 2026-08-28
 
-**Open questions:**
-- Flyway vs Liquibase (Flyway is the lighter-weight default choice for a from-scratch baseline;
-  no strong reason yet to prefer Liquibase — will confirm before implementing).
-- How to baseline safely per-service without wiping local dev data.
-- Order of services to migrate (probably matches Track A4 build-fix order, or start with
-  AuthService since it's foundational).
+## What was wrong
 
-**DECIDED:** Flyway (not Liquibase) — plain `.sql` files are reviewable; Liquibase's changelog
-layer buys us nothing here and its rollback is a paid feature in Flyway anyway.
-**DECIDED:** keep the existing local data rather than wiping — the user specifically wants to
-learn the "database already has rows" baselining case, which is the real-world situation.
-No safety backup taken: user confirmed the data is dummy/disposable.
+When something failed, every service did this:
 
-**AuthService pilot — files changed 2026-08-29:**
-| File | Change |
+```java
+throw new RuntimeException("Incident not found");
+```
+
+Spring turned that into an HTML error page with status **500**.
+
+## Why that was bad
+
+The client could not tell these two things apart:
+
+- "You asked for an incident that does not exist" — your mistake
+- "Our database is down" — our mistake
+
+Both looked the same. Both said 500.
+
+Also, if you add monitoring later, it would wake you at 3am for someone typing a bad ID.
+
+## What we built
+
+A new shared module called `common-web`. All services use it. Nobody copies code.
+
+It has three parts.
+
+**1. Five error types.** The name of the error says what went wrong:
+
+| Error type | HTTP code | Use when |
+|---|---|---|
+| `NotFoundException` | 404 | The thing does not exist |
+| `ValidationException` | 400 | The request itself is wrong |
+| `ConflictException` | 409 | Request is fine, but clashes with what is already saved |
+| `ForbiddenException` | 403 | We know who you are. You are not allowed |
+| `UnauthorizedException` | 401 | We do not know who you are |
+
+**2. One class that catches everything.** You never call it. Spring sends every error to it
+automatically. It picks the right HTTP code and builds the reply.
+
+**3. One reply shape.** Every service, every error, the same shape:
+
+```json
+{
+  "timestamp": "2026-08-28T10:15:00Z",
+  "status": 404,
+  "error": "INCIDENT_NOT_FOUND",
+  "message": "Incident not found: 3f2a...",
+  "path": "/incidents/3f2a...",
+  "traceId": "a1b2c3d4"
+}
+```
+
+The frontend writes its error code once. It then works for all services.
+
+## The safety rule
+
+If an error is one we expected, the client sees our message.
+
+If an error is a bug we did not expect, the client sees **only** a generic sentence and a
+traceId. The real error goes to the server log.
+
+Why: a raw error message can leak table names, file paths and library versions to whoever is
+calling the API.
+
+## Two services are different
+
+- **APIGateway** does not use `common-web`. It runs on WebFlux, where this trick does not work.
+  We copied the same JSON shape by hand instead.
+- **NotificationService** does not need it. It has no HTTP endpoints. It only reads Kafka.
+
+## How we know it works
+
+12 tests in `common-web`. They run with no database, no Kafka, no Eureka. About one second.
+
+They check the status codes, the JSON field names, and that a surprise error does **not** leak
+its message.
+
+If someone changes a status code later, these tests fail and tell them.
+
+## Still not done
+
+We never tested this against a running system. All 11 modules compile and the tests pass. But
+nobody has called a real endpoint and looked at the reply.
+
+---
+
+# A2 — Database migrations ✅ Done 2026-09-01
+
+## What was wrong
+
+All 6 services with a database used this setting:
+
+```
+spring.jpa.hibernate.ddl-auto=update
+```
+
+That means: *"Hibernate, look at my Java classes and change the database to match."*
+
+There were no SQL files anywhere. The database shape was not written down.
+
+## Why that was bad
+
+**Problem 1 — silent data loss on rename.**
+
+Say you rename a field in Java from `affectedSource` to `affectedService`.
+
+Hibernate does not understand this as a rename. It sees:
+1. An old field disappeared.
+2. A new field appeared.
+
+So it adds a **new empty column** and leaves the old one sitting there, still full of your data.
+No error. No warning. You find out weeks later when reports look wrong.
+
+**Problem 2 — the app just refuses to start.**
+
+`ddl-auto=update` cannot shrink a column, change a type, or add a NOT NULL rule to a table that
+already has rows. It just refuses. Your service will not start, and there is no history telling
+you what changed.
+
+## What we did
+
+We added **Flyway** to all 6 services.
+
+Flyway is like git, but for your database. You write SQL files. They run in order. Flyway
+remembers which ones already ran.
+
+Steps we followed for each service:
+
+1. Asked the real database for its shape (`mysqldump --no-data` / `pg_dump --schema-only`).
+   We did **not** build it from the Java classes. Those two can drift apart.
+2. Saved that as `V1__baseline.sql`.
+3. Told Flyway "this database already exists, mark V1 as done, do not run it"
+   (`baseline-on-migrate=true`).
+4. Changed `ddl-auto=update` to `ddl-auto=validate`. Now Hibernate never touches the database.
+   It only checks that Java and the database agree, and refuses to start if they do not.
+
+That last part is a good thing. It means "you changed a Java class and forgot the SQL file" gets
+caught straight away.
+
+## The 8 SQL files we wrote
+
+| Service | Files |
 |---|---|
-| `AuthService/src/main/resources/db/migration/V1__baseline.sql` | **New.** Schema captured from the live DB via `mysqldump --no-data`, then reordered (roles → users → user_roles) so foreign keys resolve on an empty database, with `AUTO_INCREMENT=4` and the mysqldump preamble stripped |
-| `AuthService/pom.xml` | Added `flyway-core` + `flyway-mysql` (both needed — core alone fails with "Unsupported Database: MySQL" on Flyway 10+). Resolved to 11.7.2 via the Boot parent |
-| `AuthService/src/main/resources/application.properties` | `ddl-auto=update` → `validate`; added `spring.flyway.*` settings including `baseline-on-migrate=true` |
-| `.gitignore` | Added `db-backups/` + `*.dump` so schema/data dumps are never committed |
-| `FLYWAY-NOTES.md` | **New** (user-authored, reviewed + extended). Part 2 is the running migration log |
-| `ERROR_HANDLING_FLOW.md` | **New.** Plain-English A1 walkthrough (belongs to A1, written this session) |
-| `BUGS-TO-FIX-LATER.md` | Added E7 (bit(1) vs tinyint(1) boolean inconsistency) and E8 (orphan `inicident-management-aiservicedb`) |
+| AuthService | `V1__baseline.sql`, `V2__seed_roles.sql` |
+| UserService | `V1__baseline.sql`, `V2__seed_roles.sql` |
+| IncidentService | `V1__baseline.sql` |
+| NotificationService | `V1__baseline.sql` |
+| ReportingService | `V1__baseline.sql` |
+| Ai-Service | `V1__baseline.sql` |
 
-**Build verified** (`mvn clean package`) — but **NOT yet run against the database.** The next
-step is starting AuthService and confirming Flyway baselines cleanly and `validate` passes.
-Cannot be done by the assistant: needs the `user`/`password`/`secretkey` env vars.
+## The lesson that caught us twice
 
-**Known risk on first run:** `ddl-auto=validate` may reject `account_locked tinyint(1)` because
-the entity declares `columnDefinition = "TINYINT(1)"` while Hibernate's default for `Boolean` is
-`bit(1)`. If it fails, the app simply refuses to start — nothing is modified — and the fix is
-either an explicit entity mapping or a deliberate type-normalising migration (BUGS E7).
+**V1 does not run on your database. V2 does.**
 
-**Still pending for AuthService:** `V2__seed_roles.sql`. The three role rows currently exist only
-because they were inserted by hand; a fresh machine would get a valid schema and a broken signup.
+V1 is the baseline, so Flyway skips it. But V2 is above the baseline, so Flyway runs it for real
+— on a database that already has the data.
 
-**AuthService pilot RESULT (2026-08-31): ✅ verified working.** Flyway baselined the existing
-database, `ddl-auto=validate` passed, service started, new users created successfully. The
-`account_locked tinyint(1)` risk flagged earlier did NOT materialise — Hibernate accepted it.
+This caught us twice:
 
-**Post-verification fix:** the user added explanatory comments to `AuthService/.../V1__baseline.sql`
-using `--text` with no space. MySQL requires `-- text` (space after the dashes) — 26 lines were
-invalid SQL, including one *inside* the `CREATE TABLE`. Harmless on this machine because V1 was
-baselined rather than executed, but it would have broken any fresh database. Fixed by inserting a
-single space per line; no wording changed. Safe to edit because baseline rows store
-`checksum = NULL` — that exception does NOT extend to V2+.
+1. `V2__seed_roles.sql` adds 3 role rows. Those rows already existed. A normal `INSERT` would
+   have failed with a duplicate error. We used `INSERT IGNORE` instead. It skips rows that
+   already exist.
+2. Ai-Service's vector table already existed too. So we put it in V1 instead of V2. Nothing
+   runs, nothing fails.
 
-**Rollout to the 4 remaining MySQL services — 2026-08-31:**
-| File | Change |
+## Two tables we nearly lost
+
+This is the most valuable thing A2 found.
+
+**ReportingService — the `shedlock` table.** It has no Java class. The ShedLock library uses it
+so that only one copy of the service runs each scheduled job. Somebody created it by hand once.
+It was written down nowhere.
+
+**Ai-Service — the `resolved_incidents_vectors` table.** Same story. Spring AI reads and writes
+it directly. The config says `initializeSchema(false)`, which means "do not create this, it
+already exists". So:
+
+- Hibernate did not know about it — no Java class
+- Spring AI would not create it
+- Nothing in the project described it
+
+For both tables, a new laptop would have started every service perfectly fine. Then failed later
+— the SLA schedulers for one, the AI suggestions for the other.
+
+Both are now in the SQL files.
+
+## How we know it works
+
+We tested the empty-database case for real, not just in theory.
+
+We made a throwaway database, pointed AuthService at it, and started it. Flyway built the tables
+from V1 and added the roles from V2.
+
+That was the one thing baselining alone could never prove.
+
+## Choices we made
+
+**Flyway, not Liquibase.** Flyway uses plain SQL files. Liquibase uses XML that turns into SQL.
+Plain SQL is easier to read and review. We are not switching database brands, so Liquibase's
+extra features buy us nothing.
+
+**We kept the existing data.** Wiping the databases would have been easier. But learning how to
+handle a database that already has data is the whole point. That is the real-world case.
+
+## Problems we found but did not fix
+
+A baseline file must copy the database exactly, or `validate` fails. So we wrote these down
+instead of fixing them. All are in `BUGS-TO-FIX-LATER.md`:
+
+- **E7** — `users.enabled` is `bit(1)` but `users.account_locked` is `tinyint(1)`. Same idea,
+  two different types.
+- **E9** — The `incidents` table has no indexes at all. But the code searches it by three
+  different columns. Every search reads the whole table.
+- **E10** — A CHECK rule on `notification_log` may reject the last enum value. Needs testing.
+- **E11** — `USER_LOOGED_OUT` typo, spelled that way in Java and in the database.
+- **E12** — The AI vector column has no index, and cannot easily get one. The index type only
+  supports about 2000 dimensions. Ours is 3072.
+- **E13** — Two PostgreSQL extensions look unused.
+
+## Extra work we did along the way
+
+Not strictly A2, but found while working on it.
+
+**Kafka was open to the whole network.** Port 9092 was open to every network interface, with no
+password. Anyone who could reach your laptop could read every topic, send fake events, or delete
+topics. ZooKeeper was open too, on port 2181.
+
+Both are now fixed. Kafka is locked to this machine only. ZooKeeper is not published at all —
+Kafka reaches it inside Docker, so it never needed to be.
+
+**pgvector had no compose file.** Its settings lived only inside Docker. Delete the container and
+you would have to remember the port, the volume name and the database name. Now written down in
+`pgvector-docker/docker-compose.yml`.
+
+That is the same problem as the two lost tables above. Something important that existed only on
+one machine.
+
+---
+
+# A3 — Config and profiles ⏸️ Skipped on purpose
+
+You only run this project on your own laptop. There is no staging server. There is no
+production.
+
+So Spring profiles, config servers and per-environment settings are **not needed yet**.
+
+Do not spend time here unless you decide to deploy this somewhere.
+
+---
+
+# A4 — Fix the build ✅ Done 2026-09-01
+
+## What was wrong
+
+This project has **11 buildable pieces**.
+
+The main project file at the root, `pom.xml`, is supposed to list all of them. It listed **6**.
+
+Missing:
+- IncidentService
+- NotificationService
+- ReportingService
+- Ai-Service
+- common-web
+
+## Why that was dangerous
+
+1. You change some shared code — say `shared-events`, used by several services.
+2. You run `mvn clean install` at the root.
+3. It says **BUILD SUCCESS**.
+4. **But that is a lie.** Five modules were never checked. They were silently skipped.
+5. Those services are still built against the old code.
+6. You find out much later, while the app is running. Usually as a Kafka message that a service
+   suddenly cannot read.
+
+**In one line:** the build said "everything is fine" when it was not. That is worse than a build
+that honestly fails, because a failing build warns you straight away.
+
+## Why it blocked other work
+
+Track C is about automated testing. There was no point starting that first. If the build itself
+lies about what it checked, then automatic tests sitting on top of it would lie too.
+
+## What we did
+
+**1. Listed all 11 modules** in the root `pom.xml`.
+
+Maven works out the correct build order by itself, from the dependencies between modules. So the
+shared libraries always get built before the services that use them. The order you write them in
+does not matter.
+
+**2. Marked the root file's settings as doing nothing.**
+
+This was a surprise. The root file declares things like `java.version` and `spring-boot.version`.
+**No module reads them.**
+
+In Maven, settings only flow downward from a parent to its children. No module names the root
+file as its parent. They all point at `spring-boot-starter-parent` instead, to get Spring Boot's
+version management.
+
+So those settings were doing nothing. We kept them but added a clear warning comment, so nobody
+edits them expecting a result.
+
+**3. The dead `AuthService` dependency was already gone.**
+
+Four services used to list `AuthService` as a dependency while importing nothing from it. That
+had already been removed before this task started. We checked twice: no pom declares it, and no
+Java file imports it. Everything still builds.
+
+## How we proved it works
+
+Two checks, not just "it compiled".
+
+**Check 1 — one command builds everything.** `mvn clean install` at the root now builds all 11
+modules in about 2 minutes 15 seconds.
+
+**Check 2 — the build now catches a real break.**
+
+We renamed a field in `shared-events` on purpose (`title` → `titleRENAMED`) and ran the build
+again:
+
+```
+shared-events        SUCCESS
+common-security      SUCCESS
+common-web           SUCCESS
+Eureka               SUCCESS
+APIGateway           SUCCESS
+AuthService          SUCCESS
+UserService          SUCCESS
+IncidentService      FAILURE   <-- caught it
+NotificationService  SKIPPED
+ReportingService     SKIPPED
+AiService            SKIPPED
+BUILD FAILURE
+```
+
+IncidentService is one of the four services the old build used to skip. Before the fix, those
+seven modules above it would all have passed, and the build would have printed BUILD SUCCESS.
+
+We put the rename back straight away and checked the build was green again.
+
+## What we did NOT do
+
+**Make every module point at the root file as its parent.**
+
+That would make the shared settings real. But it is not a simple change:
+
+- Modules get Spring Boot's version management **from** `spring-boot-starter-parent`. If we
+  repoint them, the root file has to import the Spring Boot BOM instead, or every version breaks
+  at once.
+- `common-security` is on Spring Boot **3.3.2** on purpose, not 3.5.11.
+- `Ai-Service` is on Java **17** on purpose, not 21.
+
+So it forces decisions about two deliberate exceptions. That is its own task, not a side effect
+of fixing the build.
+
+## One thing to know
+
+The root build needs `-DskipTests` to pass.
+
+Eight services have auto-generated `contextLoads()` tests. Those need MySQL, Kafka, Eureka and
+the environment variables all running. Only `common-web`'s 12 tests run on their own.
+
+That is a Track C problem, not something this change broke.
+
+---
+
+# Track B, C and D — not decided yet
+
+You mentioned these tracks but we never discussed what is in them.
+
+**Do not guess.** Ask before starting any of them.
+
+---
+
+# Change log — every file we changed
+
+This is your review record. Each entry says the file and what changed.
+
+---
+
+## 2026-08-28 — First look at the project
+
+Read the whole codebase. Wrote `CLAUDE.md` — what the code looks like today.
+Wrote this file. Agreed the order: A1 → A2 → A4. A3 skipped.
+
+**No code changed.**
+
+---
+
+## 2026-08-28 — A1 done (error handling)
+
+### New module: `common-web` — 10 new files
+
+| File | What it does |
 |---|---|
-| `UserService/pom.xml`, `IncidentService/pom.xml`, `NotificationService/pom.xml`, `ReportingService/pom.xml` | Added `flyway-core` + `flyway-mysql` |
-| `.../src/main/resources/application.properties` (×4) | `ddl-auto=update` → `validate`, plus the `spring.flyway.*` block |
-| `UserService/.../db/migration/V1__baseline.sql` | **New** — 3 tables, reordered for FK safety |
-| `IncidentService/.../db/migration/V1__baseline.sql` | **New** — 1 table |
-| `NotificationService/.../db/migration/V1__baseline.sql` | **New** — 1 table |
-| `ReportingService/.../db/migration/V1__baseline.sql` | **New** — 7 tables incl. the non-entity `shedlock` |
+| `pom.xml` | Boot 3.5.11. Built for Java **17** on purpose, so Ai-Service (still on 17) can use it. All Spring dependencies are `provided`, so this module never drags the servlet stack into the reactive gateway |
+| `exception/ApiException.java` | Base class. Holds the error code and the HTTP status |
+| `exception/NotFoundException.java` | 404 |
+| `exception/ValidationException.java` | 400 |
+| `exception/ConflictException.java` | 409 |
+| `exception/ForbiddenException.java` | 403 |
+| `exception/UnauthorizedException.java` | 401 |
+| `dto/ErrorResponse.java` | The 6-field reply shape. Plus an optional `fieldErrors` list, left out completely unless `@Valid` failed |
+| `handler/GlobalExceptionHandler.java` | Catches everything. 10 handlers. The last one hides real error messages and returns only a generic sentence plus a traceId |
+| `filter/TraceIdFilter.java` | Gives every request a short id. Reuses an incoming `X-Trace-Id` if there is one. Puts it in the logs and the reply. Clears it afterwards, because threads get reused |
+| `config/CommonWebAutoConfig.java` + `AutoConfiguration.imports` | Makes the module work just by adding it. Without this, Spring would never find the handler. Our services live under `com.example.*` and this module lives under `com.project.web` |
+| `src/test/.../GlobalExceptionHandlerTest.java` | 12 tests. No database needed. Locks the status codes, the field names, and the no-leak rule |
 
-All 4 build clean; baselines verified against the dumps programmatically — 12 tables / 106 columns,
-zero drift, no columns lost or invented. **Not yet run against their databases.**
+### IncidentService — 7 files (this was the pilot)
 
-**Findings recorded in BUGS-TO-FIX-LATER.md** (not fixed — a baseline must copy reality exactly or
-`validate` fails): E9 `incidents` has no indexes despite 3 query paths; E10 suspicious
-`CHECK (event_type between 0 and 7)` on an 8-value enum; E11 `USER_LOOGED_OUT` typo in the audit
-enum.
+| File | What changed |
+|---|---|
+| `pom.xml` | Added `common-web` |
+| `service/IncidentService.java` | Replaced all 13 `RuntimeException`s. Not found → 404. Caller not active → 403. Bad engineer choice → 400, because the client should pick someone else, so it is a request problem not a permission one |
+| `client/UserClient.java` | A 404 from UserService now becomes a 404 here, not a 500 |
+| `controller/IncidentController.java` | Added `@Valid` to all 4 request bodies. There was **none** before, so the DTO rules never ran |
+| `dto/AssignIncidentRequestDTO.java` | Added `@NotNull` on the engineer id |
+| `dto/UpdateIncidentStatus_RequestDTO.java` | Replaced `@Column(nullable=false)` — a database annotation that does nothing on a DTO — with a real `@NotNull`. Added length limits |
+| `dto/UpdateIncidentMetadate_RequestDTO.java` | Added length limits matching the database columns |
 
-**Biggest catch of this pass:** ReportingService's `shedlock` table is not a JPA entity and was
-created by hand — it existed only on this machine and was recorded nowhere. A fresh laptop would
-have started fine, then failed at runtime when the SLA schedulers ran. It is now in V1.
+### AuthService — 13 files
 
-**Also spotted:** the user commented out the dead `AuthService` dependency in
-`IncidentService/pom.xml` (CLAUDE.md §9 item 23). Still builds — confirms it was unused. The same
-removal is still pending in UserService, NotificationService and ReportingService (A4 work).
+| File | What changed |
+|---|---|
+| `pom.xml` | Added `common-web` |
+| `controller/TokenVersionController.java` | User not found → 404 |
+| `controller/PasswordController.java` | Added `@Valid`. It had none |
+| `service/LogoutUserService.java` | 2 × user not found → 404 |
+| `service/ChangePasswordService.java` | User not found → 404. Wrong old password → 401 |
+| `service/RegisteringUserService.java` | Duplicate username or email → 409. **Left alone on purpose:** the missing-role error stays a 500, because missing seed data is our fault, not the caller's |
+| `service/LoginUserService.java` | ⚠️ **Changes what clients see.** Login failures used to return their own private shape. Now they use the standard one. Also: unknown email and wrong password now give the **same** message. The old one said "email not exist", which let anyone check whether an account existed |
+| `service/UpdateCredentialsService.java` | ⚠️ **Changes what clients see.** Plain text replies like `"Email already exists"` are gone. A taken name is now **409**, not 400 |
+| `service/UpdateRoleService.java` | User not found → 404. A bad role name is now a 400 listing the valid roles, instead of a 500 |
+| `dto/ChangePasswordDTO.java` | Had **no** rules at all. Added them |
+| `dto/SignupFormDTO.java` | Added the missing `@NotBlank` on password. Without it, a null password passed validation and reached the encoder |
+| `dto/LoginFromDTO.java` | Same missing `@NotBlank` on password |
+| `dto/UpdateUserRolesRequestDTO.java` | Added `@NotEmpty` on the roles list |
 
-**Remaining:** Ai-Service (PostgreSQL, last — its hand-made `resolved_incidents_vectors` pgvector
-table stays outside Flyway). Postgres was not running on 5433 during this session.
+### UserService — 5 files
 
-**COMPLETE 2026-09-01.** All 6 JPA services on Flyway with `ddl-auto=validate`. 8 migration
-files total (6 baselines + 2 role seeds). All 11 modules build clean; every migration verified
-packaged into its jar; all baselines verified against their dumps programmatically (14 tables,
-118 columns, 3 Postgres extensions - zero drift).
+| File | What changed |
+|---|---|
+| `pom.xml` | Added `common-web` |
+| `service/UserService.java` | Replaced all 18 `RuntimeException`s. **The important one:** `LimitedUserInfoForValidation` now returns 404. That is what makes IncidentService's 404 work end to end. The two changes only work together |
+| `controller/UserController.java` | Added `@Valid` to 3 request bodies |
+| `dto/StatusRequestDTO.java` | Added `@NotNull` |
+| `dto/AssignEngineerRequestDTO.java` | Added `@NotNull` on both ids |
 
-**The fresh-database path was tested for real**, not just assumed: a throwaway database was
-created, AuthService pointed at it, and Flyway built the schema from V1 and seeded roles from V2.
-That was the one thing the baseline path could never prove.
+### ReportingService — 2 files
 
-**Two undocumented hand-created tables were recovered** - ReportingService's `shedlock` and
-Ai-Service's `resolved_incidents_vectors`. Both existed only on this machine, described in no
-file. Neither is a JPA entity, so `ddl-auto=validate` does not check them; without capturing them,
-a fresh machine would have started fine and then failed at runtime.
+| File | What changed |
+|---|---|
+| `pom.xml` | Added `common-web` |
+| `service/ReportingService.java` | Report not found → 404. This service had only one error to fix |
 
-**Ai-Service specifics:** `flyway-database-postgresql` (not `flyway-mysql`); 3 extensions (`vector`
-essential, `uuid-ossp`/`hstore` likely unused - E13); everything in V1 rather than a split V2,
-matching how `shedlock` was handled and avoiding a V2 that would execute against the existing DB.
+### Ai-Service — 1 file
 
-**Lesson recorded twice:** migrations above the baseline version DO execute on existing databases.
-`V2__seed_roles.sql` needed `INSERT IGNORE`; the Ai-Service vector table was folded into V1 for the
-same reason.
+| File | What changed |
+|---|---|
+| `pom.xml` | Added `common-web`. It had no errors to replace, but it now gets the shared handling for bad UUIDs, broken JSON and access-denied |
 
-**Findings logged, not fixed** (a baseline must copy reality or `validate` fails): E7 bit/tinyint
-boolean split, E9 `incidents` has no indexes, E10 suspicious CHECK on an 8-value enum, E11
-`USER_LOOGED_OUT` typo, E12 embedding column unindexable at 3072 dims, E13 unused extensions.
+### APIGateway — 1 file, hand-written, does not use `common-web`
 
-**Infrastructure hardened along the way** (not strictly A2): Kafka was bound to `0.0.0.0:9092`
-with no authentication and ZooKeeper to `0.0.0.0:2181`; both are now localhost-only/unpublished.
-pgvector gained a compose file (`pgvector-docker/docker-compose.yml`) - its config previously
-existed only inside Docker's state, the same class of problem as the two lost tables.
+| File | What changed |
+|---|---|
+| `filter/JwtGatewayFilter.java` | The gateway runs on WebFlux, where the shared handler does nothing. So we copied the same JSON shape by hand. It used to send a status code with an **empty body**, so clients got nothing to show or log. ⚠️ **Behaviour change:** if AuthService is unreachable, it now returns **503, not 401**. The old code told users their token was bad and sent them to log in again, which hid a real outage. It also creates an `X-Trace-Id` and passes it on, so one id covers the whole chain |
 
----
+### Not changed, on purpose
 
-### A3. Configuration & profiles — ⏸️ EXPLICITLY DEFERRED
-
-User's call: **this project only needs to run on the local machine right now** — no staging,
-no production target yet. So Spring profiles, externalized config server, per-environment
-property files, etc. are **not in scope** until that changes. Do not spend effort here unless
-the user reopens it. (CLAUDE.md §9 item 44/§8 still documents the current single-properties-file
-+ raw-env-var state accurately — that's fine as-is for a local-only project.)
-
----
-
-### A4. Fix the split build — 🟠 — STATUS: not started
-
-**Why this matters (agreed rationale):** a build that can be green while broken is worse than
-no build. Root `pom.xml`'s reactor currently only lists 6 of 10 modules — `IncidentService`,
-`NotificationService`, `ReportingService`, `Ai-Service` are excluded (see CLAUDE.md §1, §9
-item 24). Concrete failure mode: change `shared-events`, run `mvn clean install` at root, get a
-green build — but the 4 excluded services were never recompiled against the change, and it only
-surfaces later as a Kafka deserialization failure at runtime.
-
-**Also blocks Track C (tests/CI):** CI that runs against a lying build is worse than no CI —
-this needs to be fixed before that track starts.
-
-**Target direction (agreed, not yet built):**
-- Add all 4 missing services to the root `pom.xml` `<modules>` list.
-- Decide whether services should actually parent to the root pom (currently none do — root
-  pom's `<properties>` are inert, see CLAUDE.md §1) or just be listed as reactor modules
-  without changing their `<parent>`. Changing `<parent>` is a bigger, riskier move (touches
-  every service's pom) — leaning toward "just fix the reactor list" first, parenting is a
-  separate later decision.
-- Also relevant here: `AuthService` is currently a **declared Maven dependency** of 4 services
-  with nothing actually imported from it (CLAUDE.md §9 item 23) — worth deciding whether to
-  remove that dead dependency as part of this same pass, since it's the same "build hygiene"
-  concern. Will confirm scope before touching poms.
-
-**Not started. No files touched yet.**
+- **NotificationService** — checked: it has no HTTP endpoints at all. Only Kafka. Nothing for the
+  handler to catch. It will pick this up if it ever gets an API.
+- **Eureka** — no endpoints of its own.
 
 ---
 
-## Track B / C / D — mentioned, not yet defined
+## 2026-08-29 to 2026-09-01 — A2 done (database migrations)
 
-User referenced additional tracks beyond A ("i also have Track B, C, D but i think first we
-work on this then move to next"). **Contents of B/C/D have not been discussed or captured yet.**
-Do not assume what they contain — ask when we get there. (Reasonable guesses based on
-CLAUDE.md's issue catalogue — security perimeter/header-trust hardening, real tests + CI,
-Kafka DLQ/retry policy, notification email actually being implemented — are guesses only,
-**not confirmed scope**, and must not be started without the user defining these tracks.)
+### Every service that has a database — 3 changes each
+
+| File | What changed |
+|---|---|
+| `pom.xml` | Added `flyway-core`. Plus `flyway-mysql` for the 5 MySQL services, or `flyway-database-postgresql` for Ai-Service. **Both parts are needed.** `flyway-core` alone fails with "Unsupported Database" |
+| `application.properties` | `ddl-auto=update` → `ddl-auto=validate`. Added the Flyway settings, including `baseline-on-migrate=true` |
+| `db/migration/V1__baseline.sql` | **New.** The database shape, copied from the real running database |
+
+### The extra SQL files
+
+| File | What it does |
+|---|---|
+| `AuthService/.../V2__seed_roles.sql` | **New.** Adds the 3 roles. Without them signup fails, because the code looks up ROLE_ENGINEER and throws if it is missing |
+| `UserService/.../V2__seed_roles.sql` | **New.** Same 3 roles, different reason. When a `user.registered` event arrives, this service looks up roles too. Without them signup would look successful, but the user would never appear here. Nobody would be told |
+
+Both use `INSERT IGNORE`, so they are safe to run on a database that already has the rows.
+
+### Fix to an already-written file
+
+| File | What changed |
+|---|---|
+| `AuthService/.../V1__baseline.sql` | You added comments using `--text` with no space. MySQL needs `-- text`. 26 lines were invalid SQL, including one **inside** the CREATE TABLE. It did not break anything here, because V1 never runs on this machine. But it would have broken any new laptop. Fixed by adding one space per line. No words changed |
+
+### Docker and infrastructure
+
+| File | What changed |
+|---|---|
+| `kafka-docker/docker-compose.yml` | Kafka was open to the whole network on port 9092, with no password. Now locked to this machine. ZooKeeper's port removed completely — Kafka reaches it inside Docker, so it never needed publishing |
+| `pgvector-docker/docker-compose.yml` | **New.** The pgvector container was started by a hand-typed command. Its settings lived only inside Docker. Now written down. The password is **not** in the file. It reads an environment variable |
+| `.gitignore` | Added `db-backups/` and `*.dump`, so database dumps never get committed |
+
+### Documentation
+
+| File | What changed |
+|---|---|
+| `FLYWAY-NOTES.md` | Your notes, moved into the project. Fixed 3 things that were slightly wrong. Added 6 things that catch people out later. Part 2 is a log of every migration we write |
+| `ERROR_HANDLING_FLOW.md` | **New.** How errors work, with one example followed all the way through |
+| `BUGS-TO-FIX-LATER.md` | Added E7, E9, E10, E11, E12, E13 |
+| `CLAUDE.md` | Rewrote the schema section. It still said "No Flyway". Marked issue 41 as fixed |
 
 ---
 
-## Status table
+## 2026-09-01 — A4 done (fix the build)
 
-| Item | Priority | Status | Notes |
-|---|---|---|---|
-| A1 — Error handling & response contract | 🔴 highest | ✅ **Done** 2026-08-28 | `common-web` module; 5 services + gateway |
-| A2 — DB migrations (Flyway) | 🔴 | ✅ **Done 2026-09-01** | All 6 JPA services; 8 migrations; fresh-DB path tested |
-| A3 — Config & profiles | ⏸️ deferred | Out of scope for now | Local-machine only, revisit later |
-| A4 — Fix split build (root pom reactor) | 🟠 | Not started | Blocks Track C later |
-| Track B | ❓ undefined | Not discussed | Ask user before assuming |
-| Track C | ❓ undefined | Not discussed | Ask user before assuming |
-| Track D | ❓ undefined | Not discussed | Ask user before assuming |
+| File | What changed |
+|---|---|
+| `pom.xml` (root) | Now lists all 11 modules, not 6. Added comments explaining why the list must stay complete. Marked the settings block as doing nothing, with the reason |
+| `CLAUDE.md` | Marked issues 23 and 24 as fixed |
+| `PROGRESS.md` | This file. A4 section added |
+
+**Note:** the root `pom.xml` was already fixed when we checked it. The work in this session was
+proving it actually works, including deliberately breaking `shared-events` to confirm the build
+now catches it.
 
 ---
 
-## Change Log
+## 2026-09-01 — This file rewritten
 
-_No code changes have been made yet. Every entry below must name the exact files touched and
-explain the change, added the same session the change ships._
+`PROGRESS.md` rewritten in simpler English. **No facts changed, only the wording.**
 
-- **2026-08-28** — Initial exploration + `CLAUDE.md` written (codebase understanding, no
-  application code touched). This `PROGRESS.md` created to track the modernization plan.
-  Priorities discussed and order agreed: A1 → A2 → (A3 deferred) → A4.
-
-- **2026-08-28** — **A1 IMPLEMENTED.** Full file-by-file list below.
-  `BUGS-TO-FIX-LATER.md` also created (environment/build problems found along the way).
-
-  **NEW MODULE — `common-web/` (10 new files)**
-  - `pom.xml` — Boot 3.5.11, groupId `com.project.web`, artifact `common-web:1.0.0`.
-    Compiled with `release=17` on purpose so Ai-Service (still Java 17) can use it.
-    All Spring deps are `provided` so the module never drags the servlet stack into the
-    reactive gateway.
-  - `exception/ApiException.java` — abstract base, carries `errorCode` + `HttpStatus`.
-  - `exception/NotFoundException.java` (404), `ValidationException.java` (400),
-    `ConflictException.java` (409), `ForbiddenException.java` (403),
-    `UnauthorizedException.java` (401). Each has a 1-arg (default code) and 2-arg
-    (specific code) constructor.
-  - `dto/ErrorResponse.java` — the 6-field contract
-    `{timestamp, status, error, message, path, traceId}`, plus an optional `fieldErrors`
-    list that is OMITTED (not null) unless `@Valid` failed.
-  - `handler/GlobalExceptionHandler.java` — `@RestControllerAdvice` with 10 handlers:
-    ApiException, `@Valid` body failure, ConstraintViolation, type mismatch (bad UUID in
-    a path), unreadable JSON body, missing request param, DataIntegrityViolation,
-    AccessDenied, AuthenticationException, and a catch-all. The catch-all deliberately
-    hides the real exception message and returns only a generic sentence + traceId.
-  - `filter/TraceIdFilter.java` — reuses an inbound `X-Trace-Id` or mints an 8-char id;
-    puts it in the SLF4J MDC, the request attributes, and the response header; clears MDC
-    in a finally block (pooled threads would otherwise leak the id).
-  - `config/CommonWebAutoConfig.java` + `META-INF/spring/...AutoConfiguration.imports` —
-    solves the `com.project.*` vs `com.example.*` scanning problem: Spring would never
-    have found the advice by component scan. Same trick common-security already uses.
-  - `src/test/.../GlobalExceptionHandlerTest.java` — 12 tests, standalone MockMvc, no DB/
-    Kafka/Eureka needed. Locks the status codes, the JSON field names, traceId reuse, and
-    that an unexpected exception does not leak its message.
-
-  **IncidentService (pilot) — 8 files changed**
-  - `pom.xml` — added the `common-web` dependency.
-  - `service/IncidentService.java` — all 13 live `RuntimeException`s replaced:
-    3× incident-not-found → `NotFoundException(INCIDENT_NOT_FOUND)`;
-    caller-inactive (create/assign/status) → `ForbiddenException(USER_NOT_ACTIVE)`;
-    access/update/status denied → `ForbiddenException`;
-    engineer-not-active / not-an-engineer → `ValidationException` (400, because the fix is
-    for the client to pick a different engineer, not a permission problem);
-    `assignedByMe` filter misuse → `ForbiddenException`.
-  - `client/UserClient.java` — a 404 from UserService now becomes
-    `NotFoundException(USER_NOT_FOUND)` instead of a blanket 500. Other statuses stay a
-    500, which is correct for "a dependency failed".
-  - `controller/IncidentController.java` — added `@Valid` to all 4 request bodies. They had
-    NONE, so the DTO annotations were never being enforced.
-  - `dto/AssignIncidentRequestDTO.java` — added `@NotNull` on `enginerId`.
-  - `dto/UpdateIncidentStatus_RequestDTO.java` — replaced `@Column(nullable=false)` (a JPA
-    annotation, inert on a DTO) with a real `@NotNull`; added `@Size(2000)` on rootCause and
-    resolutionNotes.
-  - `dto/UpdateIncidentMetadate_RequestDTO.java` — added `@Size` limits matching the entity
-    columns (title 255, description 2000).
-
-  **AuthService — 11 files changed**
-  - `pom.xml` — added `common-web`.
-  - `controller/TokenVersionController.java` — user-not-found → `NotFoundException`.
-  - `controller/PasswordController.java` — added `@Valid` (was completely missing).
-  - `service/LogoutUserService.java` — 2× user-not-found → `NotFoundException`.
-  - `service/ChangePasswordService.java` — user-not-found → `NotFoundException`;
-    wrong old password → `UnauthorizedException(INVALID_OLD_PASSWORD)`.
-  - `service/RegisteringUserService.java` — duplicate username/email →
-    `ConflictException(USERNAME_TAKEN / EMAIL_TAKEN)`. The missing-ROLE_ENGINEER throw was
-    deliberately LEFT as a RuntimeException (→ 500): missing seed data is our fault, not the
-    caller's, so a 4xx would blame the wrong side. Commented as such.
-  - `service/LoginUserService.java` — **client-visible change.** Login failures used to
-    return HTTP 401 with a `LoginResponseDTO` body (its own private error shape). They now
-    throw `UnauthorizedException`, so they return the standard ErrorResponse.
-    `HandleMultipleFailedLoginAttempts` changed from `ResponseEntity`-or-null to void+throw.
-    Unknown-email and wrong-password now return the SAME message on purpose — the old code
-    said "email not exist", which let anyone harvest valid accounts.
-  - `service/UpdateCredentialsService.java` — **client-visible change.** The raw string
-    bodies `"Invalid password"` (401), `"Email already exists"` (400) and
-    `"Username already exists"` (400) are gone. Now `UnauthorizedException` and
-    `ConflictException` (409 — a taken name is a state clash, not a malformed request).
-    Return type tightened from `ResponseEntity<?>` to `ResponseEntity<UpdateCredentialResponseDTO>`.
-  - `service/UpdateRoleService.java` — user-not-found → `NotFoundException`; added a
-    `toRoleName` helper so an unknown role string is a 400 listing the valid roles instead
-    of an `IllegalArgumentException` surfacing as a 500. Role-valid-but-missing-from-DB
-    intentionally stays a 500.
-  - `dto/ChangePasswordDTO.java` — had NO constraints; added `@NotBlank` on both fields and
-    `@Size(min=6)` on the new password.
-  - `dto/SignupFormDTO.java` — added the missing `@NotBlank` on password (CLAUDE.md §9 #15:
-    `@Size` alone lets null through, so a passwordless signup reached `encode(null)`).
-  - `dto/LoginFromDTO.java` — same missing `@NotBlank` on password.
-  - `dto/UpdateUserRolesRequestDTO.java` — added `@NotEmpty` on the roles set.
-
-  **UserService — 5 files changed**
-  - `pom.xml` — added `common-web`.
-  - `service/UserService.java` — all 18 live `RuntimeException`s replaced. Notably
-    `LimitedUserInfoForValidation` now throws `NotFoundException`, which is what makes
-    IncidentService's 404 mapping actually work end-to-end. Role-mismatch cases →
-    `ValidationException`; "you can only update your assigned engineers" →
-    `ForbiddenException`; circular hierarchy → `ConflictException`.
-  - `controller/UserController.java` — added `@Valid` to 3 request bodies.
-  - `dto/StatusRequestDTO.java` — added `@NotNull` on status.
-  - `dto/AssignEngineerRequestDTO.java` — added `@NotNull` on both ids.
-
-  **ReportingService — 2 files changed**
-  - `pom.xml` — added `common-web`.
-  - `service/ReportingService.java` — incident-report-not-found → `NotFoundException`.
-    (This service had only ONE throw site.)
-
-  **Ai-Service — 1 file changed**
-  - `pom.xml` — added `common-web`. No throw sites existed to migrate; it now inherits the
-    shared handler for framework-level failures (bad UUID, malformed JSON, access denied).
-
-  **APIGateway — 1 file changed (hand-matched, does NOT use common-web)**
-  - `filter/JwtGatewayFilter.java` — the gateway is WebFlux, where `@RestControllerAdvice`
-    does nothing, so the shape is reproduced by hand.
-    `onError` previously sent a status code and an **empty body**; it now writes the same
-    6-field JSON. Error codes added: `MISSING_TOKEN`, `INVALID_TOKEN`, `TOKEN_REVOKED`,
-    `AUTH_SERVICE_UNAVAILABLE`.
-    **Behaviour change:** AuthService being unreachable now returns **503, not 401** — it
-    used to tell users their token was bad and make them re-login, hiding a real outage.
-    Also now generates an `X-Trace-Id` and forwards it downstream, so one id covers the
-    whole call chain rather than each service inventing its own.
-
-  **NOT changed, on purpose**
-  - `NotificationService` — verified it has zero `@RestController`/`@RequestMapping`, so
-    there is no HTTP response for an advice to intercept. It picks this up if it ever gets
-    an API.
-  - `Eureka` — no application endpoints of its own.
-
-  **Verification:** all 11 modules build clean via Maven, in dependency order.
-  12/12 `common-web` contract tests pass. Runtime behaviour has NOT been verified against a
-  live stack (needs MySQL + Postgres + Kafka + Eureka running) — that is the remaining
-  manual check for A1.
+The old version used long sentences and hard words, and was difficult to read.
+Rule 6 was added to the agreed rules so this stays that way.

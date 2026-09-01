@@ -331,12 +331,17 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 ### Structural / duplication
 
-23. **`AuthService:0.0.1-SNAPSHOT` (a Spring Boot application) is declared as a dependency** of
+23. ~~**`AuthService:0.0.1-SNAPSHOT` (a Spring Boot application) is declared as a dependency** of
     UserService, IncidentService, NotificationService and ReportingService — and **nothing imports
     from it** (one commented import in `UserLoggedInEventConsumer`). Dead coupling that forces an
-    `AuthService install` before any of them build.
-24. Root pom omits 4 of the 10 modules; no service uses the root pom as its parent, so its
-    version/dependency management is decorative.
+    `AuthService install` before any of them build.~~ **RESOLVED** - removed from all four
+    services; verified nothing imports from it and everything still builds.
+24. ~~Root pom omits 4 of the 10 modules~~ **RESOLVED 2026-09-01** (Track A4) - all 11 modules
+    are now listed and `mvn clean install` at the root builds everything in one command,
+    verified by deliberately breaking `shared-events` and confirming the build caught it.
+    Still true: no service uses the root pom as its `<parent>`, so its `<properties>` are
+    decorative - now clearly commented as such. Making them real is a separate task, blocked
+    on two deliberate exceptions (common-security on Boot 3.3.2, Ai-Service on Java 17).
 25. `common-security` is on Spring Boot 3.3.2 while every consumer is on 3.5.11.
 26. `Ai-Service` targets Java 17 while every other module targets 21.
 27. `common-security`'s source dir is literally `src/main/java/com.project.security/` (one flat

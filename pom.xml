@@ -12,16 +12,45 @@
 
     <name>Incident Management Platform</name>
     <description>Microservices-based incident management platform</description>
+<!-- Goal: The whole point of putting modules in a parent pom.xml is such that
+ 1.we  define properties like Java version, Spring Boot etc here in root pom file
+and  every module automatically inherit it — instead of repeating the same setting in 11 different files.
+  2. we use it to build entire project with one command. instead of building each service seperately.
 
+why is it not working right now?
+here the second point is only working, first pont is not working because:
+right now our parent pom file is passing down the settings(properties) to its children (modules).
+But this will only works if a child modules actually says: "this is my parent." But right none of our  11 modules say "the root pom.xml is my parent."
+Instead, every single one of them says:"My parent is spring-boot-starter-parent" (a Spring Boot file, not your root file).
+why we are not fixing it?
+why we are no solving this now?
+because then spring boot each service verion management is handled by the this root file.
+but we have Two modules where:
+1.common-security is intentionally using an older Spring Boot version (3.3.2) instead of the newer one everyone else uses (3.5.11)
+2.Ai-Service is intentionally using Java 17 instead of Java 21
+ So it is not mechanical - it forces decisions about two intentional
+         exceptions. That is its own task, not a side effect of fixing the build.
+         Both exceptions are recorded in BUGS-TO-FIX-LATER.md (E5, E6).
+  -->
     <modules>
-        <module>shared-events</module>
-        <module>common-security</module>
+        <!-- Shared libraries: plain JARs, not runnable. Everything else depends on these. -->
+        <module>shared-events</module>      <!-- Kafka event classes -->
+        <module>common-security</module>    <!-- HeaderAuthFilter -->
+        <module>common-web</module>         <!-- error handling: exceptions + handler + traceId -->
+
+        <!-- Infrastructure services -->
+        <module>Eureka</module>             <!-- service registry -->
+        <module>APIGateway</module>         <!-- JWT check + header injection -->
+
+        <!-- Business services -->
         <module>AuthService</module>
         <module>UserService</module>
-        <module>APIGateway</module>
-        <module>Eureka</module>
+        <module>IncidentService</module>
+        <module>NotificationService</module>
+        <module>ReportingService</module>
+        <module>Ai-Service</module>
     </modules>
-<!--central configuration for all microservices-->
+
     <properties>
         <java.version>21</java.version>
         <maven.compiler.source>21</maven.compiler.source>
