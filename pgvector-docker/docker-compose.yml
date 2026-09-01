@@ -1,0 +1,82 @@
+# =============================================================================
+# pgvector - PostgreSQL + vector extension, used ONLY by Ai-Service
+#
+# WHY THIS FILE EXISTS
+# This container was originally started with a hand-typed `docker run` command.
+# That worked, but the settings (port, volume name, database name) then lived
+# only inside Docker's own state - written down nowhere. Delete the container and
+# you would have to remember them exactly.
+#
+# Same problem as the `shedlock` table in ReportingService: not insecure, just
+# unreproducible. This file is the fix.
+#
+# HOW TO USE
+#   Start:  docker compose -f pgvector-docker/docker-compose.yml up -d
+#   Stop:   docker compose -f pgvector-docker/docker-compose.yml down
+#
+# NOTE: `down` removes the container but NOT the data - that lives in the named
+# volume below, which is deliberately external to this file.
+# =============================================================================
+
+services:
+  pgvector:
+    image: pgvector/pgvector:pg17
+    container_name: pgvector-db
+
+    ports:
+      # Bound to 127.0.0.1 so ONLY this machine can connect. Without the prefix,
+      # Docker would publish on 0.0.0.0 - every network interface - and any
+      # machine that could reach this laptop could try to connect.
+      # Host port is 5433 (not the usual 5432) because a local PostgreSQL install
+      # may already be using 5432. Ai-Service's application.properties expects 5433.
+      - "127.0.0.1:5433:5432"
+
+    environment:
+      POSTGRES_DB: vector_db
+
+      # The password is deliberately NOT written here - this file is committed to
+      # git. It is read from the `password` environment variable, the same one
+      # Ai-Service already uses for spring.datasource.password.
+      #
+      # The ":?" part means "fail immediately with this message if the variable is
+      # not set". Without it, Docker would substitute an empty string and silently
+      # create a database with a blank password.
+      POSTGRES_PASSWORD: ${password:?the 'password' env var must be set before starting pgvector}
+
+      # POSTGRES_USER is intentionally omitted, which leaves the default:
+      # "postgres". That matches what Ai-Service's application.properties expects.
+
+      # POSTGRES_HOST_AUTH_METHOD is intentionally NOT set. Setting it to "trust"
+      # would let anything connect with no password at all. Leaving it unset keeps
+      # normal password authentication. Do not add it.
+
+    # "unless-stopped" means the container comes back automatically after a reboot
+    # or a Docker restart, but stays down if you stop it deliberately.
+    # The original container was created with restart policy "no", which is why it
+    # was found stopped after Docker restarted.
+    restart: unless-stopped
+
+    # Lets `docker ps` show whether Postgres is actually ready to accept queries,
+    # rather than just whether the container process is alive. Useful because
+    # Postgres takes a few seconds to initialise on first start.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vector_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+
+volumes:
+  pgvector_data:
+    # "external: true" means: use the volume that ALREADY exists on this machine,
+    # do not create a new one.
+    #
+    # This matters. By default Compose would create a volume named
+    # "pgvectordocker_pgvector_data" (project name prefixed) - a brand new, empty
+    # one - and the existing embeddings would be left behind in the old volume,
+    # appearing to have vanished.
+    external: true
+    name: pgvector_data

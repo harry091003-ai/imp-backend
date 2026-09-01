@@ -52,6 +52,13 @@ out/
 *.env
 !.env.example
 
+# --- Database backups ---------------------------------------------------------
+# Safety dumps taken before running migrations. These contain REAL DATA and must
+# never be committed. Flyway migration files under src/main/resources/db/migration/
+# are NOT affected by this rule - those are schema only, and they must be tracked.
+db-backups/
+*.dump
+
 # --- Logs and runtime noise ---------------------------------------------------
 *.log
 logs/

@@ -3,8 +3,14 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     container_name: zookeeper
-    ports:
-      - "2181:2181"
+    # No "ports:" section on purpose.
+    # Kafka reaches ZooKeeper over Docker's own internal network using the
+    # hostname "zookeeper" (see KAFKA_ZOOKEEPER_CONNECT below), so ZooKeeper
+    # never needed to be published to the host machine at all.
+    # It used to be published on 2181 to every network interface, and ZooKeeper
+    # has no authentication by default - meaning anyone who could reach this
+    # machine on port 2181 could change Kafka's metadata.
+    # Removing the mapping closes that completely instead of merely narrowing it.
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -12,7 +18,17 @@ services:
     image: confluentinc/cp-kafka:7.4.0
     container_name: kafka
     ports:
-      - "9092:9092"
+      # "127.0.0.1:9092:9092" instead of "9092:9092".
+      # Without the 127.0.0.1 prefix, Docker publishes the port on 0.0.0.0 -
+      # every network interface - so any machine that could reach this laptop
+      # could talk to Kafka. This broker runs PLAINTEXT with no authentication,
+      # so that meant reading every topic (user emails, incident data),
+      # publishing forged events, or deleting topics.
+      # The prefix restricts it to this machine only. Nothing else changes:
+      # KAFKA_ADVERTISED_LISTENERS below already says localhost, and all our
+      # services connect to localhost:9092.
+      # (The pgvector container was already correctly bound this way.)
+      - "127.0.0.1:9092:9092"
     depends_on:
       - zookeeper
     environment:

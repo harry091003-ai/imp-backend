@@ -8,7 +8,7 @@
 > conventions, domain model, full catalogue of known issues). This file tracks the **plan to
 > fix things**, in order, with status.
 
-Last updated: 2026-08-28 · Owner: Harmandip Singh
+Last updated: 2026-08-28 · 
 
 ---
 
@@ -67,7 +67,7 @@ file for the exact per-file list. All 11 modules build clean; 12/12 contract tes
 
 ---
 
-### A2. Database migrations — 🔴 — STATUS: not started
+### A2. Database migrations — 🔴 — STATUS: ✅ DONE (2026-09-01)
 
 **Why second:** cost of delay compounds fastest of anything on this list — `ddl-auto=update`
 silently orphans data on renames (adds a new column, leaves the old one full of stale data,
@@ -92,7 +92,105 @@ approach there needs to respect that the vector table is intentionally not Hiber
 - Order of services to migrate (probably matches Track A4 build-fix order, or start with
   AuthService since it's foundational).
 
-**Not started. No files touched yet.**
+**DECIDED:** Flyway (not Liquibase) — plain `.sql` files are reviewable; Liquibase's changelog
+layer buys us nothing here and its rollback is a paid feature in Flyway anyway.
+**DECIDED:** keep the existing local data rather than wiping — the user specifically wants to
+learn the "database already has rows" baselining case, which is the real-world situation.
+No safety backup taken: user confirmed the data is dummy/disposable.
+
+**AuthService pilot — files changed 2026-08-29:**
+| File | Change |
+|---|---|
+| `AuthService/src/main/resources/db/migration/V1__baseline.sql` | **New.** Schema captured from the live DB via `mysqldump --no-data`, then reordered (roles → users → user_roles) so foreign keys resolve on an empty database, with `AUTO_INCREMENT=4` and the mysqldump preamble stripped |
+| `AuthService/pom.xml` | Added `flyway-core` + `flyway-mysql` (both needed — core alone fails with "Unsupported Database: MySQL" on Flyway 10+). Resolved to 11.7.2 via the Boot parent |
+| `AuthService/src/main/resources/application.properties` | `ddl-auto=update` → `validate`; added `spring.flyway.*` settings including `baseline-on-migrate=true` |
+| `.gitignore` | Added `db-backups/` + `*.dump` so schema/data dumps are never committed |
+| `FLYWAY-NOTES.md` | **New** (user-authored, reviewed + extended). Part 2 is the running migration log |
+| `ERROR_HANDLING_FLOW.md` | **New.** Plain-English A1 walkthrough (belongs to A1, written this session) |
+| `BUGS-TO-FIX-LATER.md` | Added E7 (bit(1) vs tinyint(1) boolean inconsistency) and E8 (orphan `inicident-management-aiservicedb`) |
+
+**Build verified** (`mvn clean package`) — but **NOT yet run against the database.** The next
+step is starting AuthService and confirming Flyway baselines cleanly and `validate` passes.
+Cannot be done by the assistant: needs the `user`/`password`/`secretkey` env vars.
+
+**Known risk on first run:** `ddl-auto=validate` may reject `account_locked tinyint(1)` because
+the entity declares `columnDefinition = "TINYINT(1)"` while Hibernate's default for `Boolean` is
+`bit(1)`. If it fails, the app simply refuses to start — nothing is modified — and the fix is
+either an explicit entity mapping or a deliberate type-normalising migration (BUGS E7).
+
+**Still pending for AuthService:** `V2__seed_roles.sql`. The three role rows currently exist only
+because they were inserted by hand; a fresh machine would get a valid schema and a broken signup.
+
+**AuthService pilot RESULT (2026-08-31): ✅ verified working.** Flyway baselined the existing
+database, `ddl-auto=validate` passed, service started, new users created successfully. The
+`account_locked tinyint(1)` risk flagged earlier did NOT materialise — Hibernate accepted it.
+
+**Post-verification fix:** the user added explanatory comments to `AuthService/.../V1__baseline.sql`
+using `--text` with no space. MySQL requires `-- text` (space after the dashes) — 26 lines were
+invalid SQL, including one *inside* the `CREATE TABLE`. Harmless on this machine because V1 was
+baselined rather than executed, but it would have broken any fresh database. Fixed by inserting a
+single space per line; no wording changed. Safe to edit because baseline rows store
+`checksum = NULL` — that exception does NOT extend to V2+.
+
+**Rollout to the 4 remaining MySQL services — 2026-08-31:**
+| File | Change |
+|---|---|
+| `UserService/pom.xml`, `IncidentService/pom.xml`, `NotificationService/pom.xml`, `ReportingService/pom.xml` | Added `flyway-core` + `flyway-mysql` |
+| `.../src/main/resources/application.properties` (×4) | `ddl-auto=update` → `validate`, plus the `spring.flyway.*` block |
+| `UserService/.../db/migration/V1__baseline.sql` | **New** — 3 tables, reordered for FK safety |
+| `IncidentService/.../db/migration/V1__baseline.sql` | **New** — 1 table |
+| `NotificationService/.../db/migration/V1__baseline.sql` | **New** — 1 table |
+| `ReportingService/.../db/migration/V1__baseline.sql` | **New** — 7 tables incl. the non-entity `shedlock` |
+
+All 4 build clean; baselines verified against the dumps programmatically — 12 tables / 106 columns,
+zero drift, no columns lost or invented. **Not yet run against their databases.**
+
+**Findings recorded in BUGS-TO-FIX-LATER.md** (not fixed — a baseline must copy reality exactly or
+`validate` fails): E9 `incidents` has no indexes despite 3 query paths; E10 suspicious
+`CHECK (event_type between 0 and 7)` on an 8-value enum; E11 `USER_LOOGED_OUT` typo in the audit
+enum.
+
+**Biggest catch of this pass:** ReportingService's `shedlock` table is not a JPA entity and was
+created by hand — it existed only on this machine and was recorded nowhere. A fresh laptop would
+have started fine, then failed at runtime when the SLA schedulers ran. It is now in V1.
+
+**Also spotted:** the user commented out the dead `AuthService` dependency in
+`IncidentService/pom.xml` (CLAUDE.md §9 item 23). Still builds — confirms it was unused. The same
+removal is still pending in UserService, NotificationService and ReportingService (A4 work).
+
+**Remaining:** Ai-Service (PostgreSQL, last — its hand-made `resolved_incidents_vectors` pgvector
+table stays outside Flyway). Postgres was not running on 5433 during this session.
+
+**COMPLETE 2026-09-01.** All 6 JPA services on Flyway with `ddl-auto=validate`. 8 migration
+files total (6 baselines + 2 role seeds). All 11 modules build clean; every migration verified
+packaged into its jar; all baselines verified against their dumps programmatically (14 tables,
+118 columns, 3 Postgres extensions - zero drift).
+
+**The fresh-database path was tested for real**, not just assumed: a throwaway database was
+created, AuthService pointed at it, and Flyway built the schema from V1 and seeded roles from V2.
+That was the one thing the baseline path could never prove.
+
+**Two undocumented hand-created tables were recovered** - ReportingService's `shedlock` and
+Ai-Service's `resolved_incidents_vectors`. Both existed only on this machine, described in no
+file. Neither is a JPA entity, so `ddl-auto=validate` does not check them; without capturing them,
+a fresh machine would have started fine and then failed at runtime.
+
+**Ai-Service specifics:** `flyway-database-postgresql` (not `flyway-mysql`); 3 extensions (`vector`
+essential, `uuid-ossp`/`hstore` likely unused - E13); everything in V1 rather than a split V2,
+matching how `shedlock` was handled and avoiding a V2 that would execute against the existing DB.
+
+**Lesson recorded twice:** migrations above the baseline version DO execute on existing databases.
+`V2__seed_roles.sql` needed `INSERT IGNORE`; the Ai-Service vector table was folded into V1 for the
+same reason.
+
+**Findings logged, not fixed** (a baseline must copy reality or `validate` fails): E7 bit/tinyint
+boolean split, E9 `incidents` has no indexes, E10 suspicious CHECK on an 8-value enum, E11
+`USER_LOOGED_OUT` typo, E12 embedding column unindexable at 3072 dims, E13 unused extensions.
+
+**Infrastructure hardened along the way** (not strictly A2): Kafka was bound to `0.0.0.0:9092`
+with no authentication and ZooKeeper to `0.0.0.0:2181`; both are now localhost-only/unpublished.
+pgvector gained a compose file (`pgvector-docker/docker-compose.yml`) - its config previously
+existed only inside Docker's state, the same class of problem as the two lost tables.
 
 ---
 
@@ -150,7 +248,7 @@ Kafka DLQ/retry policy, notification email actually being implemented — are gu
 | Item | Priority | Status | Notes |
 |---|---|---|---|
 | A1 — Error handling & response contract | 🔴 highest | ✅ **Done** 2026-08-28 | `common-web` module; 5 services + gateway |
-| A2 — DB migrations (Flyway/Liquibase) | 🔴 | Not started | Tool choice TBD |
+| A2 — DB migrations (Flyway) | 🔴 | ✅ **Done 2026-09-01** | All 6 JPA services; 8 migrations; fresh-DB path tested |
 | A3 — Config & profiles | ⏸️ deferred | Out of scope for now | Local-machine only, revisit later |
 | A4 — Fix split build (root pom reactor) | 🟠 | Not started | Blocks Track C later |
 | Track B | ❓ undefined | Not discussed | Ask user before assuming |

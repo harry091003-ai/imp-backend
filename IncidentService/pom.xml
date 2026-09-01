@@ -66,6 +66,23 @@
             <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
         </dependency>
+
+        <!-- Flyway: owns the database schema from now on.
+             Runs the SQL files in src/main/resources/db/migration on startup,
+             BEFORE Hibernate gets involved.
+             No <version> here on purpose - spring-boot-starter-parent picks a
+             Flyway version tested against this Spring Boot release. -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <!-- Flyway 10+ split each database's support into its own module.
+             Without flyway-mysql, Flyway starts and then fails with
+             "Unsupported Database: MySQL". flyway-core alone is not enough. -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-mysql</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

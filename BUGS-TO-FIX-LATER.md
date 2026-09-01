@@ -145,6 +145,165 @@ failures at runtime that look nothing like a version problem.
 
 ---
 
+### E7. `users.enabled` and `users.account_locked` use two different boolean types
+
+In `inicident-management-authservicedb`, the `users` table stores two true/false flags in two
+different ways:
+
+```
+`enabled`        bit(1)      NOT NULL
+`account_locked` tinyint(1)  NOT NULL
+```
+
+**Why:** the `User` entity has `@Column(columnDefinition = "TINYINT(1)")` on `accountLocked` only.
+For `enabled` Hibernate used its own default for MySQL, which is `bit(1)`. Nobody chose this - it
+is an accident of one field having an explicit override and the other not.
+
+**Impact today:** none functionally, both work. It is a consistency and readability problem:
+`SELECT * FROM users` shows one column as a binary blob and the other as 0/1.
+
+**Why it was NOT fixed while adding Flyway:** `V1__baseline.sql` must describe the database
+*exactly as it really is*, or `ddl-auto=validate` fails. Changing a column type is a real schema
+change and deserves its own migration, written deliberately, not smuggled into a baseline.
+
+**Fix later as:** a `V<n>__normalise_user_boolean_columns.sql` migration, applied to AuthService
+and checked against UserService (which mirrors this entity and may have the same split).
+
+---
+
+### E8. Orphan MySQL database `inicident-management-aiservicedb`
+
+MySQL still contains a database named `inicident-management-aiservicedb`, but `Ai-Service` no
+longer points at MySQL at all - its `application.properties` targets PostgreSQL (`vector_db`), and
+its own comment explains the move was made so the vector store and the regular tables could live
+in one database.
+
+So this MySQL database appears to be a leftover from before that switch and is almost certainly
+unused.
+
+**Do not just drop it.** Confirm first that nothing reads it (no service config references it),
+then drop it deliberately so it stops appearing in the database list and confusing future work.
+
+---
+
+### E9. `incidents` table has no indexes at all
+
+`inicident-management-incidentservicedb`.`incidents` has a primary key on `id` and **nothing
+else** - confirmed from the schema dump taken 2026-08-31.
+
+But `IncidentRepository` queries by three other columns on the main "list incidents" path:
+
+```java
+Page<Incident> findByCreatedBy(UUID userId, Pageable pageable);
+Page<Incident> findByAssignedTo(UUID userId, Pageable pageable);
+Page<Incident> findByAssignedBy(UUID userId, Pageable pageable);
+```
+
+plus `findIncidentsForUser(...)`, which filters on `assigned_to` and `created_by`.
+
+With no index, every one of those makes MySQL read the whole table row by row. Invisible with a
+few dozen test rows; the slowest thing in the platform once it grows.
+
+**Not fixed while adding Flyway** because `V1__baseline.sql` must describe the database exactly
+as it is, or `ddl-auto=validate` fails. Adding indexes is a real schema change.
+
+**Fix later as:** `V2__add_incident_indexes.sql` - likely indexes on `created_by`, `assigned_to`,
+`assigned_by`, and possibly a composite with `created_at` since results are sorted by it
+descending. Compare against ReportingService's `incident_report`, which is already indexed
+thoughtfully - IncidentService simply never got the same attention.
+
+---
+
+### E10. Suspicious CHECK constraint on `notification_log.event_type`
+
+The schema dump shows a Hibernate-generated constraint:
+
+```sql
+CONSTRAINT `notification_log_chk_1` CHECK ((`event_type` between 0 and 7))
+```
+
+`event_type` is a MySQL `enum` with **8** values. In MySQL, comparing an ENUM against numbers
+uses the value's *position*, and positions start at **1** (0 is the reserved invalid value). So
+the 8 values occupy positions 1-8, and the last one - `USER_UPDATED` - sits at position 8, which
+appears to fall outside `between 0 and 7`.
+
+**Impact:** likely none today. NotificationService only consumes incident events, so
+`USER_UPDATED` is probably never written. That is exactly why this is worth recording - it would
+surface much later, as a confusing constraint violation, if that event type is ever used.
+
+**Needs verifying, not assuming.** Test it directly before changing anything:
+
+```sql
+INSERT INTO notification_log (id, event_id, event_type, recipient_email)
+VALUES (UUID_TO_BIN(UUID()), UUID_TO_BIN(UUID()), 'USER_UPDATED', 'test@example.com');
+```
+
+If it fails, fix it in its own migration (drop and recreate the constraint with the correct
+range, or drop it entirely - the native `enum` type already restricts the allowed values, which
+makes the CHECK largely redundant). If it succeeds, delete this entry.
+
+**Also check `incident_audit_log.event_type` in ReportingService**, which has 10 enum values and
+may carry the same pattern.
+
+---
+
+### E11. Typo baked into the database: `USER_LOOGED_OUT`
+
+`ReportingService`'s `incident_audit_log.event_type` enum contains `USER_LOOGED_OUT` - should be
+`USER_LOGGED_OUT`. It is spelled that way in the Java enum, so Hibernate created the column that
+way, and it is now reproduced in `V1__baseline.sql` (correctly - the baseline copies reality).
+
+**Fixing it is a two-part change**, which is why it was not done in passing: the Java enum has to
+change *and* a migration has to `ALTER` the column definition and rewrite any existing rows
+holding the old spelling. Doing only one half breaks the other.
+
+---
+
+### E12. `resolved_incidents_vectors.embedding` has no index — and cannot easily get one
+
+The pgvector table has a primary key on `id` and no index on the `embedding` column, so every
+similarity search scans the whole table and computes a distance for each row.
+
+With a small number of resolved incidents this is genuinely fine, and it has the advantage of
+being *exact* — pgvector's index types are approximate.
+
+**The catch worth knowing before anyone "fixes" it:** pgvector's `hnsw` and `ivfflat` indexes
+support roughly **2000 dimensions**. This column is `vector(3072)`, matching
+`gemini-embedding-001`'s default output. So the standard advice ("just add an HNSW index") is
+expected to be rejected outright. Verify with:
+
+```sql
+CREATE INDEX ON resolved_incidents_vectors USING hnsw (embedding vector_cosine_ops);
+```
+
+If it fails on the dimension limit, the real options are:
+- store as `halfvec`, which supports more dimensions for indexing, or
+- configure `gemini-embedding-001` to emit fewer dimensions (it supports smaller sizes)
+
+**Either option requires regenerating every embedding through the Gemini API** — real cost and
+time, not just a schema change. Also note `AiConfig.dimensions(3072)` and the
+`spring.ai.google.genai.embedding.*` settings would have to change in step, or it breaks at
+runtime rather than at startup.
+
+Not urgent while the dataset is small. Written down so the trade-off is understood in advance
+rather than discovered under pressure.
+
+---
+
+### E13. Possibly unused PostgreSQL extensions: `hstore` and `uuid-ossp`
+
+`vector_db` has three extensions enabled: `vector`, `uuid-ossp` and `hstore`.
+
+`vector` is essential. The other two appear unused — application ids are generated in Java, not
+by `uuid-ossp`, and the vector table's `metadata` column uses `jsonb` rather than `hstore`. They
+likely came from an image template or were enabled speculatively.
+
+Reproduced as-is in `V1__baseline.sql` because a baseline copies reality. Confirm nothing depends
+on them, then drop them in their own migration if genuinely unused — fewer enabled extensions
+means less attack surface.
+
+---
+
 ## Fixed
 
 _Move items here with the date once resolved._

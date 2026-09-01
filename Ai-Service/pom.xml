@@ -140,6 +140,24 @@
         <scope>runtime</scope>
     </dependency>
 
+    <!-- Flyway: owns the database schema from now on.
+         Runs the SQL files in src/main/resources/db/migration on startup,
+         BEFORE Hibernate gets involved.
+         No <version> here on purpose - spring-boot-starter-parent picks a
+         Flyway version tested against this Spring Boot release. -->
+    <dependency>
+        <groupId>org.flywaydb</groupId>
+        <artifactId>flyway-core</artifactId>
+    </dependency>
+    <!-- Flyway 10+ split each database's support into its own module. The other
+         five services use flyway-mysql; this one is PostgreSQL, so it needs
+         flyway-database-postgresql instead. Without it Flyway starts and then
+         fails with "Unsupported Database: PostgreSQL". -->
+    <dependency>
+        <groupId>org.flywaydb</groupId>
+        <artifactId>flyway-database-postgresql</artifactId>
+    </dependency>
+
     <dependency>
         <groupId>org.springframework.ai</groupId>
         <artifactId>spring-ai-pgvector-store</artifactId>

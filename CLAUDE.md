@@ -247,8 +247,14 @@ The root reactor (`mvn clean install`) only covers 6 of the 10 modules.
 `roles` rows (`ROLE_ADMIN/ROLE_ENGINEER/ROLE_SUPERVISOR`) must be seeded by hand — signup does
 `roleRepository.findByRolename(ROLE_ENGINEER).orElseThrow()`.
 
-Schema is managed by **`spring.jpa.hibernate.ddl-auto=update`** in all 6 JPA services.
-No Flyway/Liquibase, no migration scripts.
+Schema is managed by **Flyway** (as of 2026-09-01, Track A2). All 6 JPA services run
+`spring.jpa.hibernate.ddl-auto=validate` and keep versioned SQL in
+`src/main/resources/db/migration/`. Each was baselined from its live schema via
+`mysqldump --no-data` / `pg_dump --schema-only`, with `spring.flyway.baseline-on-migrate=true`.
+Flyway 11.7.2, managed by the Boot parent. MySQL services need `flyway-core` + `flyway-mysql`;
+Ai-Service needs `flyway-core` + `flyway-database-postgresql`.
+**Never edit an applied migration** - Flyway checksums them. Add a new `V<n>__*.sql` instead.
+See [FLYWAY-NOTES.md](FLYWAY-NOTES.md) for the full explanation and per-migration log.
 
 **Tests**: 8 auto-generated `contextLoads()` classes, **no real tests anywhere**. They will fail
 without the env vars and running infrastructure. `spring-boot-starter-test` and
@@ -369,7 +375,10 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 40. ~~No global exception handling, no `@ControllerAdvice`, no problem-details responses.~~
     **RESOLVED 2026-08-28** by the `common-web` module (Track A1). See §7 Conventions.
-41. No Flyway/Liquibase; `ddl-auto=update` on every JPA service.
+41. ~~No Flyway/Liquibase; `ddl-auto=update` on every JPA service.~~ **RESOLVED 2026-09-01**
+    (Track A2). Flyway on all 6 JPA services, `ddl-auto=validate` everywhere. Two tables that
+    were previously undocumented and hand-created - ReportingService's `shedlock` and
+    Ai-Service's `resolved_incidents_vectors` - are now captured in their baselines.
 42. No tests, no CI, no Dockerfiles, no profiles, no config server.
 43. Actuator exposes only `info,health`, but `show-details=always` in Auth/User/Notification/Reporting.
 44. Secrets come from bare env vars with no defaults and no validation.
