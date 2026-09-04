@@ -25,11 +25,12 @@ Last updated: 2026-09-01
 | A2 | Database migrations (Flyway) | ✅ Done — 2026-09-01 |
 | A3 | Config and profiles | ⏸️ Skipped on purpose |
 | A4 | Fix the build | ✅ Done — 2026-09-01 |
-| Track B | Not decided yet | ❓ Need to discuss |
+| B1 | Stop people faking an Admin | 🔨 Step 1 done and proven. Steps 2 and 3 left |
+| B2 to B5 | Kafka, timeouts, input checks, rate limits | ⬜ Planned, not started |
 | Track C | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
 
-**Track A is finished.**
+**Track A is finished. Track B has started.**
 
 ---
 
@@ -416,11 +417,210 @@ That is a Track C problem, not something this change broke.
 
 ---
 
-# Track B, C and D — not decided yet
+# Track B — Security and reliability
 
-You mentioned these tracks but we never discussed what is in them.
+We agreed this list on 2026-09-01. There are 5 items. B1 is by far the most important.
 
-**Do not guess.** Ask before starting any of them.
+| Item | What it is | Status |
+|---|---|---|
+| B1 | Anyone could pretend to be an Admin | 🔨 Doing now |
+| B2 | Kafka messages can get stuck forever | ⬜ Not started |
+| B3 | One slow service can freeze everything | ⬜ Not started |
+| B4 | Missing input checks | ⬜ Not started |
+| B5 | Nothing stops someone spamming the app | ⬜ Not started |
+
+---
+
+## B1 — Anyone could pretend to be an Admin 🔴
+
+### How your system works today
+
+1. The gateway checks your login token.
+2. If it is good, the gateway adds three headers: `X-User-Id`, `X-Roles`, `X-User-Email`.
+3. The gateway passes the request on to a service.
+4. The service trusts those headers. It never checks the token itself.
+
+This is a normal design. It is fine **as long as nobody can reach a service directly**.
+
+### The real problem
+
+Every one of your services listens on `0.0.0.0`. That means "any network can reach me".
+
+So somebody who can reach your laptop can skip the gateway completely:
+
+```
+curl -H "X-User-Id: 000..." -H "X-Roles: ROLE_ADMIN" http://your-host:8085/incidents
+```
+
+No password. No token. The service believes it, because that is exactly what the gateway would
+have sent.
+
+This is the same problem Kafka had, and the same fix works.
+
+### Two things we checked, and they are NOT problems
+
+We looked at both before planning. Both turned out fine:
+
+**1. Fake headers cannot sneak through the gateway.** The gateway uses `builder.header(...)`, and
+that method *replaces* a header instead of adding a second one. So a fake `X-Roles` sent by a
+client gets overwritten by the real one before the request goes onward.
+
+**2. `/auth/**` skipping the token check is safe today.** Those routes only reach login, signup
+and token-version. We read all three. Login and signup read the request body. Token-version reads
+the URL. **None of them read a header.** So a fake header there does nothing.
+
+It is still worth stripping headers on `/auth/**` later, but only to stop a future mistake. Not
+because anything is broken now.
+
+### What we decided NOT to do, and why
+
+The first idea was: make every service decode the login token itself.
+
+**We rejected it.** It copies the gateway's job into 6 places. Checking the token is the gateway's
+whole purpose. Doing it 7 times is redundant. It would also mean giving the signing secret to 4
+more services that do not have it today.
+
+The lighter plan below gives almost the same protection, for much less work and much less risk.
+
+### The plan — 3 steps
+
+**Step 1 — Lock the doors.** Make every service listen on `127.0.0.1` instead of `0.0.0.0`.
+Now only your own laptop can reach port 8085. Nobody else on the network can even try.
+
+This is what real companies do, just with bigger tools: a private network, a firewall, or a
+Kubernetes rule. On one laptop, `127.0.0.1` does the same job.
+
+⚠️ **This step has a trap.** Every service has `eureka.instance.prefer-ip-address=true`, so it
+tells Eureka "reach me at 192.168.x.x". If we bind to `127.0.0.1` but keep advertising the LAN
+address, the gateway would call an address nothing is listening on. **Every service call would
+fail.**
+
+So each service needs **two** lines, not one:
+
+```
+server.address=127.0.0.1
+eureka.instance.ip-address=127.0.0.1
+```
+
+### Step 1 result — ✅ done and proven 2026-09-02
+
+We did not just assume it worked. We ran the real attack from both sides:
+
+```
+From the network  (192.168.x.x:8085)  ->  CONNECTION REFUSED
+From this laptop  (127.0.0.1:8085)     ->  200 OK
+```
+
+The first line is the win. That is the exact fake-header request from the plan above. Before this
+change it would have worked. Now the attacker cannot even open a connection.
+
+All 7 ports moved from `0.0.0.0` to `127.0.0.1`. Eureka confirms every service now advertises
+`hostName=127.0.0.1`.
+
+**Two things worth knowing:**
+
+**1. The Eureka dashboard does not show this.** It shows the `instanceId`, which is just a name
+tag shaped like `machine-name:SERVICE:port`. It never changes. The field that matters is
+`hostName`, which you can see at `http://localhost:8081/eureka/apps`.
+
+**2. The fake header STILL works from this laptop** (that 200 above). That is not a bug. Step 1
+only means "you cannot reach the door". It does not yet mean "the door checks who you are".
+That is exactly what step 2 adds.
+
+---
+
+**Step 2 — Add a secret handshake.** The gateway sends a secret word with every request. Services
+check the word before trusting the headers.
+
+The service does **not** decode any token. It just checks that one header equals one value. About
+ten lines of code.
+
+Why bother, when step 1 already blocks outsiders? Because step 1 protects you from the network,
+and step 2 protects you from a mistake. Someone opens a firewall later, or another program runs
+on the same machine. Two layers. If one fails, the other still holds.
+
+**Step 3 — Close the internal doors.** The `/internal/**` endpoints exist so services can talk to
+each other. Today they are open to anyone. They leak user emails, team lists and performance data.
+
+⚠️ **This step has a trap too.** Your services currently call each other with **no login info at
+all**. Look at `IncidentService/client/UserClient.java`. So if we lock the doors first, we break
+our own services. Caller and receiver must change together, in one commit.
+
+### Files this touches
+
+**Step 1** — 8 files, all `application.properties`:
+
+```
+Eureka, APIGateway, AuthService, UserService,
+IncidentService, NotificationService, ReportingService, Ai-Service
+```
+
+**Step 2**:
+
+```
+APIGateway/.../filter/JwtGatewayFilter.java       <- send the secret
+common-security/.../filter/HeaderAuthFilter.java  <- check it before trusting headers
+8 x application.properties                        <- read the secret from an env variable
+```
+
+**Step 3**:
+
+```
+IncidentService/client/UserClient.java            <- send the secret
+NotificationService/client/UserClient.java        <- send the secret
+Ai-Service/feignClients/...                       <- send the secret
+UserService/config/SecurityConfig.java            <- stop allowing /internal/** for everyone
+ReportingService/config/SecurityConfig.java       <- same, plus /reports/**
+```
+
+### What does NOT change
+
+Every controller stays exactly the same. `auth.getName()` still returns the user UUID, just as
+today. We are not replacing `HeaderAuthFilter`. We are only adding one check before it trusts
+what it was given.
+
+### The weakness we are accepting for now
+
+Your tokens use one shared secret. Any service that can *check* a token could also *create* one.
+So if a service is ever hacked, the attacker could make an admin token.
+
+The proper fix is public/private key signing. AuthService signs with a private key, services check
+with a public key. Then a hacked service can only read tokens, not make them.
+
+That is a much bigger job: key files, key rotation, probably a JWKS endpoint. **Not now.**
+Written down so it stays a choice, not an accident.
+
+---
+
+## B2 to B5 — agreed, not started
+
+Short version of each. Full detail when we get to them.
+
+**B2 — Kafka messages can get stuck.** If a service cannot read a message, Kafka keeps handing it
+back forever. Worse, every message behind it has to wait too. So notifications could stop
+completely, with no error anywhere. Also: `spring.json.trusted.packages=*` tells your app to trust
+any class named in a Kafka message. That should be narrowed to your own packages.
+
+**B3 — One slow service can freeze everything.** When the gateway calls AuthService there is no
+timeout. If AuthService gets slow, the gateway threads all sit waiting, and then the gateway
+cannot serve *any* request at all. Also, the gateway calls AuthService on every single request
+just to check the token version. Caching that for 30 to 60 seconds would remove almost all of
+those calls.
+
+**B4 — Missing input checks.** Update forms mostly have no rules. ReportingService has none at
+all. A 10MB description would be rejected by the database as a confusing 500 error, instead of a
+clean "too long" message.
+
+**B5 — Nothing stops spamming.** Your login lockout protects one account. It does not stop someone
+trying one password across 10,000 accounts. More urgent: the AI endpoints cost real money per
+call. A loop, or a buggy frontend retry, could run up a large bill overnight. A rate limit on
+`/ai/**` is about an hour of work.
+
+---
+
+# Track C and D — not decided yet
+
+You mentioned these but we never discussed what is in them. **Do not guess.** Ask first.
 
 ---
 
