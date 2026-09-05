@@ -2,11 +2,13 @@ package com.example.APIGateway.filter;
 import com.example.APIGateway.services.TokenVersionService;
 import com.example.APIGateway.utils.JwtUtil;
 import jakarta.validation.constraints.Email;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.stereotype.Component;
@@ -39,6 +41,20 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
 
     private final JwtUtil jwtUtil;
     private final TokenVersionService tokenVersionService;
+
+    // ADDED 2026-09-02 (Track B1, step 2): the secret handshake.
+    //
+    // We send this word with every request we pass on. Each service checks it before it believes
+    // the X-User-Id and X-Roles headers we add below.
+    //
+    // Why we need it: those headers are just text. Anybody who can reach a service directly could
+    // type "X-Roles: ROLE_ADMIN" and be believed. Step 1 stopped outsiders reaching the services at
+    // all. This is the second lock: even if someone does reach one, they cannot fake being a user
+    // without knowing this word.
+    //
+    // No default value on purpose. If the setting is missing the gateway refuses to start, which is
+    // much safer than starting up and quietly sending no secret at all.
+    private final String internalSecret;
     private static final Logger logger = Logger.getLogger(JwtGatewayFilter.class.getName());
 
     // Must match TraceIdFilter.TRACE_ID_HEADER in common-web. The gateway cannot share that
@@ -47,10 +63,31 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
     private static final String TRACE_ID_HEADER = "X-Trace-Id";
 
     public JwtGatewayFilter(JwtUtil jwtUtil,
-                            TokenVersionService tokenVersionService) {
+                            TokenVersionService tokenVersionService,
+                            @Value("${internal.secret}") String internalSecret) {
         this.jwtUtil = jwtUtil;
         this.tokenVersionService = tokenVersionService;
+        this.internalSecret = internalSecret;
     }
+
+    /** The header name we put the secret word in. Must match HeaderAuthFilter in common-security. */
+    private static final String INTERNAL_SECRET_HEADER = "X-Internal-Secret";
+
+    /**
+     * Headers we wipe off every incoming request before we add our own.
+     *
+     * The first three are the identity headers we set ourselves from the token.
+     *
+     * X-Internal-Service was added 2026-09-02 (Track B1, step 3) for a different reason: it is
+     * how one of OUR services tells another "I am a service, not a person", which grants the
+     * ROLE_INTERNAL_SERVICE role and opens the /internal/** endpoints.
+     *
+     * A caller from outside must never be able to claim that. They would also need the secret
+     * word, which they do not have - but wiping it costs nothing and means the claim cannot even
+     * be made. Two things would have to go wrong instead of one.
+     */
+    private static final String[] IDENTITY_HEADERS =
+            { "X-User-Id", "X-Roles", "X-User-Email", "X-Internal-Service" };
 
 
 //    ServerWebExchange → request + response (like HttpServletRequest in servlet filters)
@@ -72,7 +109,21 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
         // ✅ 1. Skip public endpoints
         if (path.startsWith("/auth")) {
             logger.info("✅ Public endpoint detected (/auth/**) - Skipping authentication");
-            return chain.filter(exchange);//passing request forward without token validation as here no need
+            // CHANGED 2026-09-02 (Track B1, step 2).
+            // We still skip the token check here - login and signup have no token yet, by
+            // definition. But we no longer pass the request on untouched:
+            //
+            //   1. We wipe any X-User-Id / X-Roles the caller sent. Nothing under /auth reads
+            //      those today, so this is not fixing a live hole. It stops a future one: if
+            //      somebody later adds a page under /auth that trusts them, it is already safe.
+            //   2. We add the secret word, so these requests look the same as every other one we
+            //      send. One consistent rule is easier to reason about than two.
+            return chain.filter(
+                    exchange.mutate()
+                            .request(builder -> stripIdentityHeaders(builder)
+                                    .header(INTERNAL_SECRET_HEADER, internalSecret)
+                                    .header(TRACE_ID_HEADER, traceId))
+                            .build());
         }
 
         String authHeader = exchange.getRequest().getHeaders().getFirst("Authorization");
@@ -130,9 +181,15 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
                         return chain.filter(
                                 exchange.mutate()
                                         .request(builder ->
-                                                builder.header("X-User-Id", Userid)
+                                                // wipe anything the caller sent under these names
+                                                // first, then write the real values from the token
+                                                stripIdentityHeaders(builder)
+                                                        .header("X-User-Id", Userid)
                                                         .header("X-Roles", String.join(",", roles))
                                                         .header("X-User-Email", Useremail)
+                                                        // the secret word that tells the service
+                                                        // "this really did come from the gateway"
+                                                        .header(INTERNAL_SECRET_HEADER, internalSecret)
                                                         // pass the id on so the downstream
                                                         // TraceIdFilter reuses it instead of
                                                         // inventing a second one
@@ -174,6 +231,21 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
      * <p>Previously this sent a status code and an EMPTY body, so a client got a bare 401 with
      * nothing to display or log.</p>
      */
+    /**
+     * Removes any X-User-Id / X-Roles / X-User-Email the caller sent us.
+     *
+     * Why bother, when we overwrite them a moment later anyway? Because "overwrite" and "remove
+     * then write" are only the same thing while the code below always writes all three. If someone
+     * later adds a path that writes only two of them, the third would silently survive from the
+     * caller. Wiping first means that can never happen, whatever changes later.
+     */
+    private ServerHttpRequest.Builder stripIdentityHeaders(ServerHttpRequest.Builder builder) {
+        for (String header : IDENTITY_HEADERS) {
+            builder.headers(headers -> headers.remove(header));
+        }
+        return builder;
+    }
+
     private Mono<Void> onError(ServerWebExchange exchange, String errorCode, String message, HttpStatus status) {
 
         String traceId = resolveTraceId(exchange);

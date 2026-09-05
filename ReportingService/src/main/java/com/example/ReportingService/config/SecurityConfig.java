@@ -50,7 +50,34 @@ public class SecurityConfig {
 
                 // Authorization rules
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/actuator/**","/reports/**","/internal/**").permitAll()
+                        // Health checks stay open. They give away nothing.
+                        .requestMatchers("/actuator/**").permitAll()
+
+                        // CHANGED 2026-09-02 (Track B1, step 3).
+                        // Service-to-service only. Ai-Service calls these to decide which
+                        // engineer to suggest for an incident. Used to be permitAll.
+                        //
+                        // NOTE: this rule must stay ABOVE the /reports/** rule below. Spring
+                        // checks these in order and the first match wins. (These two do not
+                        // actually overlap - "/internal/reports/..." does not match "/reports/**"
+                        // - but keeping the more specific rule first is the habit that stops a
+                        // real mistake later.)
+                        .requestMatchers("/internal/**").hasRole("INTERNAL_SERVICE")
+
+                        // CHANGED 2026-09-02 (Track B1, step 3).
+                        // This was permitAll, which meant this service's ENTIRE public API was
+                        // open with no login: every incident report, all the metrics, the full
+                        // audit log, and every engineer's performance numbers.
+                        //
+                        // Now only admins and supervisors. Engineers are deliberately left out -
+                        // these endpoints show everyone's performance statistics, and one
+                        // engineer should not be browsing another engineer's numbers.
+                        //
+                        // This also quietly closes a side door: ReportingController repeats two
+                        // of the internal endpoints at /reports/engineer-performance/... and
+                        // /reports/engineer-workload/... . Locking /internal/** alone would have
+                        // left the same data reachable through this second path.
+                        .requestMatchers("/reports/**").hasAnyRole("ADMIN", "SUPERVISOR")
                         .anyRequest().authenticated()//ye line se authentication use karne ya na karne ka koi link nahi hai it check check karte hai ki SecurityContextHolder.getContext().getAuthentication() != null to nahi hai
                 );
 

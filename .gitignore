@@ -74,3 +74,10 @@ Desktop.ini
 *.tmp
 *.bak
 scratch/
+
+# --- Personal learning notes ---------------------------------------------------
+# The user's own notes on what they learned while building this project. Not
+# project documentation (that stays tracked - CLAUDE.md, PROGRESS.md, etc), just
+# a personal study folder. Kept off git on purpose, same as the reasoning behind
+# imp-git-local-only: this is personal, not project state.
+notes/

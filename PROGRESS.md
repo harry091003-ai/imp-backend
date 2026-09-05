@@ -10,8 +10,8 @@ It says three things:
 Other files that go with this one:
 - `CLAUDE.md` — what the code looks like today, and a list of known problems.
 - `BUGS-TO-FIX-LATER.md` — problems we found but chose not to fix yet.
-- `FLYWAY-NOTES.md` — how database migrations work here.
-- `ERROR_HANDLING_FLOW.md` — how errors work here.
+- `notes/` — personal learning notes (not tracked by git - see below). Includes
+  `FLYWAY-NOTES.md`, `ERROR_HANDLING_FLOW.md`, and topic notes on things learned along the way.
 
 Last updated: 2026-09-01
 
@@ -25,7 +25,7 @@ Last updated: 2026-09-01
 | A2 | Database migrations (Flyway) | ✅ Done — 2026-09-01 |
 | A3 | Config and profiles | ⏸️ Skipped on purpose |
 | A4 | Fix the build | ✅ Done — 2026-09-01 |
-| B1 | Stop people faking an Admin | 🔨 Step 1 done and proven. Steps 2 and 3 left |
+| B1 | Stop people faking an Admin | ✅ Done — all 3 steps, 2026-09-02 |
 | B2 to B5 | Kafka, timeouts, input checks, rate limits | ⬜ Planned, not started |
 | Track C | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
@@ -529,6 +529,62 @@ That is exactly what step 2 adds.
 
 ---
 
+### Step 2 result — ✅ done 2026-09-02
+
+**What we built.** The gateway now sends a secret word with every request it passes on. Each
+service checks that word before it believes the `X-User-Id` and `X-Roles` headers.
+
+The service does **not** decode the login token. It only checks that one word matches. About ten
+lines of real code.
+
+**What happens when the word is wrong or missing.** The service does not reject the request
+itself. It simply does not log anybody in. The request carries on with no user attached, and each
+service's own `SecurityConfig` decides what to do with it. Protected pages then reject it. Open
+pages like `/actuator/health` still work.
+
+We chose this over "reject straight away" so that all the "who is allowed where" rules stay in one
+place, instead of being split between the filter and `SecurityConfig`.
+
+**Two small extras we did at the same time:**
+
+1. **The gateway now wipes any identity headers the caller sent**, before writing its own. It
+   already overwrote them, so this fixes nothing today. It stops a future bug: if someone later
+   writes a path that sets only two of the three headers, the third can no longer survive from the
+   caller.
+2. **`/auth/**` now gets the same treatment.** We still skip the token check there, because login
+   and signup have no token yet. But the headers get wiped and the secret gets added, so every
+   request the gateway sends now looks the same. One rule is easier to reason about than two.
+
+**A detail worth knowing: `MessageDigest.isEqual`, not `equals`.**
+
+A normal string comparison stops at the first character that differs. So a wrong guess starting
+with the right letter takes very slightly longer to reject than one starting with a wrong letter.
+Somebody measuring those tiny differences over thousands of tries could work the secret out one
+letter at a time. That is called a timing attack.
+
+`MessageDigest.isEqual` always checks every byte, so every wrong answer takes the same time and
+there is nothing to measure. It costs nothing, so we used it.
+
+**No default value, on purpose.** If the `internalsecret` variable is missing, the service refuses
+to start with a clear message. For a security setting a loud failure is much better than a service
+that quietly starts and lets everyone in.
+
+**Files changed:**
+
+| File | What changed |
+|---|---|
+| `common-security/.../filter/HeaderAuthFilter.java` | Checks the secret before trusting any headers |
+| `common-security/.../config/SecurityAutoConfig.java` | Passes the secret into the filter |
+| `APIGateway/.../filter/JwtGatewayFilter.java` | Sends the secret. Wipes caller headers. Covers `/auth/**` too |
+| 7 x `application.properties` | Added `internal.secret=${internalsecret}` (gateway + 6 services) |
+
+Eureka needed nothing. It has no `HeaderAuthFilter`, and the gateway never routes to it.
+
+**New environment variable:** `internalsecret`. Must be the **same value everywhere**, or every
+request gets rejected.
+
+---
+
 **Step 2 — Add a secret handshake.** The gateway sends a secret word with every request. Services
 check the word before trusting the headers.
 
@@ -538,6 +594,91 @@ ten lines of code.
 Why bother, when step 1 already blocks outsiders? Because step 1 protects you from the network,
 and step 2 protects you from a mistake. Someone opens a firewall later, or another program runs
 on the same machine. Two layers. If one fails, the other still holds.
+
+### Step 3 result — ✅ done 2026-09-02
+
+We split this into two parts on purpose, so the system worked after each one.
+
+**Part A — teach every caller to identify itself.** Nothing was enforced yet, so nothing could
+break. We only added information to requests.
+
+`HeaderAuthFilter` learned there are two kinds of caller, not one:
+
+| Caller | Sends | Gets |
+|---|---|---|
+| A person, through the gateway | `X-User-Id` + `X-Roles` | their own roles |
+| One of our services, calling directly | `X-Internal-Service` | `ROLE_INTERNAL_SERVICE` |
+
+Both must also send the secret word from step 2. The second header is what separates them.
+
+**Why a second header at all?** The gateway sends the secret too. If the secret alone granted
+the service role, then every ordinary request through the gateway — even a plain login — would
+count as a service.
+
+**Part B — lock the doors.** Changed the rules in two `SecurityConfig` files.
+
+**The order mattered.** Our services called each other with **no identification at all** — every
+`.header(...)` line in the clients was commented out. Locking first would have locked our own
+services out. Part A first meant we could confirm the headers were arriving (a
+`Internal service call from INCIDENTSERVICE to /internal/validation/...` line in the UserService
+log) before anything started being enforced.
+
+**Where the headers get added:**
+
+| Service | How | Why different |
+|---|---|---|
+| IncidentService, NotificationService | `defaultHeader(...)` on the `WebClient.Builder` bean | Set once, cannot be forgotten on a new call later |
+| Ai-Service | A Feign `RequestInterceptor` (new file) | Feign has no builder to attach to — you describe the call as a Java interface and Feign writes the code |
+
+**Is it safe to put a secret on every call that builder makes?** Yes, because the builders are
+`@LoadBalanced`. That means they can only reach services registered in Eureka — they resolve
+names like `USERSERVICE`, not real web addresses. They physically cannot call an outside website,
+so the secret cannot leak to a third party. If anyone ever removes `@LoadBalanced`, this needs
+rethinking.
+
+**⚠️ One behaviour change for real users:** `/reports/**` now needs ADMIN or SUPERVISOR. It used
+to be open to everyone with no login at all. **Engineers will now get 403 from report pages.**
+That was a deliberate choice — those endpoints show every engineer's performance numbers, and one
+engineer should not browse another's.
+
+That choice also closed a side door: `ReportingController` repeats two of the internal endpoints
+at `/reports/engineer-performance/...`. Locking `/internal/**` alone would have left the same
+data reachable through that second path (CLAUDE.md issue 30).
+
+**Files changed:**
+
+| File | What changed |
+|---|---|
+| `common-security/.../HeaderAuthFilter.java` | Knows two kinds of caller. New constants `INTERNAL_SERVICE_HEADER`, `INTERNAL_SERVICE_ROLE` |
+| `APIGateway/.../JwtGatewayFilter.java` | Also wipes `X-Internal-Service` from incoming requests |
+| `IncidentService/config/SecurityConfig.java` | `WebClient.Builder` now sends both headers |
+| `NotificationService/config/SecurityConfig.java` | Same |
+| `Ai-Service/config/FeignInternalAuthConfig.java` | **New file.** Feign interceptor, same job |
+| `UserService/config/SecurityConfig.java` | `/internal/**` → `hasRole("INTERNAL_SERVICE")` |
+| `ReportingService/config/SecurityConfig.java` | `/internal/**` → `hasRole("INTERNAL_SERVICE")`, `/reports/**` → `hasAnyRole("ADMIN","SUPERVISOR")` |
+
+No new environment variable — `internalsecret` from step 2 is reused.
+
+---
+
+## B1 is complete — what it adds up to
+
+Three locks, each covering a different failure:
+
+| Lock | Protects against | Fails if |
+|---|---|---|
+| 1. Services listen on `127.0.0.1` only | Anyone on the network reaching a service | This ever moves to a real server, or a firewall is opened |
+| 2. Shared secret on every request | A program on this machine faking a user | The secret leaks |
+| 3. `/internal/**` needs a service role | Even a real logged-in person reading everyone's emails | — |
+
+Any one of them can fail and the others still hold.
+
+**The weakness we are still accepting:** the JWT uses one shared secret, so any service that can
+*check* a token could also *create* one. The proper fix is public/private key signing. That is a
+bigger job — key files, key rotation, probably a JWKS endpoint — and is deliberately left for
+later.
+
+---
 
 **Step 3 — Close the internal doors.** The `/internal/**` endpoints exist so services can talk to
 each other. Today they are open to anyone. They leak user emails, team lists and performance data.
@@ -762,8 +903,8 @@ Both use `INSERT IGNORE`, so they are safe to run on a database that already has
 
 | File | What changed |
 |---|---|
-| `FLYWAY-NOTES.md` | Your notes, moved into the project. Fixed 3 things that were slightly wrong. Added 6 things that catch people out later. Part 2 is a log of every migration we write |
-| `ERROR_HANDLING_FLOW.md` | **New.** How errors work, with one example followed all the way through |
+| `FLYWAY-NOTES.md` | Your notes, reviewed and extended. Later moved to `notes/` (2026-09-02) |
+| `ERROR_HANDLING_FLOW.md` | **New.** How errors work, with one example followed all the way through. Later moved to `notes/` (2026-09-02) |
 | `BUGS-TO-FIX-LATER.md` | Added E7, E9, E10, E11, E12, E13 |
 | `CLAUDE.md` | Rewrote the schema section. It still said "No Flyway". Marked issue 41 as fixed |
 

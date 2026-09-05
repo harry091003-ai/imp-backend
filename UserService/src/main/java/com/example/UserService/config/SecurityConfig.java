@@ -43,7 +43,24 @@ public class SecurityConfig {
 
                 // Authorization rules
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/actuator/**","/internal/**").permitAll()
+                        // Health checks stay open. They give away nothing.
+                        .requestMatchers("/actuator/**").permitAll()
+
+                        // CHANGED 2026-09-02 (Track B1, step 3).
+                        // These used to be permitAll, which meant ANYONE could call them with no
+                        // login at all. They hand out user names, email addresses and whole team
+                        // rosters - /internal/UserSpecificDetails/batch takes a list of user ids
+                        // and returns everyone's email in one go.
+                        //
+                        // They are meant only for our other services (IncidentService and
+                        // NotificationService) to call. So now they require the role that only a
+                        // service can get: a caller must send the shared secret AND the
+                        // X-Internal-Service header. See HeaderAuthFilter in common-security.
+                        //
+                        // A normal person can never reach these, because the gateway wipes the
+                        // X-Internal-Service header off every request that comes in from outside.
+                        .requestMatchers("/internal/**").hasRole("INTERNAL_SERVICE")
+
                         .requestMatchers("/users/**").hasAnyRole("ENGINEER", "SUPERVISOR","ADMIN") // Only users with ROLE_ENGINEER or ROLE_SUPERVISOR can access /users/**
 
                         .anyRequest().authenticated()//ye line se authentication use karne ya na karne ka koi link nahi hai it check check karte hai ki SecurityContextHolder.getContext().getAuthentication() != null to nahi hai

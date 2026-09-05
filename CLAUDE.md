@@ -94,11 +94,17 @@ SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetric
    `AUTHSERVICE /auth/token-version/{userid}` (reactive `WebClient`, `@LoadBalanced`) and
    rejects on version mismatch. This is the logout / password-change revocation mechanism.
 3. On success the gateway **injects headers** `X-User-Id`, `X-Roles`, `X-User-Email`.
-4. Downstream services trust those headers via `common-security`'s **`HeaderAuthFilter`**
+4. **As of 2026-09-02 (Track B1) the gateway also sends `X-Internal-Secret`, and wipes any
+   `X-User-*` headers the caller sent before writing its own.** Services check that secret
+   (constant-time compare) before trusting any identity header; a wrong or missing secret means
+   no authentication is set, so `SecurityConfig` rejects protected paths. Services also now bind
+   to `127.0.0.1` only. Value comes from the `internalsecret` env var - no default, so a missing
+   value stops startup.
+5. Downstream services trust those headers via `common-security`'s **`HeaderAuthFilter`**
    (`OncePerRequestFilter`, auto-registered through
    `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`), which
    builds a `UsernamePasswordAuthenticationToken(userId, null, authorities)`.
-5. So in every downstream controller/service: **`auth.getName()` is the user's UUID string**,
+6. So in every downstream controller/service: **`auth.getName()` is the user's UUID string**,
    and authorities are the raw `ROLE_*` strings.
 
 Every downstream `SecurityConfig` is a copy-paste of the same shape: csrf disabled,
@@ -107,8 +113,11 @@ Every downstream `SecurityConfig` is a copy-paste of the same shape: csrf disabl
 
 Per-service permitAll rules:
 - AuthService: `/auth/**`, `/debug/**`, `/actuator/**`; `/roles/**` → `hasAuthority("ROLE_ADMIN")`. **No `@EnableMethodSecurity`.**
-- UserService: `/actuator/**`, `/internal/**`; `/users/**` → `hasAnyRole(ENGINEER, SUPERVISOR, ADMIN)`.
-- ReportingService: `/actuator/**`, **`/reports/**`**, `/internal/**` — its entire public API is open.
+- UserService: `/actuator/**` only; `/internal/**` → `hasRole("INTERNAL_SERVICE")`;
+  `/users/**` → `hasAnyRole(ENGINEER, SUPERVISOR, ADMIN)`.
+- ReportingService: `/actuator/**` only; `/internal/**` → `hasRole("INTERNAL_SERVICE")`;
+  `/reports/**` → `hasAnyRole(ADMIN, SUPERVISOR)` (engineers deliberately excluded — these
+  endpoints expose every engineer's performance numbers).
 - IncidentService / NotificationService / Ai-Service: `/actuator/**` only.
 
 ---
@@ -158,6 +167,12 @@ Consumer groups: `user-service-group`, `notification-service-group`, `Reporting-
   (`/internal/reports/engineer-performance/{engineerId}/{category}/{service}`,
   `/internal/reports/engineer-workload/{engineerId}`). Ai-Service is the only Feign user;
   everything else uses WebClient.
+
+**As of 2026-09-02 (Track B1 step 3)** every one of these internal calls carries
+`X-Internal-Secret` + `X-Internal-Service`. WebClient callers get them from `defaultHeader(...)`
+on the `@LoadBalanced WebClient.Builder` bean; Ai-Service gets them from a Feign
+`RequestInterceptor` (`config/FeignInternalAuthConfig`). Add a new internal call and it inherits
+them automatically — but only if it uses the shared builder / Feign.
 
 Service ids used in `lb://` / URIs are inconsistently cased vs `spring.application.name`
 (e.g. `lb://IncidentService` vs `INCIDENTSERVICE`) — verify before touching discovery.
@@ -254,7 +269,8 @@ Schema is managed by **Flyway** (as of 2026-09-01, Track A2). All 6 JPA services
 Flyway 11.7.2, managed by the Boot parent. MySQL services need `flyway-core` + `flyway-mysql`;
 Ai-Service needs `flyway-core` + `flyway-database-postgresql`.
 **Never edit an applied migration** - Flyway checksums them. Add a new `V<n>__*.sql` instead.
-See [FLYWAY-NOTES.md](FLYWAY-NOTES.md) for the full explanation and per-migration log.
+See `notes/FLYWAY-NOTES.md` for the full explanation and per-migration log (personal notes
+folder, gitignored - see PROGRESS.md).
 
 **Tests**: 8 auto-generated `contextLoads()` classes, **no real tests anywhere**. They will fail
 without the env vars and running infrastructure. `spring-boot-starter-test` and
@@ -289,13 +305,20 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 ### Security
 
-8. **The header-trust model has no perimeter.** Downstream services accept `X-User-Id`/`X-Roles`
-   verbatim and are reachable directly on ports 8083–8088. Anyone who can reach a service port
+8. **The header-trust model has no perimeter.** ~~Downstream services accept `X-User-Id`/`X-Roles`
+   verbatim and are reachable directly on ports 8083–8088.~~ **LARGELY FIXED 2026-09-02**
+   (Track B1 steps 1-2): all services now bind to `127.0.0.1` only, and `HeaderAuthFilter`
+   requires a shared `X-Internal-Secret` before trusting any identity header. `/internal/**`
+   was closed in step 3 (2026-09-02). Remaining: the JWT still uses one shared HMAC secret,
+   so any service that can verify a token could also mint one - asymmetric keys are the proper
+   fix, deliberately deferred. Anyone who can reach a service port
    can forge an admin identity. Nothing strips inbound `X-*` headers, and `/auth/**` bypasses the
    gateway filter entirely.
-9. `ReportingService` `permitAll`s **`/reports/**`** and `/internal/**` — all report, metric,
-   audit-log and engineer-performance data is unauthenticated. `UserService` `permitAll`s
-   `/internal/**` (user emails, team rosters).
+9. ~~`ReportingService` `permitAll`s **`/reports/**`** and `/internal/**` ... `UserService`
+   `permitAll`s `/internal/**` (user emails, team rosters).~~ **RESOLVED 2026-09-02**
+   (Track B1 step 3). `/internal/**` in both services now requires `ROLE_INTERNAL_SERVICE`,
+   granted only to a caller sending both the shared secret and `X-Internal-Service` (which the
+   gateway strips from inbound requests). `/reports/**` now requires ADMIN or SUPERVISOR.
 10. `AuthService` has **no `@EnableMethodSecurity`**, so `@PreAuthorize("hasRole('ADMIN')")` on
     `RoleController` is inert (the URL rule `/roles/** -> ROLE_ADMIN` is what actually protects it).
 11. `/auth/token-version/{userid}` is `permitAll` — a public per-user counter that throws a raw
@@ -353,7 +376,8 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 29. **`AuthService.SecurityConfig` (a `@Configuration`) contains `generateToken` and is injected
     into `LoginUserService`** as a collaborator.
 30. `ReportingController` (`/reports/...`) **duplicates** the two endpoints of
-    `InternalReportingContoller` (`/internal/reports/...`) verbatim; its
+    `InternalReportingContoller` (`/internal/reports/...`) verbatim. (Since 2026-09-02 this is no
+    longer a data leak - `/reports/**` requires ADMIN/SUPERVISOR - but the duplication remains.) its
     `EngineerPerformanceService`/`EngineerWorkloadService` fields are declared halfway down the
     class. ("Contoller" typo is in the class name.)
 31. `UserClient` is duplicated near-verbatim in IncidentService and NotificationService.
