@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Same Spring Boot version as the services (3.5.11), like common-web.
+         common-security is still on 3.3.2 - that drift is a known issue (CLAUDE.md 25)
+         and is deliberately not repeated here. -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.11</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.project.kafka</groupId>
+    <artifactId>common-kafka</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>common-kafka</name>
+    <description>Shared Kafka safety net: retry, then park bad messages in a dead-letter topic
+        instead of retrying them forever and blocking everything behind them.</description>
+
+    <properties>
+        <!-- Java 17, not 21, for the same reason as common-web: Ai-Service is still on 17,
+             and a library built for 21 cannot be read by a module compiling against 17.
+             17 bytecode runs fine on a 21 JVM, so this works for everybody. -->
+        <maven.compiler.release>17</maven.compiler.release>
+    </properties>
+
+    <dependencies>
+        <!-- 'provided' because every service that uses this module already has spring-kafka
+             itself. We need it to compile; we must not drag a second copy in at runtime. -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <!-- For KafkaProperties (reading spring.kafka.* settings) and the auto-config hooks. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-autoconfigure</artifactId>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

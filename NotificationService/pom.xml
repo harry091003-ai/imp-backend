@@ -118,6 +118,15 @@
             <version>1.0.0</version>
         </dependency>
 
+        <!-- Shared Kafka safety net: retry a few times, then park the bad message in a
+             dead-letter topic instead of retrying it forever and blocking the whole partition.
+             Auto-configures itself - nothing to wire up in this service. -->
+        <dependency>
+            <groupId>com.project.kafka</groupId>
+            <artifactId>common-kafka</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+
         <!-- ✅ Load Balancer for @LoadBalanced WebClient with Eureka -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>

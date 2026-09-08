@@ -37,6 +37,7 @@ but we have Two modules where:
         <module>shared-events</module>      <!-- Kafka event classes -->
         <module>common-security</module>    <!-- HeaderAuthFilter -->
         <module>common-web</module>         <!-- error handling: exceptions + handler + traceId -->
+        <module>common-kafka</module>       <!-- Kafka safety net: retry + dead letter topic -->
 
         <!-- Infrastructure services -->
         <module>Eureka</module>             <!-- service registry -->

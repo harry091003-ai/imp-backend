@@ -26,7 +26,8 @@ Last updated: 2026-09-01
 | A3 | Config and profiles | ⏸️ Skipped on purpose |
 | A4 | Fix the build | ✅ Done — 2026-09-01 |
 | B1 | Stop people faking an Admin | ✅ Done — all 3 steps, 2026-09-02 |
-| B2 to B5 | Kafka, timeouts, input checks, rate limits | ⬜ Planned, not started |
+| B2 | Kafka dead letter topics | ✅ Done — 2026-09-08 |
+| B3 to B5 | Timeouts, input checks, rate limits | ⬜ Planned, not started |
 | Track C | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
 
@@ -737,10 +738,81 @@ Written down so it stays a choice, not an accident.
 
 Short version of each. Full detail when we get to them.
 
-**B2 — Kafka messages can get stuck.** If a service cannot read a message, Kafka keeps handing it
-back forever. Worse, every message behind it has to wait too. So notifications could stop
-completely, with no error anywhere. Also: `spring.json.trusted.packages=*` tells your app to trust
-any class named in a Kafka message. That should be narrowed to your own packages.
+**B2 — Kafka messages can get stuck.** ✅ **DONE 2026-09-08.**
+
+### What was wrong
+
+If a service could not process a message, Kafka handed it back forever. And a Kafka partition is
+a strict queue, so that one message blocked every message behind it. Notifications would stop
+completely, with no error and no alert.
+
+### What we built
+
+A new shared module, **`common-kafka`** (our 12th module). One file. Every consumer service gets
+it by adding the dependency - nothing to configure per service.
+
+```
+message fails -> retry 3 times, 1 second apart -> still failing?
+              -> copy it to <topic>-dlt -> mark the original done, queue moves on
+```
+
+### The part that is easy to miss
+
+A message can fail in two different places, and they need different handling:
+
+| Where | Example | Handled by |
+|---|---|---|
+| Inside the listener | database down | `DefaultErrorHandler` alone |
+| Before the listener runs | bad JSON, unknown class | needs `ErrorHandlingDeserializer` too |
+
+The second one is the actual poison-pill case. Without `ErrorHandlingDeserializer` there is no
+message object to hand over - it never got built - so it keeps spinning forever. That needed one
+extra line in each service's properties.
+
+### Why two producers for the dead letter topic
+
+A serializer turns a value into bytes, and only one runs per message - they do not chain. The
+failed message is in one of two shapes:
+
+| Failure | We hold | Producer | What it does |
+|---|---|---|---|
+| Inside the listener | a Java object | `dltJsonTemplate` | object → JSON → bytes |
+| During deserializing | raw bytes | `dltRawBytesTemplate` | nothing - sends bytes as they are |
+
+The second is deliberate: the dead letter topic then holds exactly what arrived, so you can read
+the broken JSON yourself.
+
+We build both producers inside `common-kafka` rather than reusing each service's, because a
+consumer-only service (NotificationService) has no producer configured at all - Spring's default
+would be `StringSerializer`, which cannot send a Java object.
+
+### Also fixed: `trusted.packages=*`
+
+Every message carries a header saying which Java class it is. `*` meant "build any class named",
+which is a way in for anyone who can write to our topics. Narrowed to `com.project.events` in all
+four consumers.
+
+**Worth knowing:** this only affects Kafka. HTTP `@RequestBody` DTOs use a completely separate
+Jackson converter - look at the property prefix, `spring.kafka.consumer.*`. Narrowing it cannot
+break any REST endpoint.
+
+### Proved it works
+
+Added a deliberate `throw` in NotificationService, created an incident, and watched it: 3 retries
+exactly 1 second apart, then the event landed in `incident.created-dlt`, and the offset moved on.
+
+Two things learned while testing:
+- The topic is `<topic>-dlt`, not `.DLT` as first assumed. Always check the real topic list.
+- Duplicate-key errors appearing during retries are **normal** - the first attempt saved a row,
+  so later retries hit the unique constraint and the idempotency guard catches them. Two safety
+  mechanisms working together, not a failure.
+
+**Files:** new `common-kafka/` module (pom, `KafkaErrorHandlingAutoConfig`, autoconfig imports);
+root `pom.xml` (module list); 4 x `pom.xml` and 4 x `application.properties` for
+NotificationService, UserService, ReportingService, Ai-Service.
+
+**Still open from B2:** Ai-Service's RAG path has no duplicate check, so a redelivered message
+would add duplicate vectors and quietly degrade search quality. Separate fix, not done yet.
 
 **B3 — One slow service can freeze everything.** When the gateway calls AuthService there is no
 timeout. If AuthService gets slow, the gateway threads all sit waiting, and then the gateway

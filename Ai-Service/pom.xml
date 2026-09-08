@@ -89,6 +89,15 @@
     <version>1.0.0</version>
 </dependency>
 
+<!-- Shared Kafka safety net: retry a few times, then park the bad message in a
+     dead-letter topic instead of retrying forever and blocking everything behind it.
+     Auto-configures itself - nothing to wire up in this service. -->
+<dependency>
+    <groupId>com.project.kafka</groupId>
+    <artifactId>common-kafka</artifactId>
+    <version>1.0.0</version>
+</dependency>
+
 <!-- Shared HTTP error contract: exception family + global @RestControllerAdvice.
      Auto-configures itself, no wiring needed in this service.
      NOTE: common-web is compiled targeting Java 17 specifically so THIS service

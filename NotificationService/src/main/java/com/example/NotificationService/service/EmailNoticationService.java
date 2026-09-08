@@ -25,6 +25,7 @@ public class EmailNoticationService {
 
     public void storeNotificationLog(UUID incidentId, UUID eventId, UUID performedby, List<UserCredentialDTO> usersToSendEmail, EventType eventType){
         // for storing the logs of Each User to whom we want to send the email in future, we first store in Database.
+//        if(true){ throw new  RuntimeException("This is a test exception to check the retry mechanism in kafka consumer for incident created event");}
         for(UserCredentialDTO user:usersToSendEmail){
 
 

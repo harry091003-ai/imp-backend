@@ -46,7 +46,6 @@ public class IncidentEventConsumer {
         List<UUID> userid= List.of(event.getCreatedBy());
       List<UserCredentialDTO> usersTosendEmail=  userClient.getBatchOfUsers_Credentials(userid);
         log.info("Hi the incident Creation Event is Consumed and the Users to whom that Details need to be shared are follows :{}", usersTosendEmail);
-
       // for storing the logs of Each User to whom we want to send the email in future, we first store in Database.
         emailNoticationService.storeNotificationLog(event.getIncidentId(),event.getEventId(),event.getPerformedBy(),usersTosendEmail, EventType.INCIDENT_CREATED);
 
