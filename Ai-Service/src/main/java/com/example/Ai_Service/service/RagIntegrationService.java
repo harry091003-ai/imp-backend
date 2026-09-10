@@ -24,6 +24,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
 import org.springframework.ai.vectorstore.filter.Filter;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -54,8 +55,37 @@ public class RagIntegrationService {
 
         // 3. LOAD into vector store
 
-        Document doc=new Document(cleaned);
-        //also adding the metadata to the document that we are storing in vector db so that it can be used in filtering the relevant documents at the time of retrieval from vector db based on the user prompt query.
+        // ---------------------------------------------------------------------------------
+        // The document id is the INCIDENT id, on purpose. (Track B2 - 2026-09-08)
+        //
+        // It used to be `new Document(cleaned)`, which gives the document a brand new random id
+        // every time. That was a quiet bug:
+        //
+        // Kafka promises "at least once" delivery, so the same event CAN arrive twice - after a
+        // retry, a rebalance, or a restart. With a random id each time, the same incident got
+        // stored as TWO separate documents. Then a search would find both, the same advice would
+        // be counted twice, and the AI's suggestions would slowly get worse.
+        //
+        // Nothing would ever show an error. That is what made it nasty.
+        //
+        // Using the incident id fixes it, because of how the vector store writes rows:
+        //
+        //     INSERT INTO ... VALUES (...) ON CONFLICT (id) DO UPDATE SET ...
+        //
+        // Same id arriving again = overwrite the existing row, not add a second one.
+        //
+        // A NOTE ON WHY WE OVERWRITE RATHER THAN SKIP
+        // We could check "does this incident already exist" and skip early. That would save the
+        // Gemini embedding call on a repeat. We deliberately do not, because an incident can
+        // genuinely be resolved more than once (reopened, then resolved differently). Skipping
+        // would leave the old, wrong resolution in the search index forever. Overwriting always
+        // keeps the latest version. Kafka redeliveries are rare, so the occasional extra
+        // embedding call is a fair price for never serving stale advice.
+//        also here:Document doesn't have a version of its constructor that takes just (id, content). If you want to give it a custom id, you're forced to also hand it a metadata box — even if that box starts empty.
+//        as this is what we are doing: new Document(id, content, metadata)      // YOUR id, but metadata is required
+        // ---------------------------------------------------------------------------------
+        Document doc = new Document(event.getIncidentId().toString(), cleaned, new HashMap<>());
+        //so in our HAshMap we are  actaully  adding  the metadata to the document that we are storing in vector db so that it can be used in filtering the relevant documents at the time of retrieval from vector db based on the user prompt query.
         doc.getMetadata().put("incidentId",event.getIncidentId());
         doc.getMetadata().put("category",event.getCategory());
         doc.getMetadata().put("service",event.getServiceName());
@@ -67,7 +97,9 @@ public class RagIntegrationService {
 
 log.info("Incident resolved data: data loading Done,now  adding to vector store");
         vectorStore.add(List.of(doc));
-log.info("Incident resolved data: added to vector store successfully");
+log.info("Incident resolved data: added to vector store successfully "
+        + "(document id = incident id {}, so a repeat delivery overwrites instead of duplicating)",
+        event.getIncidentId());
     }
 //Helper method used in storingResolvedIncidentsInVectorDb
     private String BuildTextForRag(IncidentResolutionReportEvent event)

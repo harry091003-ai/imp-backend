@@ -1,8 +1,6 @@
 package com.example.NotificationService.config;
 
 import com.project.security.filter.HeaderAuthFilter;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.cloud.client.loadbalancer.LoadBalanced;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
@@ -12,7 +10,6 @@ import org.springframework.security.config.annotation.web.configurers.AbstractHt
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
-import org.springframework.web.reactive.function.client.WebClient;
 
 @Configuration
 @EnableMethodSecurity
@@ -20,39 +17,30 @@ import org.springframework.web.reactive.function.client.WebClient;
 public class SecurityConfig {
 
     private final HeaderAuthFilter headerAuthFilter;
+
     // ---------------------------------------------------------------------------------
-    // CHANGED 2026-09-02 (Track B1, step 3): this builder now sends two extra headers on
-    // every call it makes.
+    // REMOVED 2026-09-09 (Track B3, step 2): the @LoadBalanced WebClient.Builder bean
+    // that used to sit here.
     //
-    //   X-Internal-Secret   the shared secret word - "I am allowed to talk to you"
-    //   X-Internal-Service  our own service name   - "and I am a service, not a person"
+    // It did two jobs, and both now live somewhere better:
     //
-    // The service being called needs both before it will let us reach its /internal/**
-    // endpoints. Without them we get a 403.
+    //   1. Attaching X-Internal-Secret and X-Internal-Service to every outgoing call
+    //         -> config/FeignInternalAuthConfig.java
+    //   2. Turning a Eureka name like "USERSERVICE" into a real address
+    //         -> Feign does this by itself, no bean needed
     //
-    // WHY SET IT HERE, ON THE BUILDER, INSTEAD OF AT EACH CALL?
-    // Because there is more than one call site today, and there will be more tomorrow. Set
-    // it once here and it is impossible to forget on a new call. Set it at each call site
-    // and forgetting one is a silent 403 that only shows up at runtime.
+    // Two things worth noticing about this removal:
     //
-    // IS IT SAFE TO PUT A SECRET ON EVERY CALL THIS BUILDER MAKES?
-    // Yes, because of @LoadBalanced. That annotation means this client can only reach
-    // services registered in Eureka - it resolves names like "USERSERVICE", not real web
-    // addresses. So it physically cannot call an outside website, and the secret cannot
-    // leak to a third party. If this builder ever loses @LoadBalanced, revisit this.
+    //   - Feign does the load-balancing wiring on its own, so this whole bean simply has
+    //     no replacement. One fewer thing to declare, and one fewer thing to get wrong.
     //
-    // The service name comes from spring.application.name, so it stays correct by itself
-    // if the service is ever renamed.
+    //   - It should never have been in SecurityConfig in the first place. An HTTP client
+    //     is not a security setting. It ended up here in three other services too, and is
+    //     recorded as known issue #35 in CLAUDE.md. This service is now clear of it.
+    //
+    // This file is back to doing only what its name says: security configuration.
     // ---------------------------------------------------------------------------------
-    @Bean
-    @LoadBalanced
-    public WebClient.Builder LoaBalancedWebClientBuilder(
-            @Value("${internal.secret}") String internalSecret,
-            @Value("${spring.application.name}") String serviceName) {
-        return WebClient.builder()
-                .defaultHeader(HeaderAuthFilter.INTERNAL_SECRET_HEADER, internalSecret)
-                .defaultHeader(HeaderAuthFilter.INTERNAL_SERVICE_HEADER, serviceName);
-    }
+
     public SecurityConfig(HeaderAuthFilter headerAuthFilter) {
         this.headerAuthFilter = headerAuthFilter;
     }

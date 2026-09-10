@@ -127,12 +127,41 @@
             <version>1.0.0</version>
         </dependency>
 
-        <!-- ✅ Load Balancer for @LoadBalanced WebClient with Eureka -->
+        <!-- ✅ Load Balancer: turns a service NAME like "USERSERVICE" into a real
+             address, by asking Eureka. Feign uses this too, exactly as WebClient did. -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
             <artifactId>spring-cloud-starter-loadbalancer</artifactId>
         </dependency>
-        <!--        used in creating webclient-->
+
+        <!-- ADDED 2026-09-09 (Track B3, step 2): Feign, our HTTP client for calling
+             other services.
+
+             WHY WE SWITCHED TO IT
+             Before this, UserClient used WebClient and then called .block() on every
+             call. That was the wrong pairing: WebClient is built for reactive apps
+             that never sit and wait, and .block() forces it to sit and wait anyway.
+             We paid for machinery we then threw away.
+
+             This service is a normal Spring MVC service - one thread per request,
+             and that thread is SUPPOSED to wait. So it needs a client that waits by
+             design, not one bent into waiting.
+
+             Feign is that client, and Ai-Service already uses it. Same tool
+             everywhere is one less thing to learn.
+
+             No <version> - the spring-cloud-dependencies BOM lower down picks a
+             version tested against our Spring Cloud release. -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-openfeign</artifactId>
+        </dependency>
+
+        <!-- NOTE 2026-09-09 (Track B3, step 2): nothing in our code uses WebClient any
+             more - Feign replaced it. This is now unused and could be deleted.
+             BUt we are still not deleting it now because: deleting it might accidentally
+             remove other libraries that hidden dependencies need. They'll delete it separately
+             so they can test it on its own. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webflux</artifactId>

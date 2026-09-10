@@ -1,5 +1,6 @@
 package com.example.APIGateway.services;
 
+import com.example.APIGateway.utils.FailureDescription;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
@@ -33,7 +34,15 @@ public class TokenVersionService {
                         })
                 .bodyToMono(Integer.class) // wrap the resopnse with MONO  ie. MONO<1>
                 .doOnSuccess(version -> logger.info("✅ Token version retrieved: " + version))
-                .doOnError(error -> logger.severe("❌ Error fetching token version: " + error.getMessage()));
+                // CHANGED 2026-09-09: was error.getMessage(), which printed the single word
+                // "null" whenever the response timeout fired - because Netty's
+                // ReadTimeoutException is built with no message on purpose. See
+                // FailureDescription for the full explanation; the short version is that the
+                // exception TYPE was the only information available, and we were not printing
+                // it. Now we print the type, the whole cause chain, AND which timeout setting
+                // is responsible.
+                .doOnError(error -> logger.severe("❌ Error fetching token version for user "
+                        + userid + ": " + FailureDescription.of(error)));
     }
 }
 

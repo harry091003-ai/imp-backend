@@ -24,12 +24,15 @@ Root: `E:\dev-spring-boot\IMP` — **not a git repository**, no root `.gitignore
 | `shared-events` | — | plain JAR: Kafka event DTOs (`com.project.events`) | no |
 | `common-security` | — | plain JAR: `HeaderAuthFilter` + auto-config | no |
 | `common-web` | — | plain JAR: exception family, `ErrorResponse`, global `@RestControllerAdvice`, `TraceIdFilter` + auto-config | no |
+| `common-kafka` | — | plain JAR: retry-then-dead-letter error handler + 2 DLT producers, auto-config | no |
 
 Root `pom.xml` (`com.example:incident-management-platform:1.0-SNAPSHOT`, `packaging=pom`)
-lists only: `shared-events, common-security, AuthService, UserService, APIGateway, Eureka`.
-**`Ai-Service`, `IncidentService`, `NotificationService`, `ReportingService` and `common-web`
-are NOT modules** — they build only individually. No service declares the root pom as its `<parent>`; every service
-parents directly to `spring-boot-starter-parent`, so the root pom's `<properties>` are inert.
+lists **all 12 modules** as of 2026-09-01 (Track A4), so `mvn clean install` at the root builds
+everything in one command. It previously listed only 6, and the other 6 built individually - see
+issue 24.
+
+**Still true:** no service declares the root pom as its `<parent>`; every service parents directly
+to `spring-boot-starter-parent`, so the root pom's `<properties>` are decorative and inert.
 
 ---
 
@@ -157,25 +160,47 @@ Consumer groups: `user-service-group`, `notification-service-group`, `Reporting-
 
 ## 6. Synchronous inter-service calls
 
+**As of 2026-09-09 (Track B3 step 2) the rule is: the HTTP client follows the app's execution
+model.** APIGateway is reactive (WebFlux/Netty) so it uses `WebClient`. Every other service is
+blocking (Spring MVC/Tomcat) so it uses **OpenFeign**. Do not mix them — `WebClient` + `.block()`
+in a blocking service was exactly the bug B3 removed.
+
 - Gateway → AuthService: `WebClient` `http://AUTHSERVICE/auth/token-version/{userid}`.
-- IncidentService → UserService (`client/UserClient`, **blocking `WebClient` + `.block()`**):
+  Called on **every request**. Timeouts and a bounded connection pool live in
+  `config/WebClientConfig` + `gateway.httpclient.*` in `application.properties`.
+- IncidentService → UserService (`client/UserClient`, **`@FeignClient(name = "USERSERVICE")`**):
   `/internal/validation/{userId}`, `/internal/EngineersUnderSupervisor/{SupervisorId}`,
-  `/internal/UserSpecificDetails/{userId}`.
-- NotificationService → UserService (`client/UserClient`, near-duplicate of the above):
-  `/internal/UserSpecificDetails/{userId}`, `POST /internal/UserSpecificDetails/batch`.
+  `/internal/UserSpecificDetails/{userId}` (this last one is **unused** and its endpoint is
+  broken — see issue 2).
+- NotificationService → UserService (`client/UserClient`, also a `@FeignClient`):
+  `/internal/UserSpecificDetails/{userId}` (**unused**, broken endpoint),
+  `POST /internal/UserSpecificDetails/batch` (the one actually used, from a Kafka listener).
 - Ai-Service → ReportingService: **OpenFeign** `ReportingServiceFeignClient`
   (`/internal/reports/engineer-performance/{engineerId}/{category}/{service}`,
-  `/internal/reports/engineer-workload/{engineerId}`). Ai-Service is the only Feign user;
-  everything else uses WebClient.
+  `/internal/reports/engineer-workload/{engineerId}`).
 
-**As of 2026-09-02 (Track B1 step 3)** every one of these internal calls carries
-`X-Internal-Secret` + `X-Internal-Service`. WebClient callers get them from `defaultHeader(...)`
-on the `@LoadBalanced WebClient.Builder` bean; Ai-Service gets them from a Feign
-`RequestInterceptor` (`config/FeignInternalAuthConfig`). Add a new internal call and it inherits
-them automatically — but only if it uses the shared builder / Feign.
+**Headers.** Every internal call carries `X-Internal-Secret` + `X-Internal-Service` (Track B1
+step 3). All three Feign services attach them with a `RequestInterceptor` bean in
+`config/FeignInternalAuthConfig`. A new Feign client in those services inherits them
+automatically — a plain `@Bean` interceptor applies to every client in the service.
+
+**Timeouts (Track B3 step 2).** All Feign services set
+`spring.cloud.openfeign.client.config.default.{connect,read}-timeout` = 2000/5000 ms. Note Feign
+ships with 10s/60s defaults (unlike WebClient, which has **none**) — so Ai-Service was never
+fully exposed, but 60s was still far too long. Spring Cloud's default retryer is `NEVER_RETRY`
+and is deliberately left alone: retries stack across layers (3 × 3 = 9 real calls), so retry
+belongs at exactly one layer, chosen in B3 step 4.
+
+**Error mapping.** IncidentService has `config/FeignErrorDecoderConfig` mapping 404 →
+`NotFoundException` so "no such user" stays a 404 instead of becoming a 500. NotificationService
+deliberately has none — its old code had no 404 rule to preserve, and Feign's default decoder
+(status + method + URL + body) beats what was there. **Caveat:** a *timeout* never reaches an
+`ErrorDecoder` (there is no HTTP reply to decode), so it currently surfaces as a 500 rather than
+a 503. Mapping that properly is B3 step 4.
 
 Service ids used in `lb://` / URIs are inconsistently cased vs `spring.application.name`
 (e.g. `lb://IncidentService` vs `INCIDENTSERVICE`) — verify before touching discovery.
+`@FeignClient(name = ...)` must match `spring.application.name` exactly.
 
 ---
 
@@ -388,13 +413,19 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     `@EnableSchedulerLock` is declared twice in ReportingService (app class + `SchedularConfig`).
 34. `SchedularConfig` hardcodes `withLockedByValue("ReportingService_Instance1")`, so every
     instance claims the same identity in the lock table.
-35. `IncidentService`, `NotificationService`, `ReportingService` and `Ai-Service` each declare a
-    `@LoadBalanced WebClient.Builder` bean **inside their `SecurityConfig`**.
+35. ~~`IncidentService`, `NotificationService`, `ReportingService` and `Ai-Service` each declare a
+    `@LoadBalanced WebClient.Builder` bean **inside their `SecurityConfig`**.~~ **HALF RESOLVED
+    2026-09-09** (Track B3 step 2). IncidentService and NotificationService no longer have the bean
+    at all - Feign wires load balancing itself, so there was nothing to move. Still present in
+    `ReportingService` and `Ai-Service` (both declare it but neither uses WebClient for calls).
 36. `spring.cloud.gateway.routes[*]` uses the pre-2025 property prefix; Spring Cloud 2025.0.x
     moved these to `spring.cloud.gateway.server.webflux.*`. Verify routing still binds.
-37. Blocking `.block()` on `WebClient` throughout IncidentService/NotificationService (a
+37. ~~Blocking `.block()` on `WebClient` throughout IncidentService/NotificationService (a
     `RestClient` would be the honest choice); each call also does `webClientBuilder.build()` per
-    invocation.
+    invocation.~~ **RESOLVED 2026-09-09** (Track B3 step 2). Both now use OpenFeign, matching
+    Ai-Service. Feign was chosen over RestClient deliberately: consistency with the service that
+    already used it was judged worth more than the smaller diff. No `.block()` and no
+    per-invocation `build()` remain in either service. See §6.
 38. `IncidentService.AssignIncident` calls UserService twice per assignment — `IsUserActive`
     re-fetches what `getUser` already returned.
 39. Gateway JWT expiry is configured at 3600000 ms but AuthService mints 7200000 ms tokens (the
@@ -443,5 +474,15 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   are deliberate (missing seed data) and are commented as such.
 - **Changing `ErrorResponse`'s fields is a breaking change for every client of all 8 services.**
   `GlobalExceptionHandlerTest` will fail if you do; that failure is the point.
+- **The HTTP client follows the app's execution model, not preference.** APIGateway is reactive
+  -> `WebClient`. Every other service is blocking -> `@FeignClient`. Never `WebClient` +
+  `.block()` in a blocking service; that was issue 37 and it is fixed. A new Feign client needs
+  `@EnableFeignClients` on the application class (already present in IncidentService,
+  NotificationService, Ai-Service) and inherits the auth interceptor, error decoder and timeouts
+  automatically.
+- **Never name a `@Configuration` class the same as a `@Bean` method inside it.** Spring registers
+  the scanned config class under its own decapitalized name, so the two collide and the service
+  refuses to start. Name config classes after their job (`FeignErrorDecoderConfig`), not after
+  what they produce.
 - APIGateway is WebFlux and cannot use `common-web`. If the error shape changes, update
   `JwtGatewayFilter.onError` by hand to match.

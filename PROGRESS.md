@@ -27,7 +27,8 @@ Last updated: 2026-09-01
 | A4 | Fix the build | ✅ Done — 2026-09-01 |
 | B1 | Stop people faking an Admin | ✅ Done — all 3 steps, 2026-09-02 |
 | B2 | Kafka dead letter topics | ✅ Done — 2026-09-08 |
-| B3 to B5 | Timeouts, input checks, rate limits | ⬜ Planned, not started |
+| B3 | Timeouts, resilience, the gateway hot path | 🟨 Steps 1-2 done 2026-09-09, steps 3-5 to do |
+| B4 to B5 | Input checks, rate limits | ⬜ Planned, not started |
 | Track C | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
 
@@ -734,9 +735,10 @@ Written down so it stays a choice, not an accident.
 
 ---
 
-## B2 to B5 — agreed, not started
+## B2 to B5 — where each one stands
 
-Short version of each. Full detail when we get to them.
+B2 is done. B3 steps 1-2 are done. B4 and B5 are still short summaries - full detail when we
+get to them.
 
 **B2 — Kafka messages can get stuck.** ✅ **DONE 2026-09-08.**
 
@@ -811,14 +813,258 @@ Two things learned while testing:
 root `pom.xml` (module list); 4 x `pom.xml` and 4 x `application.properties` for
 NotificationService, UserService, ReportingService, Ai-Service.
 
-**Still open from B2:** Ai-Service's RAG path has no duplicate check, so a redelivered message
-would add duplicate vectors and quietly degrade search quality. Separate fix, not done yet.
+### Also fixed: the RAG duplicate bug (2026-09-08)
 
-**B3 — One slow service can freeze everything.** When the gateway calls AuthService there is no
-timeout. If AuthService gets slow, the gateway threads all sit waiting, and then the gateway
-cannot serve *any* request at all. Also, the gateway calls AuthService on every single request
-just to check the token version. Caching that for 30 to 60 seconds would remove almost all of
-those calls.
+Ai-Service stored each resolved incident with `new Document(cleanedText)`, which gives the
+document a **random id every time**.
+
+Kafka delivers "at least once", so the same event can arrive twice. With a random id, the same
+incident became two separate documents. A search would find both, count the same advice twice,
+and the AI's suggestions would slowly get worse - with no error and nothing in the logs.
+
+**Fix:** use the incident id as the document id.
+
+```java
+new Document(event.getIncidentId().toString(), cleaned, metadata)
+```
+
+This works because the vector store writes with
+`INSERT ... ON CONFLICT (id) DO UPDATE SET ...` (verified by reading the SQL out of the
+spring-ai-pgvector-store jar, not assumed). Same id arriving again overwrites the row instead of
+adding a second one.
+
+**Why overwrite rather than skip early?** Skipping would save the paid Gemini embedding call on a
+repeat. But an incident can genuinely be resolved twice - reopened, then resolved differently -
+and skipping would leave the old wrong answer in the index forever. Overwriting always keeps the
+latest. Redeliveries are rare, so the occasional extra call is worth it.
+
+**File:** `Ai-Service/service/RagIntegrationService.java`.
+
+This closes the last open item in B2.
+
+## B3 — One slow service could freeze everything 🟡 Steps 1–2 done 2026-09-09
+
+### What was wrong
+
+Not a single network call in this project had a time limit. Not one.
+
+The gateway asks AuthService "is this token still valid?" on **every single request**. If
+AuthService went quiet, we waited forever.
+
+### Why that was worse than "slow"
+
+Most people picture threads piling up. In the gateway that is **not** what happens — it is
+reactive, so a thread waiting for a reply is released, not held. The real damage is different:
+
+```
+AuthService goes quiet
+   -> each call borrows a connection and never gives it back
+   -> the pool (about 16 by default) empties permanently
+   -> new requests queue, and the default wait is 45 SECONDS, then fail
+   -> the gateway cannot serve ANY request, to ANY service
+   -> and it does NOT recover when AuthService gets better,
+      because nothing ever gave up
+```
+
+**A ten-second hiccup became an outage lasting until someone restarted it by hand.**
+
+The other six services break the ordinary way instead: they are blocking, so a hung call holds a
+Tomcat thread. 200 of those and the service is dead — while still reporting itself healthy,
+because nothing crashed.
+
+### The plan — 5 steps
+
+| Step | What | Status |
+|---|---|---|
+| 1 | Timeouts + a bounded connection pool on the gateway | ✅ Done 2026-09-09 |
+| 2 | Timeouts on the other 9 calls, and fix the wrong HTTP client | ✅ Done 2026-09-09 |
+| 3 | Cache the token version (stop calling AuthService every request) | ⬜ To do |
+| 4 | Circuit breaker + fallback | ⬜ To do |
+| 5 | Turn on metrics so we can see steps 1–4 working | ⬜ To do |
+
+The order matters. A cache on top of a hang does not fix the hang — it just makes it rarer, and
+therefore harder to find. Timeouts had to be first.
+
+---
+
+### Step 1 result — ✅ done 2026-09-09
+
+Two timeouts and a bounded pool on the gateway's call to AuthService.
+
+| Setting | Value | What it means |
+|---|---|---|
+| `connect-timeout-ms` | 2000 | "Nobody answered the door" |
+| `response-timeout-ms` | 2000 | "They answered but never spoke" — **this is the one that was missing** |
+| `max-connections` | 50 | The default is about 16, which surprises people |
+| `pending-acquire-max-count` | 100 | 50 working + 100 waiting = 150; number 151 is refused straight away |
+| `pending-acquire-timeout-ms` | 2000 | The built-in default is **45 seconds** |
+| `max-idle-time-ms` | 15000 | Close before Tomcat does at ~20s, or you get random "connection prematurely closed" errors |
+
+Worst case a user now waits **6 seconds** and gets a clear answer, instead of waiting forever.
+
+**No change was needed in `JwtGatewayFilter`.** It already had error handling that returns a 503.
+It simply never fired, because the call never *failed* — it only hung. Now it fails, and code
+that was already written starts doing its job.
+
+**A follow-up we only found by testing.** The timeout fired correctly, but the log said:
+
+```
+Error fetching token version: null
+```
+
+Netty builds its timeout exception with **no message and no stack trace on purpose** — timeouts
+are common under load and stack traces are expensive, so it reuses one shared instance. Our
+logging called `getMessage()`, which threw away the only information that existed: the class
+name.
+
+New `FailureDescription` helper prints the exception type, the whole cause chain, **and which
+of the three timeout settings is responsible**. The lesson: *"log the message" is a habit, not a
+rule* — when the message is empty, the type and cause chain are the real information.
+
+---
+
+### Step 2 result — ✅ done 2026-09-09
+
+This turned out to be two problems, not one.
+
+**Problem A: no timeouts.** Nine more calls with no limit — 6 in IncidentService, 2 in
+NotificationService, 2 in Ai-Service.
+
+**Problem B: the wrong HTTP client.** IncidentService and NotificationService used WebClient and
+then called `.block()` on every call:
+
+```java
+webClientBuilder.build().get().uri(...).retrieve().bodyToMono(...).block();
+                                                                  ^^^^^^^
+```
+
+WebClient is built for reactive apps whose whole design is "never sit and wait". `.block()` told
+it to sit and wait anyway — all the machinery, none of the benefit. This was already catalogued
+as known issue #37 in `CLAUDE.md`.
+
+**The rule we settled on:** the client follows the app's execution model, not personal taste.
+
+| App | How it works | Client |
+|---|---|---|
+| APIGateway | Reactive (Netty) | **WebClient** — correct already |
+| The other 6 | Blocking (Tomcat, one thread per request) | **Feign** |
+
+**Why Feign and not RestClient.** I first recommended RestClient — a smaller change, and it
+matches the note already in `CLAUDE.md` issue #37. You pushed back: Ai-Service already uses
+Feign, and consistency across services is worth more than saving a few lines. That was the right
+call, and it is what we did. All three blocking services now use the same tool.
+
+**What changed per service:**
+
+| Service | Change |
+|---|---|
+| IncidentService | `UserClient` class → Feign interface; new `FeignInternalAuthConfig` + `FeignErrorDecoderConfig`; `WebClient.Builder` bean removed from `SecurityConfig`; timeouts added |
+| NotificationService | Same, **minus** the error decoder (see below) |
+| Ai-Service | Timeouts only — no code change; it already used Feign |
+
+**Zero caller changes.** The Feign interfaces kept identical method names and signatures, so all
+9 call sites were untouched.
+
+**Why NotificationService got no error decoder.** I wrote one, and the build rejected it —
+`common-web` is not a dependency there, because that service has no HTTP endpoints. Rather than
+add a dependency to make my file work, I checked what the old code actually did:
+
+```java
+new RuntimeException("UserService returned error: " + response.statusCode())
+```
+
+No 404 rule at all. Nothing to preserve — and Feign's built-in decoder is better anyway, giving
+the status, method, URL **and** response body. Deleting the file was the right answer.
+
+IncidentService *does* have one, because its old code had a real rule worth keeping: 404 means
+"no such user", which must reach the caller as a 404 and not a 500. Without that file the
+migration would have silently downgraded a 404 into a 500.
+
+**Three facts we verified in the jars rather than assuming:**
+
+- Feign's default timeouts are **10s connect / 60s read** — so Ai-Service was never fully
+  exposed the way WebClient's *no* limit left the others. But 60s is still far too long.
+- Spring Cloud sets Feign to **`NEVER_RETRY`** — so no accidental retry stacking. This matters:
+  3 gateway retries x 3 service retries = 9 real calls to a service that is already struggling.
+  **Retry belongs at exactly one layer**, chosen deliberately in step 4.
+- The property prefix is **`spring.cloud.openfeign.client.config`** — a wrong prefix would have
+  silently applied nothing, which is the worst kind of failure.
+
+**A mistake worth recording.** The first version named the config class `FeignErrorDecoder`, and
+the service refused to start:
+
+```
+The bean 'feignErrorDecoder' could not be registered.
+A bean with that name has already been defined and overriding is disabled.
+```
+
+Spring names a scanned `@Configuration` class after the class itself, first letter lowercased.
+So the class and its own `@Bean` method both claimed `feignErrorDecoder`. **A config class must
+never share its name with a `@Bean` method inside it** — name it after its *job*, not after what
+it produces. Fixed by renaming to `FeignErrorDecoderConfig`.
+
+---
+
+### What steps 1–2 add up to
+
+```
+BEFORE                                 AFTER
+no time limit anywhere        ->       every call has one
+one slow service = total,              one slow service = a fast, clear 503
+  permanent outage                       and the system heals itself
+WebClient bent into blocking  ->       the client matches the app
+a timeout logged as "null"    ->       names the exact setting to change
+```
+
+### Known gap, deliberately left for step 4
+
+A timeout currently surfaces to the caller as a **500**, not a 503. Feign's `ErrorDecoder` only
+sees real HTTP replies — a timeout has no reply, so it bypasses it and lands on common-web's
+catch-all. Honest, but not as clear as it should be. Mapping "the dependency is down" to a 503
+belongs with step 4, where fallbacks are handled properly for the whole project at once.
+
+### Files changed in B3 steps 1–2
+
+**APIGateway (4):** `config/WebClientConfig.java` (timeouts + pool),
+`resources/application.properties` (6 tunable values), `utils/FailureDescription.java` (new),
+`services/TokenVersionService.java` + `filter/JwtGatewayFilter.java` (logging).
+
+**IncidentService (7):** `pom.xml` (+openfeign), `IncidentServiceApplication.java`
+(+`@EnableFeignClients`), `client/UserClient.java` (→ interface),
+`config/FeignInternalAuthConfig.java` (new), `config/FeignErrorDecoderConfig.java` (new),
+`config/SecurityConfig.java` (WebClient bean removed), `application.properties` (timeouts).
+
+**NotificationService (6):** same list minus the error decoder.
+
+**Ai-Service (1):** `application.properties` (timeouts only).
+
+**Notes (3):** `gateway-timeouts-and-connection-pools.md` (new),
+`choosing-between-webclient-and-feign.md` (new), `README.md` (index).
+
+### Still to do — steps 3, 4, 5
+
+**Step 3 — cache the token version.** The gateway calls AuthService on every request to check a
+number that changes maybe twice a year per user. A 30-second in-memory cache (Caffeine) removes
+about 99.9% of those calls.
+
+The trade-off must be decided, not defaulted into: a logged-out token stays valid for up to 30
+more seconds. Worth knowing — the benefit flattens fast but the staleness grows linearly, so
+**shorter is better**. 30s and 60s save almost the same number of calls.
+
+**Not Redis, and there is a reason.** Redis is itself a network call — we would be swapping "a
+call that can hang" for "another call that can hang", plus a new server that can be down. An
+in-memory cache is a lookup in our own memory. Redis becomes correct when we run **more than one
+gateway instance**, or need logout to be instant despite caching. Neither is true today.
+
+**Step 4 — circuit breaker + fallback.** Resilience4j on the gateway only. **One decision is
+still open:** when AuthService is down and the circuit opens, do we (A) reject everything, (B)
+skip the check and trust signature + expiry alone, or (C) use the last cached value and fall
+back to B? Recommendation is C with loud logging — but it is a real security trade-off and it is
+your call.
+
+**Step 5 — turn on metrics.** Actuator exposes only `info,health` today. Steps 1–4 are all
+mechanisms you tune from real numbers, and a circuit breaker you cannot observe is arguably
+worse than none, because it will open silently.
 
 **B4 — Missing input checks.** Update forms mostly have no rules. ReportingService has none at
 all. A 10MB description would be rejected by the database as a confusing 500 error, instead of a

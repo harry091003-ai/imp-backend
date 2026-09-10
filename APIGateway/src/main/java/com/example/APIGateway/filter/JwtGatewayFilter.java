@@ -1,5 +1,6 @@
 package com.example.APIGateway.filter;
 import com.example.APIGateway.services.TokenVersionService;
+import com.example.APIGateway.utils.FailureDescription;
 import com.example.APIGateway.utils.JwtUtil;
 import jakarta.validation.constraints.Email;
 import org.springframework.beans.factory.annotation.Value;
@@ -19,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 
@@ -200,8 +202,30 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
                     //onErrorResume handles asynchronous (reactive) errors!
                     //this onErrorResume is to handle as if tokenVersionService fails
                     .onErrorResume(e -> {
-                        logger.severe("❌ Auth service error: " + e.getClass() + " - " + e.getMessage());
-                        e.printStackTrace();
+                        // CHANGED 2026-09-09 (Track B3, step 1 follow-up).
+                        //
+                        // This used to be:
+                        //     logger.severe("... " + e.getClass() + " - " + e.getMessage());
+                        //     e.printStackTrace();
+                        //
+                        // Both lines were useless for the failure we most need to see - a timeout:
+                        //   - getMessage() was "null", because Netty builds its timeout
+                        //     exception with no message on purpose.
+                        //   - printStackTrace() printed nothing useful, because that same
+                        //     exception is built with no stack trace either (also on purpose -
+                        //     timeouts are common under load and stack traces are expensive).
+                        //
+                        // So the log said "null" for the one case this whole change was about.
+                        //
+                        // FailureDescription prints the exception TYPE, the full cause chain,
+                        // and - the useful part - WHICH timeout setting is responsible.
+                        //
+                        // Passing the exception to logger.log() as well means a real stack
+                        // trace still gets recorded when there IS one, and it goes through the
+                        // logger instead of being printed straight to the console where it
+                        // cannot be filtered or captured.
+                        logger.log(Level.SEVERE,
+                                "❌ Auth service call failed: " + FailureDescription.of(e), e);
                         // CHANGED: 503, not 401. AuthService being unreachable is our problem, not a
                         // sign the caller's token is bad - telling them "unauthorized" made them
                         // re-login pointlessly and hid a real outage.
