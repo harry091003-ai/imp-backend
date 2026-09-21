@@ -27,7 +27,7 @@ Last updated: 2026-09-01
 | A4 | Fix the build | ✅ Done — 2026-09-01 |
 | B1 | Stop people faking an Admin | ✅ Done — all 3 steps, 2026-09-02 |
 | B2 | Kafka dead letter topics | ✅ Done — 2026-09-08 |
-| B3 | Timeouts, resilience, the gateway hot path | 🟨 Steps 1-2 done 2026-09-09, steps 3-5 to do |
+| B3 | Timeouts, resilience, the gateway hot path | ✅ Done — all 5 steps, 2026-09-16 |
 | B4 to B5 | Input checks, rate limits | ⬜ Planned, not started |
 | Track C | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
@@ -737,7 +737,7 @@ Written down so it stays a choice, not an accident.
 
 ## B2 to B5 — where each one stands
 
-B2 is done. B3 steps 1-2 are done. B4 and B5 are still short summaries - full detail when we
+B2 and B3 are done. B4 and B5 are still short summaries - full detail when we
 get to them.
 
 **B2 — Kafka messages can get stuck.** ✅ **DONE 2026-09-08.**
@@ -842,7 +842,7 @@ latest. Redeliveries are rare, so the occasional extra call is worth it.
 
 This closes the last open item in B2.
 
-## B3 — One slow service could freeze everything 🟡 Steps 1–2 done 2026-09-09
+## B3 — One slow service could freeze everything ✅ Done 2026-09-16
 
 ### What was wrong
 
@@ -986,7 +986,7 @@ migration would have silently downgraded a 404 into a 500.
   exposed the way WebClient's *no* limit left the others. But 60s is still far too long.
 - Spring Cloud sets Feign to **`NEVER_RETRY`** — so no accidental retry stacking. This matters:
   3 gateway retries x 3 service retries = 9 real calls to a service that is already struggling.
-  **Retry belongs at exactly one layer**, chosen deliberately in step 4.
+  **Retry belongs at exactly one layer.** We have not chosen that layer yet (see "Not done in B3").
 - The property prefix is **`spring.cloud.openfeign.client.config`** — a wrong prefix would have
   silently applied nothing, which is the worst kind of failure.
 
@@ -1016,12 +1016,12 @@ WebClient bent into blocking  ->       the client matches the app
 a timeout logged as "null"    ->       names the exact setting to change
 ```
 
-### Known gap, deliberately left for step 4
+### Known gap, still open after B3
 
 A timeout currently surfaces to the caller as a **500**, not a 503. Feign's `ErrorDecoder` only
 sees real HTTP replies — a timeout has no reply, so it bypasses it and lands on common-web's
-catch-all. Honest, but not as clear as it should be. Mapping "the dependency is down" to a 503
-belongs with step 4, where fallbacks are handled properly for the whole project at once.
+catch-all. Honest, but not as clear as it should be. This was planned for step 4 but step 4 only
+covered the gateway, so it is still open (see "Not done in B3").
 
 ### Files changed in B3 steps 1–2
 
@@ -1041,30 +1041,148 @@ belongs with step 4, where fallbacks are handled properly for the whole project 
 **Notes (3):** `gateway-timeouts-and-connection-pools.md` (new),
 `choosing-between-webclient-and-feign.md` (new), `README.md` (index).
 
-### Still to do — steps 3, 4, 5
+### Step 3 result — ✅ done 2026-09-11
 
-**Step 3 — cache the token version.** The gateway calls AuthService on every request to check a
-number that changes maybe twice a year per user. A 30-second in-memory cache (Caffeine) removes
-about 99.9% of those calls.
+**What it does.** The gateway used to call AuthService on every request to check if a token was
+revoked. Now it remembers the answer, using 3 tiers:
 
-The trade-off must be decided, not defaulted into: a logged-out token stays valid for up to 30
-more seconds. Worth knowing — the benefit flattens fast but the staleness grows linearly, so
-**shorter is better**. 30s and 60s save almost the same number of calls.
+| Tier | When | What happens |
+|---|---|---|
+| 1 — fresh cache | value under 30s old | use it, no call to AuthService |
+| live | cache empty/old | call AuthService, save the answer |
+| 2 — stale cache | AuthService didn't reply, value under 5min old | use it anyway, log a warning |
+| 3 — unavailable | AuthService didn't reply, nothing usable cached | skip the check, log it loudly |
 
-**Not Redis, and there is a reason.** Redis is itself a network call — we would be swapping "a
-call that can hang" for "another call that can hang", plus a new server that can be down. An
-in-memory cache is a lookup in our own memory. Redis becomes correct when we run **more than one
-gateway instance**, or need logout to be instant despite caching. Neither is true today.
+Signature and expiry are still checked before any of this, so even Tier 3 rejects a fake or
+expired token — only the extra "was this revoked recently" check is skipped.
 
-**Step 4 — circuit breaker + fallback.** Resilience4j on the gateway only. **One decision is
-still open:** when AuthService is down and the circuit opens, do we (A) reject everything, (B)
-skip the check and trust signature + expiry alone, or (C) use the last cached value and fall
-back to B? Recommendation is C with loud logging — but it is a real security trade-off and it is
-your call.
+**Why an in-memory cache (Caffeine), not Redis.** Redis is itself a network call — we'd be
+swapping "a call that can hang" for "another call that can hang". Caffeine is a lookup in our own
+memory, so it can never hang. Redis becomes the right choice once we run more than one gateway,
+so every instance shares the same cache — not before. When that day comes it goes **behind**
+Caffeine, not instead of it.
 
-**Step 5 — turn on metrics.** Actuator exposes only `info,health` today. Steps 1–4 are all
-mechanisms you tune from real numbers, and a circuit breaker you cannot observe is arguably
-worse than none, because it will open silently.
+**A bug we caught while writing this.** If Tier 3 gives back "I don't know" and the code compared
+it carelessly, every user would look revoked and get logged out — for as long as AuthService
+stayed down. Fixed with `canCheckRevocation()`, which the filter must check before comparing.
+
+**A second, separate case we had to add.** A 404 from AuthService means the user was deleted —
+not that AuthService is down. Without treating that separately, a deleted user's old token would
+fall into Tier 3 and get waved straight through. New `AuthUserNotFoundException` keeps the two
+apart.
+
+**Files:** `pom.xml` (+Caffeine), `services/TokenVersionService.java` (the 3 tiers),
+`services/TokenVersionResult.java` (new), `services/AuthUserNotFoundException.java` (new),
+`filter/JwtGatewayFilter.java` (uses the new result type), `application.properties`
+(3 new settings: fresh-ms, stale-ceiling-ms, max-cached-users).
+
+### Step 4 result — ✅ done 2026-09-16
+
+**Goal:** when AuthService is down, reach the fallback **instantly** instead of waiting 2
+seconds on every request.
+
+**What we did:** put a circuit breaker (Resilience4j) around the one HTTP call to AuthService.
+The cache and the 3 tiers are untouched.
+
+```
+Cache missed → we need a live answer from AuthService
+        │
+        ▼
+Is the breaker OPEN?
+   ├─ NO  → make the real call (gives up after 2s if it hangs)
+   └─ YES → refuse instantly. Never touch the network.
+        │
+        ▼
+No answer? → same fallback as step 3 (Tier 2 or Tier 3)
+```
+
+The breaker's 3 states:
+
+```
+CLOSED (normal)
+   │  half of the last 10 calls failed
+   ▼
+OPEN (refuse everything for 10 seconds)
+   │  10 seconds pass
+   ▼
+HALF_OPEN (let 3 test calls through)
+   ├─ they work → back to CLOSED
+   └─ they fail → back to OPEN
+```
+
+**Remember:**
+- The breaker only changes how **fast** we reach the fallback. It never changes **what** the
+  fallback does.
+- The window is 10, not 20+. Step 3's cache made calls to AuthService rare, so a big window
+  would take minutes to fill with failures.
+- A 404 ("no such user") is **not** a failure for the breaker. AuthService answered correctly.
+  `ignoreExceptions(AuthUserNotFoundException.class)`.
+- Every state change is logged (`CLOSED_TO_OPEN` etc.).
+
+**Files:** `pom.xml` (+Resilience4j), `TokenVersionService.java`, `FailureDescription.java`,
+`application.properties` (`gateway.circuitbreaker.*`).
+
+### Step 5 result — ✅ done 2026-09-16
+
+**Goal:** make steps 1–4 **visible**. They all work silently. A breaker you cannot see is a
+breaker you cannot trust or tune.
+
+```
+STARTUP   make 4 Counters + 1 Gauge, pin them on the MeterRegistry (the shared noticeboard)
+             │
+RUNNING   a request is answered by a tier → click that tier's Counter (+1)
+             │
+ANYTIME   open a /actuator URL → registry reads the counters,
+                                 gauge reads the cache size right then
+```
+
+**Open these in a browser:**
+
+| URL (on port 8082) | Shows |
+|---|---|
+| `/actuator/metrics/gateway.tokenversion.lookups` | requests answered per tier (tag `tier`) |
+| `/actuator/metrics/gateway.tokenversion.cache.size` | users cached right now |
+| `/actuator/circuitbreakers` | breaker state and failure rate |
+
+Healthy system: `stale_cache` and `unavailable` stay at **0**.
+
+**Remember:**
+- **Counter** = a tally we click; the number lives inside it; only goes up. **Gauge** = stores
+  nothing; reads the cache size live; goes up and down. Counters replaced the old `AtomicLong`s,
+  which were private and invisible.
+- **Bug we caught:** `CircuitBreaker.of(...)` builds a breaker that works but never shows up in
+  `/actuator`. We use `registry.circuitBreaker(...)` instead.
+- **Safety:** the `circuitbreakers` page also accepts a POST that can force the breaker open.
+  The gateway has no login on `/actuator`. We tested it: without
+  `management.endpoints.access.max-permitted=read-only` the POST returned 200 and the breaker
+  became `FORCED_OPEN`. With it: 404, breaker stays `CLOSED`.
+- The `circuitbreakerevents` page is left off. It shows raw error text that can hold user ids.
+- Never use a user id as a metric label. Every new value makes a new metric.
+- Only the **gateway** has these pages. The other 6 services still expose only `health`, `info`.
+
+**Files:** `TokenVersionService.java` (counters, gauge, registry; `statsSummary()` removed),
+`application.properties` (`management.*`).
+
+### B3 is complete — what it adds up to
+
+```
+Step 1  timeouts        → nothing waits forever
+Step 2  Feign           → each app uses the right HTTP client
+Step 3  cache + tiers   → AuthService is not called every request, and can be down
+Step 4  circuit breaker → the fallback is instant
+Step 5  metrics         → we can see all of it
+```
+
+### Not done in B3 (still open)
+
+- **A Feign timeout shows up as a 500, not a 503.** A timeout has no reply, so Feign's
+  `ErrorDecoder` never sees it. Step 4 was meant to fix this and did not.
+- **No retries anywhere.** We never chose which layer should retry. Feign is still
+  `NEVER_RETRY`. Retry at **one** layer only, or retries multiply (3 × 3 = 9 calls).
+- **No circuit breaker on the Feign calls** (Incident, Notification, Ai-Service). Only the
+  gateway has one.
+- **Ai-Service has no timeout on the Gemini call.**
+- **Metrics only exist on the gateway.**
 
 **B4 — Missing input checks.** Update forms mostly have no rules. ReportingService has none at
 all. A 10MB description would be rejected by the database as a confusing 500 error, instead of a

@@ -80,6 +80,39 @@
 <!--            <version>1.0.0</version>-->
 <!--        </dependency>-->
 
+		<!-- ADDED 2026-09-11 (Track B3, step 3): Caffeine, an in-memory cache.
+		     Used to remember AuthService's answer for "is this token revoked?"
+		     so we don't call AuthService on every single request.
+
+		     Why not Redis instead: Redis is itself a network call - it would
+		     just swap one thing that can hang for another. Caffeine is a
+		     lookup in our own memory, so it never touches the network.
+
+		     LATER: once we run more than one gateway instance, add Redis
+		     BEHIND Caffeine (not instead of it), so every instance shares
+		     the same cached answers.
+
+		     No <version> - spring-boot-starter-parent manages it (3.2.3 today). -->
+		<dependency>
+			<groupId>com.github.ben-manes.caffeine</groupId>
+			<artifactId>caffeine</artifactId>
+		</dependency>
+
+		<!-- ADDED 2026-09-16 (Track B3, step 4): Resilience4j circuit breaker.
+
+		     What it adds: when AuthService keeps failing, stop calling it for a
+		     while and go straight to the fallback. Without this, every request
+		     still waits the full 2-second timeout before falling back.
+
+		     The REACTOR version, not the plain one - the gateway is reactive
+		     (WebFlux), and the plain starter is built for blocking apps.
+
+		     No <version> - the spring-cloud-dependencies BOM manages it. -->
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-circuitbreaker-reactor-resilience4j</artifactId>
+		</dependency>
+
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-test</artifactId>

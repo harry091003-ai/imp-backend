@@ -55,6 +55,13 @@ to `spring-boot-starter-parent`, so the root pom's `<properties>` are decorative
   `pdf-document-reader`). Chat model `gemini-2.5-flash-lite`, embeddings `gemini-embedding-001`.
   Prompt templates live in `Ai-Service/src/main/resources/prompts/**/*.st`.
 - **ShedLock 5.10.0** (JDBC) for `ReportingService` schedulers.
+- **Caffeine** (in-memory cache, APIGateway only, Track B3 step 3) — caches the AuthService
+  token-version answer so it isn't called on every request.
+- **Resilience4j** (`spring-cloud-starter-circuitbreaker-reactor-resilience4j`, APIGateway only,
+  Track B3 step 4) — circuit breaker around the AuthService call. Reactor variant, not the plain
+  one — the gateway is WebFlux.
+- **Micrometer** (comes with actuator; used in APIGateway, Track B3 step 5) — `Counter` per tier and
+  a `Gauge` for cache size, registered on the `MeterRegistry` so they show under `/actuator`.
 - **Lombok** everywhere (`@Getter/@Setter/@Builder/@RequiredArgsConstructor`).
 
 ---
@@ -93,9 +100,11 @@ SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetric
 1. `POST /auth/login` → AuthService mints a JWT with claims `roles`, `tokenVersion`, `email`;
    subject = **userid (UUID string)**.
 2. Every request hits **APIGateway** → `JwtGatewayFilter` (`GlobalFilter`, order `-1`):
-   skips paths starting with `/auth`, validates signature + expiry, then calls
-   `AUTHSERVICE /auth/token-version/{userid}` (reactive `WebClient`, `@LoadBalanced`) and
-   rejects on version mismatch. This is the logout / password-change revocation mechanism.
+   skips paths starting with `/auth`, validates signature + expiry, then checks the token version
+   against AuthService and rejects on mismatch. This is the logout / password-change revocation
+   mechanism. **As of 2026-09-11 (Track B3 step 3) this check goes through a Caffeine cache with
+   3 tiers** (fresh cache → live call → stale-cache fallback → skip-the-check fallback) instead of
+   calling AuthService on every request. See `services/TokenVersionService.java` and §6.
 3. On success the gateway **injects headers** `X-User-Id`, `X-Roles`, `X-User-Email`.
 4. **As of 2026-09-02 (Track B1) the gateway also sends `X-Internal-Secret`, and wipes any
    `X-User-*` headers the caller sent before writing its own.** Services check that secret
@@ -166,8 +175,19 @@ blocking (Spring MVC/Tomcat) so it uses **OpenFeign**. Do not mix them — `WebC
 in a blocking service was exactly the bug B3 removed.
 
 - Gateway → AuthService: `WebClient` `http://AUTHSERVICE/auth/token-version/{userid}`.
-  Called on **every request**. Timeouts and a bounded connection pool live in
-  `config/WebClientConfig` + `gateway.httpclient.*` in `application.properties`.
+  Timeouts and a bounded connection pool live in `config/WebClientConfig` +
+  `gateway.httpclient.*` in `application.properties`. **As of Track B3 step 3, this is no longer
+  called on every request** — `services/TokenVersionService.java` caches the answer (Caffeine,
+  30s fresh) and falls back to a stale cached value (up to 5 min) or skips the check entirely if
+  AuthService won't answer at all. `gateway.tokenversion.*` in `application.properties`.
+  **As of Track B3 step 4, the call is also wrapped in a Resilience4j circuit breaker** —
+  `gateway.circuitbreaker.*` in `application.properties`. When AuthService is failing, the breaker
+  opens and skips the call entirely (no more waiting out the 2s timeout on every request); a 404
+  ("no such user") is explicitly excluded from failure counting, same reasoning as the tiers —
+  AuthService answering 404 means it's healthy. **As of step 5 the numbers are visible** (gateway
+  only, port 8082): `/actuator/metrics/gateway.tokenversion.lookups` (per tier),
+  `/actuator/metrics/gateway.tokenversion.cache.size`, `/actuator/circuitbreakers`. Healthy =
+  `stale_cache` and `unavailable` stay at 0.
 - IncidentService → UserService (`client/UserClient`, **`@FeignClient(name = "USERSERVICE")`**):
   `/internal/validation/{userId}`, `/internal/EngineersUnderSupervisor/{SupervisorId}`,
   `/internal/UserSpecificDetails/{userId}` (this last one is **unused** and its endpoint is
@@ -189,14 +209,14 @@ automatically — a plain `@Bean` interceptor applies to every client in the ser
 ships with 10s/60s defaults (unlike WebClient, which has **none**) — so Ai-Service was never
 fully exposed, but 60s was still far too long. Spring Cloud's default retryer is `NEVER_RETRY`
 and is deliberately left alone: retries stack across layers (3 × 3 = 9 real calls), so retry
-belongs at exactly one layer, chosen in B3 step 4.
+belongs at exactly one layer. **That layer has not been chosen yet** - B3 added no retries.
 
 **Error mapping.** IncidentService has `config/FeignErrorDecoderConfig` mapping 404 →
 `NotFoundException` so "no such user" stays a 404 instead of becoming a 500. NotificationService
 deliberately has none — its old code had no 404 rule to preserve, and Feign's default decoder
 (status + method + URL + body) beats what was there. **Caveat:** a *timeout* never reaches an
 `ErrorDecoder` (there is no HTTP reply to decode), so it currently surfaces as a 500 rather than
-a 503. Mapping that properly is B3 step 4.
+a 503. **Still open** - B3 step 4 only covered the gateway.
 
 Service ids used in `lb://` / URIs are inconsistently cased vs `spring.application.name`
 (e.g. `lb://IncidentService` vs `INCIDENTSERVICE`) — verify before touching discovery.
@@ -441,6 +461,8 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     Ai-Service's `resolved_incidents_vectors` - are now captured in their baselines.
 42. No tests, no CI, no Dockerfiles, no profiles, no config server.
 43. Actuator exposes only `info,health`, but `show-details=always` in Auth/User/Notification/Reporting.
+    **APIGateway is different (Track B3 step 5):** it also exposes `metrics` and `circuitbreakers`,
+    read-only. Metrics exist on the gateway only.
 44. Secrets come from bare env vars with no defaults and no validation.
 45. No git repository at the project root.
 
@@ -484,5 +506,13 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   the scanned config class under its own decapitalized name, so the two collide and the service
   refuses to start. Name config classes after their job (`FeignErrorDecoderConfig`), not after
   what they produce.
+- **Actuator on the gateway must stay read-only** (`management.endpoints.access.max-permitted=read-only`).
+  The `circuitbreakers` page accepts a POST that can force the breaker open, and `/actuator` has no
+  login check on the gateway. Tested: without the line the POST returns 200 and the breaker becomes
+  `FORCED_OPEN`.
+- **Register circuit breakers through the registry** (`circuitBreakerRegistry.circuitBreaker(...)`),
+  not `CircuitBreaker.of(...)`. `.of()` works but never shows up in `/actuator`.
+- **Never use a user id (or any open-ended value) as a metric tag.** Every new value creates a new
+  metric. Tags must have a small fixed set of values, like the 4 tiers.
 - APIGateway is WebFlux and cannot use `common-web`. If the error shape changes, update
   `JwtGatewayFilter.onError` by hand to match.

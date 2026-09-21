@@ -130,6 +130,11 @@ public final class FailureDescription {
                         + " is currently busy (see gateway.httpclient.pending-acquire-timeout-ms"
                         + " and gateway.httpclient.max-connections)";
 
+            case "CallNotPermittedException":
+                return "CIRCUIT BREAKER IS OPEN - we did not even try the call. The service has"
+                        + " been failing, so we are giving it time to recover"
+                        + " (see gateway.circuitbreaker.*)";
+
             default:
                 // Not a timeout, or not one we recognise. The chain below still gets printed,
                 // so nothing is hidden - we just have no friendly one-liner to add.

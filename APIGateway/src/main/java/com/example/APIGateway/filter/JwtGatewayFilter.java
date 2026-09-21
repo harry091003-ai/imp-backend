@@ -1,4 +1,5 @@
 package com.example.APIGateway.filter;
+import com.example.APIGateway.services.AuthUserNotFoundException;
 import com.example.APIGateway.services.TokenVersionService;
 import com.example.APIGateway.utils.FailureDescription;
 import com.example.APIGateway.utils.JwtUtil;
@@ -168,15 +169,26 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
             System.out.println("JwtGatewayFilter executed");
             // ✅ 5. Get latest version from AuthService
             return tokenVersionService.getTokenVersion(Userid)
-                    .flatMap(latestVersion -> {
+                    .flatMap(result -> {
 
-                        if ( !tokenVersion.equals(latestVersion)) {
+                        // result can now mean "we don't know" (AuthService down and
+                        // nothing cached). Must check canCheckRevocation() FIRST - if we
+                        // compared tokenVersion.equals(null) directly, that quietly
+                        // returns false, and every user would get logged out for as long
+                        // as AuthService stays down.
+                        if (!result.canCheckRevocation()) {
+                            // Already logged at SEVERE inside TokenVersionService, with the
+                            // reason and a running count. Not logged twice here.
+                            logger.warning("[" + traceId + "] Proceeding WITHOUT a revocation"
+                                    + " check - signature and expiry were still verified");
+
+                        } else if (!tokenVersion.equals(result.version())) {
                             logger.severe("❌ Token version mismatch - token revoked");
                             return onError(exchange, "TOKEN_REVOKED",
                                     "This token is no longer valid. Please log in again.", HttpStatus.UNAUTHORIZED);
                         }
 
-                        logger.info("✅ Token version verified");
+                        logger.info("✅ Token version verified (source: " + result.source() + ")");
                         logger.info("📤 Adding headers - X-User: " + Userid + ", X-Roles: " + String.join(",", roles));
 
                         // this is the success case(as token validation is done) so here we are sending the request forward and also modifing the request  by  passing the user and its roles also in the request header
@@ -202,33 +214,30 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
                     //onErrorResume handles asynchronous (reactive) errors!
                     //this onErrorResume is to handle as if tokenVersionService fails
                     .onErrorResume(e -> {
-                        // CHANGED 2026-09-09 (Track B3, step 1 follow-up).
+
+                        // 404 from AuthService = this user no longer exists. That is a
+                        // real answer, not an outage - so it's a 401 (log in again),
+                        // not a 503 (retry later, which would never help).
+                        if (e instanceof AuthUserNotFoundException) {
+                            logger.severe("[" + traceId + "] Token belongs to a user that no"
+                                    + " longer exists - rejecting");
+                            return onError(exchange, "TOKEN_REVOKED",
+                                    "This token is no longer valid. Please log in again.",
+                                    HttpStatus.UNAUTHORIZED);
+                        }
+
+                        // Anything else here is genuinely unexpected - AuthService being
+                        // slow or down no longer reaches this point at all; the fallback
+                        // tiers in TokenVersionService already handle that.
                         //
-                        // This used to be:
-                        //     logger.severe("... " + e.getClass() + " - " + e.getMessage());
-                        //     e.printStackTrace();
-                        //
-                        // Both lines were useless for the failure we most need to see - a timeout:
-                        //   - getMessage() was "null", because Netty builds its timeout
-                        //     exception with no message on purpose.
-                        //   - printStackTrace() printed nothing useful, because that same
-                        //     exception is built with no stack trace either (also on purpose -
-                        //     timeouts are common under load and stack traces are expensive).
-                        //
-                        // So the log said "null" for the one case this whole change was about.
-                        //
-                        // FailureDescription prints the exception TYPE, the full cause chain,
-                        // and - the useful part - WHICH timeout setting is responsible.
-                        //
-                        // Passing the exception to logger.log() as well means a real stack
-                        // trace still gets recorded when there IS one, and it goes through the
-                        // logger instead of being printed straight to the console where it
-                        // cannot be filtered or captured.
+                        // FailureDescription.of(e) instead of e.getMessage(): a timeout
+                        // exception carries NO message on purpose (a Netty design
+                        // choice), so getMessage() used to just print "null". This
+                        // prints the real cause chain and which setting to check.
                         logger.log(Level.SEVERE,
                                 "❌ Auth service call failed: " + FailureDescription.of(e), e);
-                        // CHANGED: 503, not 401. AuthService being unreachable is our problem, not a
-                        // sign the caller's token is bad - telling them "unauthorized" made them
-                        // re-login pointlessly and hid a real outage.
+                        // 503, not 401 - AuthService being unreachable is our problem,
+                        // not a sign the caller's token is bad.
                         return onError(exchange, "AUTH_SERVICE_UNAVAILABLE",
                                 "Unable to verify the session right now. Please try again.",
                                 HttpStatus.SERVICE_UNAVAILABLE);
