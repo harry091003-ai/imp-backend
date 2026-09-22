@@ -5,6 +5,7 @@ import com.example.UserService.entity.RoleName;
 import com.example.UserService.entity.User;
 import com.example.UserService.service.UserService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Size;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.ResponseEntity;
@@ -116,7 +117,9 @@ public class UserController {
 //search user using email ,username and get results based on user searching role in pageable format
     @GetMapping("/search")
     public ResponseEntity<Page<UserSearchResponseDTO>> searchUsers(
-            @RequestParam String query,
+            // B4 step 5: max 100 = the email column size, so a longer text can never match.
+            // Empty is still allowed (it lists everyone you are allowed to see), same as before.
+            @RequestParam @Size(max = 100, message = "query must be at most 100 characters") String query,
             Pageable pageable,
             Authentication authentication
     ) {

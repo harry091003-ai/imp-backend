@@ -222,6 +222,17 @@ Service ids used in `lb://` / URIs are inconsistently cased vs `spring.applicati
 (e.g. `lb://IncidentService` vs `INCIDENTSERVICE`) — verify before touching discovery.
 `@FeignClient(name = ...)` must match `spring.application.name` exactly.
 
+**Request size (Track B4 step 6).** The gateway's `filter/RequestSizeFilter.java` (a
+`GlobalFilter`, order `-2` — runs before `JwtGatewayFilter`'s `-1`) refuses any request body over
+`gateway.request.max-body-size` (256KB) with a 413, and refuses a chunked body with no
+`Content-Length` at all with a 411 (Spring's own `RequestSizeGatewayFilterFactory` only reads
+`Content-Length`, so a chunked request slips past it — that is why this is a hand-written filter,
+not the built-in one). It applies to every route, including `/auth/**`. Downstream services do
+**not** re-check body size — they trust the gateway is the only door in, which holds only because
+they bind to `127.0.0.1` (Track B1). The JSON-error-writing code both gateway filters use lives in
+`utils/GatewayErrorWriter.java` (new, Track B4 step 6) — write to that one place, not to each
+filter separately, or the two error shapes will drift apart.
+
 ---
 
 ## 7. Conventions actually in use
@@ -243,9 +254,22 @@ Deviations: `Ai-Service` uses `Kafka/` (capital K); `NotificationService` uses `
 Mapping is inline `Builder` chaining in the service layer — **no MapStruct, no mapper classes**.
 
 **Validation**: `jakarta.validation` annotations on DTOs, enforced by `@Valid` on every
-request body in AuthService, IncidentService and UserService (added 2026-08-28 — previously
-`@Valid` existed only in AuthService, so IncidentService's constraints never fired).
-ReportingService and Ai-Service have no request bodies to validate.
+request body in AuthService, IncidentService, UserService and **Ai-Service** (Ai-Service's
+`RagController` added 2026-09-20, Track B4 step 4 — it was previously wrong to say Ai-Service
+has no request bodies; both its endpoints take one, just as `@GetMapping` with `@RequestBody`,
+see issue 7). ReportingService genuinely has no request bodies (every endpoint is a plain
+`@GetMapping`), but **as of Track B4 step 5 its `days` query parameter is validated too**
+(`@Min`/`@Max`) — "no request bodies" and "no validation" are not the same thing.
+
+**As of Track B4 (2026-09-19 to 2026-09-22), path and query parameters are validated the same
+way as request bodies** — `@Min`/`@Max`/`@Size` directly on the `@PathVariable`/`@RequestParam`,
+enforced by Spring's built-in method validation (`HandlerMethodValidationException`, handled in
+`common-web`'s `GlobalExceptionHandler` alongside `@Valid` body failures). See ReportingService's
+`days`, UserService's search `query` and batch-id list, and AuthService's `TokenVersionController`
+(its `userid` path variable is now typed `UUID`, not `String`, so a non-UUID value is rejected by
+Spring itself before the controller method runs). DTO length limits are chosen to **match the
+database column they are saved to** — see issue 46 for the one mismatch B4 found and fixed with
+a migration.
 
 **Exception handling**: **as of 2026-08-28 this is now centralized** — see the `common-web`
 module. Services throw `NotFoundException` / `ValidationException` / `ConflictException` /
@@ -346,7 +370,8 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 6. Account lockout has **no unlock path**: 5 failures set `accountLocked=true`; the pre-check
    rejects before authentication, and the reset to `false` only runs after a successful login.
 7. `RagController` uses `@GetMapping` with `@RequestBody` on both endpoints — GET-with-body is
-   dropped by many clients and by gateways.
+   dropped by many clients and by gateways. **Still true as of Track B4 step 4** — both bodies are
+   now validated (`@Valid`, `@NotBlank`/`@Size`), but the HTTP method itself is unchanged.
 
 ### Security
 
@@ -366,8 +391,12 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
    gateway strips from inbound requests). `/reports/**` now requires ADMIN or SUPERVISOR.
 10. `AuthService` has **no `@EnableMethodSecurity`**, so `@PreAuthorize("hasRole('ADMIN')")` on
     `RoleController` is inert (the URL rule `/roles/** -> ROLE_ADMIN` is what actually protects it).
-11. `/auth/token-version/{userid}` is `permitAll` — a public per-user counter that throws a raw
-    `RuntimeException` for unknown ids.
+11. `/auth/token-version/{userid}` is `permitAll` — a public per-user counter. **As of Track B4
+    step 5, `userid` is a typed `UUID` path variable**, so a non-UUID value now gets a clean 400
+    from Spring itself instead of a raw crash inside `UUID.fromString(...)`. It still throws
+    `NotFoundException` (a proper 404, not a raw `RuntimeException`) for a well-formed but unknown
+    id — that part was already fixed under issue 40/`common-web`. The `permitAll` exposure itself
+    is unchanged.
 12. `System.out.println` of user ids, roles, authorities and token versions across AuthService,
     UserService and the gateway.
 13. `spring.json.trusted.packages=*` on every consumer.
@@ -439,7 +468,11 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     at all - Feign wires load balancing itself, so there was nothing to move. Still present in
     `ReportingService` and `Ai-Service` (both declare it but neither uses WebClient for calls).
 36. `spring.cloud.gateway.routes[*]` uses the pre-2025 property prefix; Spring Cloud 2025.0.x
-    moved these to `spring.cloud.gateway.server.webflux.*`. Verify routing still binds.
+    moved these to `spring.cloud.gateway.server.webflux.*`. **Checked 2026-09-22 (Track B4 step
+    6): routing is fine.** `GatewayServerWebfluxPropertiesMigrationListener` auto-copies the old
+    keys to the new ones at startup and logs a warning ("Each configuration key has been
+    temporarily mapped..."), confirmed in a real startup log. Renaming the keys to silence the
+    warning is still a separate, un-started tidy-up.
 37. ~~Blocking `.block()` on `WebClient` throughout IncidentService/NotificationService (a
     `RestClient` would be the honest choice); each call also does `webClientBuilder.build()` per
     invocation.~~ **RESOLVED 2026-09-09** (Track B3 step 2). Both now use OpenFeign, matching
@@ -465,6 +498,17 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     read-only. Metrics exist on the gateway only.
 44. Secrets come from bare env vars with no defaults and no validation.
 45. No git repository at the project root.
+
+### Found during Track B4 (2026-09-19 to 2026-09-22)
+
+46. ~~`incidents.root_cause` and `incidents.resolution_notes` were `varchar(500)` in the database,
+    but `UpdateIncidentStatus_RequestDTO` allowed up to 2000 characters.~~ **RESOLVED 2026-09-19**
+    — `V2__widen_root_cause_and_resolution_notes.sql` widens both columns to 2000, matching the
+    DTO. **You must run this migration yourself; it has not touched the live database yet.**
+47. `AuthService/dto/LoginFromDTO.java`'s `username` field is `@NotBlank` (required) but never
+    read — `LoginUserService` authenticates by email only (confirmed: no
+    `request.getUsername()` anywhere in it). A caller must still send *something* there because
+    of `@NotBlank`. Pre-existing behaviour, documented in the file, not changed by Track B4.
 
 ---
 
@@ -516,3 +560,13 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   metric. Tags must have a small fixed set of values, like the 4 tiers.
 - APIGateway is WebFlux and cannot use `common-web`. If the error shape changes, update
   `JwtGatewayFilter.onError` by hand to match.
+- **Validate at the edge, declaratively (Track B4).** A request body gets `@Valid` + annotations
+  on the DTO. A path/query value gets `@Min`/`@Max`/`@Size` directly on the parameter — Spring's
+  own `HandlerMethodValidationException` handles it, already wired into `common-web`'s
+  `GlobalExceptionHandler`. Don't hand-write an `if` check for something an annotation already
+  does. A DTO's length limit must **match the database column it is saved to** — a mismatch means
+  a value can pass our check and still be rejected by the database as a confusing 500 (see
+  issue 46, the one place this was found for real).
+- **`@Valid` is not optional decoration.** A DTO covered in annotations does nothing if the
+  controller method is missing `@Valid` on that parameter — the rules simply never run. This is
+  exactly the mistake `RagController` had (issue 7 / Track B4 step 4) until it was added.

@@ -13,7 +13,7 @@ Other files that go with this one:
 - `notes/` — personal learning notes (not tracked by git - see below). Includes
   `FLYWAY-NOTES.md`, `ERROR_HANDLING_FLOW.md`, and topic notes on things learned along the way.
 
-Last updated: 2026-09-01
+Last updated: 2026-09-22
 
 ---
 
@@ -28,11 +28,12 @@ Last updated: 2026-09-01
 | B1 | Stop people faking an Admin | ✅ Done — all 3 steps, 2026-09-02 |
 | B2 | Kafka dead letter topics | ✅ Done — 2026-09-08 |
 | B3 | Timeouts, resilience, the gateway hot path | ✅ Done — all 5 steps, 2026-09-16 |
-| B4 to B5 | Input checks, rate limits | ⬜ Planned, not started |
+| B4 | Input checks | ✅ Done — all 7 steps, 2026-09-22 |
+| B5 | Rate limiting | ⬜ Planned, not started |
 | Track C | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
 
-**Track A is finished. Track B has started.**
+**Track A is finished. Track B is almost finished — only B5 is left.**
 
 ---
 
@@ -425,10 +426,10 @@ We agreed this list on 2026-09-01. There are 5 items. B1 is by far the most impo
 
 | Item | What it is | Status |
 |---|---|---|
-| B1 | Anyone could pretend to be an Admin | 🔨 Doing now |
-| B2 | Kafka messages can get stuck forever | ⬜ Not started |
-| B3 | One slow service can freeze everything | ⬜ Not started |
-| B4 | Missing input checks | ⬜ Not started |
+| B1 | Anyone could pretend to be an Admin | ✅ Done |
+| B2 | Kafka messages can get stuck forever | ✅ Done |
+| B3 | One slow service can freeze everything | ✅ Done |
+| B4 | Missing input checks | ✅ Done |
 | B5 | Nothing stops someone spamming the app | ⬜ Not started |
 
 ---
@@ -1184,9 +1185,297 @@ Step 5  metrics         → we can see all of it
 - **Ai-Service has no timeout on the Gemini call.**
 - **Metrics only exist on the gateway.**
 
-**B4 — Missing input checks.** Update forms mostly have no rules. ReportingService has none at
-all. A 10MB description would be rejected by the database as a confusing 500 error, instead of a
-clean "too long" message.
+## B4 — Missing input checks ✅ Done 2026-09-22
+
+### What was wrong
+
+Most request bodies had **no rules at all**. ReportingService had none anywhere. A field with no
+limit could be:
+
+- **Missing**, and crash something later, far from where the request came in.
+- **Too long**, and get rejected by the database as a confusing 500, instead of a clean "too long"
+  message.
+- **The wrong type**, like `days=abc`, and crash with a raw exception.
+
+The goal of all 7 steps: **catch a bad request at the door, and say exactly what is wrong** —
+instead of letting it travel deep into the code and fail somewhere confusing.
+
+### Why order mattered
+
+```
+Step 1  teach the error handler to answer these checks with a clean 400
+           │  (without this, every later step below still gives a 500)
+           ▼
+Step 2  add the checks to the biggest, riskiest forms (create/update incident, auth)
+           ▼
+Step 3  prove the checks actually stop a real crash (not just "looks right")
+           ▼
+Step 4  same checks for Ai-Service — its bugs cost real money, not just a bad reply
+           ▼
+Step 5  the same idea for values in the URL, not just the request body
+           ▼
+Step 6  a size limit for the whole request, at the one door everyone walks through
+           ▼
+Step 7  write it all down (this step)
+```
+
+Step 1 had to come first. `@Min`, `@Max` and `@Size` on a parameter do nothing useful until
+something turns their failure into a clean reply — otherwise they just change a 500 into a
+*different* 500.
+
+### The plan — 7 steps
+
+| Step | What | Status |
+|---|---|---|
+| 1 | Teach the shared error handler to answer parameter checks with 400 | ✅ Done |
+| 2 | Add length limits to the biggest request bodies (Incident, Auth) | ✅ Done |
+| 3 | Prove a missing required field really did crash something | ✅ Done |
+| 4 | Add the same checks to Ai-Service (its bugs cost real money) | ✅ Done |
+| 5 | Add limits to values in the URL (path and query) | ✅ Done |
+| 6 | Cap the whole request body size, at the gateway | ✅ Done |
+| 7 | Write it all down | ✅ Done |
+
+---
+
+### Step 1 result — ✅ done 2026-09-19
+
+**Goal:** before this step, a bad `@Min`/`@Max`/`@Size` on a URL value crashed with a raw 500.
+Spring's own check (`HandlerMethodValidationException`) was never being caught.
+
+**What we built:** one new handler in the shared `common-web` module, plus a second fix for a
+related gap — an unknown URL, a wrong HTTP method, or a wrong `Content-Type` were **also**
+landing as unhandled 500s, because they arrive as Spring's own exception types, and our catch-all
+did not recognise them.
+
+```
+Bad request arrives
+   │
+   ▼
+Is it a @Valid body failure?          → 400, existing handler (unchanged)
+Is it a bad @Min/@Max/@Size param?    → 400, NEW handler
+Is it a 4xx Spring already knows      → 400/404/405/415, NEW check in the catch-all
+   about (bad URL, wrong method...)?
+Anything else                         → 500, hidden message (unchanged, the safety rule)
+```
+
+**Proved with 6 new tests**, each hitting a real endpoint: a bad query param, a body list that
+was too long, the wrong HTTP method, the wrong content type, an unknown URL, and a 200-character
+value that should be cut down to a short preview in the error. **Before: 18 tests, 5 failing, all
+500. After: 18 of 18 pass**, and the 5 error-log lines for "this is a framework problem, not our
+bug" dropped to 0.
+
+**Files:** `common-web/handler/GlobalExceptionHandler.java`,
+`common-web/handler/GlobalExceptionHandlerTest.java` (+6 tests).
+
+---
+
+### Step 2 result — ✅ done 2026-09-19
+
+**Goal:** stop obviously-bad create/update requests from ever reaching a service or a database.
+
+**What we found first.** Reading `IncidentService`'s `SLAConfiguration` class, a missing
+`priority` on a newly created incident would later crash `ReportingService` — a completely
+different service, minutes later, with no obvious link back to the request that caused it. That
+became the reason for Step 3.
+
+**What we added:**
+
+| DTO | Rule added | Why |
+|---|---|---|
+| `CreateIncidentRequestDTO` | `@NotNull` on severity, priority, environment, serviceName, category | Each one is read by another service later (see Step 3) |
+| `CreateIncidentRequestDTO`, `UpdateIncidentMetadate_RequestDTO` | `@Size(max=255)` on affectedSource, location | Matches the database column width |
+| `SignupFormDTO`, `LoginFromDTO` | username/email/password length caps | Matches the database columns, and BCrypt (see below) |
+| `ChangePasswordDTO`, `UpdateCredentialsRequestDTO` | password caps, `@NotBlank` where it was missing | Same reasons |
+
+**One database mismatch found and fixed with a migration.** `root_cause` and
+`resolution_notes` were **`varchar(500)`** in the database, but the DTO that updates them allowed
+**2000** characters. A value over 500 would have passed our own check and then been rejected by
+MySQL — the exact confusing 500 this whole track exists to prevent. Fixed with a new migration,
+**`V2__widen_root_cause_and_resolution_notes.sql`**, widening both columns to 2000 to match the
+DTO. **You still need to run this migration yourself** — it has not touched the live database.
+
+**Why 72 for every password field.** BCrypt (the password hashing algorithm) silently reads only
+the first 72 **bytes** of any password and ignores the rest. A field with no limit could let
+someone set a 500-character password, believe all 500 characters matter, and be wrong. Capping at
+72 makes the truth match what the user believes.
+
+**Files:** `IncidentService/dto/CreateIncidentRequestDTO.java`,
+`IncidentService/dto/UpdateIncidentMetadate_RequestDTO.java`,
+`IncidentService/db/migration/V2__widen_root_cause_and_resolution_notes.sql` (new, **not yet
+run**), `AuthService/dto/SignupFormDTO.java`, `LoginFromDTO.java`, `ChangePasswordDTO.java`,
+`UpdateCredentialsRequestDTO.java`.
+
+---
+
+### Step 3 result — ✅ done 2026-09-20
+
+**Goal:** don't just assume the missing-priority crash from Step 2 is real — prove it.
+
+**What we did.** Ran the real, compiled `SLAConfiguration` class directly (with `jshell`, not a
+guess from reading the code):
+
+```
+SLAConfiguration.getResolutionSLA_INSeconds("HIGH")  →  864000   (works)
+SLAConfiguration.getResolutionSLA_INSeconds(null)     →  NullPointerException
+```
+
+Before Step 2's fix, an incident with no priority saved fine, and then silently crashed
+ReportingService's SLA calculation in the background — no report, no SLA deadline, and nobody
+told.
+
+**Then checked the update path could not bring the bug back.** `applyMetadataUpdatesToIncident`
+only sets priority when a value was actually sent:
+```java
+if (request.getPriority() != null) incident.setPriority(request.getPriority());
+```
+So an existing priority can never be cleared through an update.
+
+**No code changed in this step.** The fix was already in place from Step 2 — this step only
+proved it really works, and checked the one other door (update) that could have undone it.
+
+---
+
+### Step 4 result — ✅ done 2026-09-20
+
+**Goal:** the same idea as Step 2, but for Ai-Service — where a bad request doesn't just give a
+bad reply, it can **spend real money** on a paid Gemini API call.
+
+**Two real bugs found while adding the checks, not assumed:**
+
+| Bug | What happened |
+|---|---|
+| Missing title/description crashed | `Map.of("title", request.getTitle(), ...)` throws if any value is null — proved with `NullPointerException` in `jshell` |
+| Missing fields still got sent to Gemini | `request.getTitle() + " " + request.getDescription()` turns a null into the literal text `"null"` — so we would **pay** to search for `"null null"` |
+
+**What we added:** `title` and `description` are now required and capped (255 / 2000, matching
+the incidents table); `category`, `serviceName`, `severity` stay optional but capped at 50. Added
+`@Valid` to both `RagController` endpoints — **without it, the DTO rules never run at all.**
+
+**Checked with the real Hibernate Validator**, not just by reading the annotations: a request
+missing both fields gave 2 errors, a 5000-character description gave 1 error, and two normal
+requests (with and without the optional fields) both passed cleanly.
+
+**Left alone on purpose:** both endpoints are still `@GetMapping` with `@RequestBody`
+(known issue 7 — GET-with-a-body). Fixing that changes the HTTP method callers must use, which is
+a bigger, separate decision.
+
+**Files:** `Ai-Service/dto/IncidentSuggestionNeededDTO.java`,
+`Ai-Service/dto/EngineerRecommendationRequestDTO.java`,
+`Ai-Service/controller/RagController.java`.
+
+---
+
+### Step 5 result — ✅ done 2026-09-22
+
+**Goal:** Steps 2 and 4 checked the request **body**. This step checks values in the **URL** —
+the path (`/token-version/abc`) and the query string (`?days=7`) — which had almost no checks at
+all.
+
+```
+request comes in with a bad URL value
+   │
+   ▼
+@Min / @Max / @Size on the parameter checks it
+   │
+   ▼
+fails?  →  Step 1's handler turns it into a clean 400 with a message
+passes? →  the method runs normally
+```
+
+| # | Where | Rule | Before |
+|---|---|---|---|
+| 1 | `ReportingController` trend `days` | `@Min(1) @Max(365)` | `days=-5` silently returned nothing; `days=100000` scanned the whole table |
+| 2 | `UserController` search `query` | `@Size(max=100)` | No limit — matches the email column, so longer text could never match anyway |
+| 3 | `InternalUserController` batch of ids | `@Size(max=50)` list, `@NotNull` on each item | One call could ask for the whole users table |
+| 4 | `TokenVersionController` `userid` | `String` → `UUID` type | `/token-version/abc` crashed with a 500; now Spring rejects it with a clean 400 before our code even runs |
+| 5 | 3 services (Incident, Reporting, User) | `spring.data.web.pageable.max-page-size=100` | Default is 2000 — `?size=2000` loaded 2000 rows in one request |
+
+**Checked with throwaway tests** calling the real controllers (then deleted — they weren't meant
+to stay): normal values passed, bad values got 400, and `?size=5000` came back capped at exactly
+100. Empty search and a missing `days` both still work as before — proving the new limits don't
+break normal use is as important as proving they block bad use.
+
+**Files:** `ReportingService/controller/ReportingController.java`,
+`UserService/controller/UserController.java`, `InternalUserController.java`,
+`AuthService/controller/TokenVersionController.java`, and the `application.properties` of
+IncidentService, ReportingService, UserService.
+
+---
+
+### Step 6 result — ✅ done 2026-09-22
+
+**Goal:** stop a huge request (10MB+) before it reaches any service at all — refuse it at the
+gateway, the one door every request walks through.
+
+```
+request arrives at the gateway
+   │
+   ▼
+RequestSizeFilter runs FIRST (before the JWT check)
+   │
+   ├─ Content-Length over 256KB?     → 413, refused instantly
+   ├─ no Content-Length, "chunked"?  → 411, we can't measure it so we refuse it
+   ├─ Content-Length not a number?   → 400
+   └─ anything else (normal request) → let it through
+```
+
+**Why not Spring's own built-in size filter?** We read its code first. It only reads the
+`Content-Length` header — a request sent in pieces ("chunked") has none, and would walk straight
+past it. Its error also has an empty body, not our normal JSON shape. So we wrote a small filter
+of our own.
+
+**256KB, not something smaller or bigger.** The biggest real request (an incident with the full
+2000-character description) is about 10KB. 256KB is 25× that — comfortable room, still nowhere
+near "somebody is trying to flood us".
+
+**A small tidy-up alongside it.** The JSON-error-writing code that already existed inside
+`JwtGatewayFilter` moved into a new shared helper, `GatewayErrorWriter`, so the new filter and the
+old one share one copy instead of two slowly drifting apart.
+
+**Checked two ways.** First, 9 permanent unit tests (exactly-at-the-limit passes, one byte over
+fails, a chunked request gets 411, a normal GET passes, and so on). Second, started the real
+gateway and sent real requests: a 300KB POST got **413** with our JSON error, a 300KB POST to the
+**public** `/auth/signup` path also got 413 (the filter runs before the "skip auth for /auth/**"
+rule), and a small request correctly passed the size check and moved on to the next check (401,
+no token).
+
+**Issue 36 checked while here.** The gateway's old-style route property names
+(`spring.cloud.gateway.routes`) still work — Spring Cloud Gateway auto-translates them to the new
+names at startup (confirmed in the real startup log). Routing was never broken; only the property
+names are due a tidy-up later.
+
+**Files:** `APIGateway/filter/RequestSizeFilter.java` (new),
+`APIGateway/utils/GatewayErrorWriter.java` (new),
+`APIGateway/filter/JwtGatewayFilter.java` (now uses the shared helper),
+`APIGateway/src/test/.../RequestSizeFilterTest.java` (new, 9 tests),
+`APIGateway/application.properties` (`gateway.request.max-body-size=256KB`).
+
+---
+
+### B4 is complete — what it adds up to
+
+```
+Step 1  teach the error handler   → a bad parameter now gives a clean 400, not a 500
+Step 2  body limits (Incident,    → a DTO's rules can't be skipped, and can't disagree
+        Auth)                       with the database column they save to
+Step 3  proved the crash is real  → not "looks right" — actually run and watched crash
+Step 4  Ai-Service checks         → stopped paying Gemini to search for "null null"
+Step 5  URL value limits          → the same idea, for path and query values
+Step 6  gateway size cap          → a huge request never reaches any service at all
+```
+
+### Not done in B4 (still open)
+
+- **The IncidentService V2 migration has not been run yet.** You are running it yourself.
+- **Issue 7 (GET-with-a-body on `/ai/rag/**`) is still open.** Its requests are now validated,
+  but the HTTP method itself is unchanged.
+- **No rate limiting.** A request can still be perfectly valid and sent 10,000 times a second.
+  That is B5, not B4.
+- **The gateway's 256KB cap is the only place body size is checked.** Individual services do not
+  re-check it — they trust the gateway is the only door in (true today, because they bind to
+  `127.0.0.1`, Track B1).
+
+---
 
 **B5 — Nothing stops spamming.** Your login lockout protects one account. It does not stop someone
 trying one password across 10,000 accounts. More urgent: the AI endpoints cost real money per
@@ -1366,3 +1655,65 @@ now catches it.
 
 The old version used long sentences and hard words, and was difficult to read.
 Rule 6 was added to the agreed rules so this stays that way.
+
+---
+
+## 2026-09-19 to 2026-09-22 — B4 done (missing input checks)
+
+### `common-web` — 2 files
+
+| File | What changed |
+|---|---|
+| `handler/GlobalExceptionHandler.java` | New handler for `HandlerMethodValidationException` (bad `@Min`/`@Max`/`@Size` on a path or query value). Catch-all now also recognises Spring's own 4xx exceptions (bad URL, wrong method, wrong content type) instead of hiding them as 500 |
+| `handler/GlobalExceptionHandlerTest.java` | +6 tests. 18/18 pass, up from 13/18 |
+
+### IncidentService — 3 files
+
+| File | What changed |
+|---|---|
+| `dto/CreateIncidentRequestDTO.java` | `@NotNull` on severity, priority, environment, serviceName, category; `@Size(max=255)` on affectedSource, location |
+| `dto/UpdateIncidentMetadate_RequestDTO.java` | Same `@Size(max=255)` limits |
+| `db/migration/V2__widen_root_cause_and_resolution_notes.sql` | **New.** Widens `root_cause`/`resolution_notes` from 500 to 2000 characters, matching the DTO. **Not yet run** |
+
+### AuthService — 4 files
+
+| File | What changed |
+|---|---|
+| `dto/SignupFormDTO.java` | username/email/password length caps |
+| `dto/LoginFromDTO.java` | email/password length caps |
+| `dto/ChangePasswordDTO.java` | Both password fields capped at 72 (BCrypt reads no more anyway) |
+| `dto/UpdateCredentialsRequestDTO.java` | newEmail/newUsername/password caps; password `@NotNull` → `@NotBlank` |
+
+### Ai-Service — 3 files
+
+| File | What changed |
+|---|---|
+| `dto/IncidentSuggestionNeededDTO.java` | title/description required + capped; category/serviceName optional + capped |
+| `dto/EngineerRecommendationRequestDTO.java` | Same, plus severity capped (not read by the service) |
+| `controller/RagController.java` | `@Valid` added to both endpoints — without it, the rules above never ran |
+
+### Path/query limits — 5 files
+
+| File | What changed |
+|---|---|
+| `ReportingService/controller/ReportingController.java` | `days` gets `@Min(1) @Max(365)` |
+| `UserService/controller/UserController.java` | search `query` gets `@Size(max=100)` |
+| `UserService/controller/InternalUserController.java` | batch id list gets `@Size(max=50)`, each id gets `@NotNull` |
+| `AuthService/controller/TokenVersionController.java` | `userid` path variable: `String` → `UUID` |
+| `application.properties` × 3 (Incident, Reporting, User) | `spring.data.web.pageable.max-page-size=100` |
+
+### APIGateway — 4 files
+
+| File | What changed |
+|---|---|
+| `filter/RequestSizeFilter.java` | **New.** Refuses request bodies over 256KB, and chunked bodies with no declared size, before the JWT check runs |
+| `utils/GatewayErrorWriter.java` | **New.** The JSON-error-writing code, moved out of `JwtGatewayFilter` so both filters share one copy |
+| `filter/JwtGatewayFilter.java` | Now calls the shared helper instead of building its own JSON |
+| `application.properties` | `gateway.request.max-body-size=256KB` |
+
+**Verification, not just "it compiled":** the full 12-module build passed after every step. Step 1
+was proven with 6 new permanent tests. Step 3's crash was proven by running the real compiled
+class in `jshell`, not by reading the code. Step 4 was checked against the real Hibernate
+Validator, also via `jshell`. Step 5 was checked with throwaway MockMvc tests (removed once they
+passed — they were not meant to stay). Step 6 got 9 new permanent tests plus a real running
+gateway sent real oversized/chunked/normal requests over `curl`.

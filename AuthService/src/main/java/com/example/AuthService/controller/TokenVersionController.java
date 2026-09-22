@@ -21,11 +21,14 @@ public class TokenVersionController {
         this.userRepository = userRepository;
     }
 
+    // B4 step 5: userid is now a UUID, not a String.
+    // Before: "abc" reached UUID.fromString(...) and crashed = 500.
+    // Now: Spring checks it first and "abc" gets a clean 400.
     @GetMapping("/token-version/{userid}")
-    public Integer getTokenVersion(@PathVariable String userid) {
+    public Integer getTokenVersion(@PathVariable UUID userid) {
         System.out.println("UUID is: ");
- System.out.println(UUID.fromString(userid));
-        User user = userRepository.findById(UUID.fromString(userid))
+ System.out.println(userid);
+        User user = userRepository.findById(userid)
                 .orElseThrow(() -> new NotFoundException("USER_NOT_FOUND", "User not found: " + userid));
         return user.getTokenVersion();
     }

@@ -23,8 +23,14 @@ public class UpdateIncidentMetadate_RequestDTO {
     private String title;
     private Severity severity;
     private Priority priority;
+
+    // Added B4 step 2. These two had no limit, even though the comment above
+    // already claimed the limits mirror the entity columns. Both columns are
+    // varchar(255), same as title.
+    @Size(max = 255, message = "Affected source must be at most 255 characters")
     private String affectedSource;
     private Environment environment;
+    @Size(max = 255, message = "Location must be at most 255 characters")
     private String location;
 
 }

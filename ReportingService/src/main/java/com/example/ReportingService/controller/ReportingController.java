@@ -4,6 +4,8 @@ import com.example.ReportingService.dto.*;
 import com.example.ReportingService.service.EngineerPerformanceService;
 import com.example.ReportingService.service.EngineerWorkloadService;
 import com.example.ReportingService.service.ReportingService;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import lombok.Builder;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
@@ -64,8 +66,12 @@ public class ReportingController {
     // Incidents Happened on last x days for getting the trend of INCIDENT
     // this is useful like Management wants to see Are incidents increasing or decreasing.
     // we can see in graphically form are the incidents increasing or decreasing on daily basis.. eg: graph of last 7 days.
+    // B4 step 5: days must be 1 to 365.
+    // Before: days=-5 looked into the future (empty answer), and a huge number scanned the whole table.
 @GetMapping("/trends")
-    public ResponseEntity<List<IncidentsHappeningTrendDTO>>IncidentsHappenedTrend(@RequestParam(defaultValue ="7")int days){
+    public ResponseEntity<List<IncidentsHappeningTrendDTO>>IncidentsHappenedTrend(
+            @RequestParam(defaultValue ="7") @Min(value = 1, message = "days must be at least 1")
+            @Max(value = 365, message = "days must be at most 365") int days){
     List<IncidentsHappeningTrendDTO>trends= reportingService.getIncidentsHappenedTrends(days);
 return ResponseEntity.ok(trends);
     }

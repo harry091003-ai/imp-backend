@@ -7,19 +7,26 @@ import com.project.web.exception.UnauthorizedException;
 import com.project.web.exception.ValidationException;
 import com.project.web.filter.TraceIdFilter;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpMethod;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.util.List;
 import java.util.UUID;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -169,6 +176,71 @@ class GlobalExceptionHandlerTest {
     }
 
     // -----------------------------------------------------------------------------
+    // B4 step 1: bad input must get a 4xx, never a 500.
+    // Before this step these all fell into the catch-all and came back as 500,
+    // logged as ERROR with a stack trace, as if the bug were ours.
+    // -----------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("@Min on a query param fails -> 400 with the param name")
+    void queryParamValidationMapsTo400() throws Exception {
+        mockMvc.perform(get("/dummy/trend").param("days", "99999"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.fieldErrors[0].field").value("days"))
+                .andExpect(jsonPath("$.fieldErrors[0].message").value("days must be at most 90"));
+    }
+
+    @Test
+    @DisplayName("@Size on a request-body list fails -> 400")
+    void bodyListTooLongMapsTo400() throws Exception {
+        mockMvc.perform(post("/dummy/batch")
+                        .contentType("application/json")
+                        .content("[\"a\",\"b\",\"c\"]"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_FAILED"));
+    }
+
+    @Test
+    @DisplayName("wrong HTTP method -> 405")
+    void wrongMethodMapsTo405() throws Exception {
+        mockMvc.perform(post("/dummy/not-found"))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(jsonPath("$.error").value("METHOD_NOT_ALLOWED"));
+    }
+
+    @Test
+    @DisplayName("wrong Content-Type -> 415")
+    void wrongContentTypeMapsTo415() throws Exception {
+        mockMvc.perform(post("/dummy/validate")
+                        .contentType("text/plain")
+                        .content("hello"))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(jsonPath("$.error").value("UNSUPPORTED_MEDIA_TYPE"));
+    }
+
+    @Test
+    @DisplayName("unknown URL (what a real service throws) -> 404 in our JSON shape")
+    void unknownUrlMapsTo404() throws Exception {
+        mockMvc.perform(get("/dummy/no-such-page"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("NOT_FOUND"))
+                .andExpect(jsonPath("$.traceId").exists());
+    }
+
+    @Test
+    @DisplayName("a huge rejected value is cut to 200 chars, never echoed in full")
+    void hugeRejectedValueIsTruncated() throws Exception {
+        String huge = "x".repeat(5000);
+        mockMvc.perform(post("/dummy/validate")
+                        .contentType("application/json")
+                        .content("{\"title\":\"ok\",\"note\":\"" + huge + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.fieldErrors[0].field").value("note"))
+                .andExpect(jsonPath("$.fieldErrors[0].rejectedValue").value("x".repeat(200) + "..."));
+    }
+
+    // -----------------------------------------------------------------------------
     // traceId plumbing
     // -----------------------------------------------------------------------------
 
@@ -237,11 +309,41 @@ class GlobalExceptionHandlerTest {
         void validate(@Valid @RequestBody DummyRequest request) {
             // never reached in the test - validation fails first
         }
+
+        @GetMapping("/trend")
+        void trend(@RequestParam("days") @Min(value = 1, message = "days must be at least 1")
+                   @Max(value = 90, message = "days must be at most 90") int days) {
+            // never reached in the test - validation fails first
+        }
+
+        @PostMapping("/batch")
+        void batch(@RequestBody @Size(max = 2, message = "at most 2 ids per call") List<String> ids) {
+            // never reached in the test - validation fails first
+        }
+
+        // A real Spring Boot service answers an unknown URL by throwing this
+        // (from its static-resource handler). This dummy MockMvc has no such
+        // handler, so we throw it ourselves to test the same path.
+        @GetMapping("/no-such-page")
+        void noSuchPage() throws NoResourceFoundException {
+            throw new NoResourceFoundException(HttpMethod.GET, "dummy/no-such-page");
+        }
     }
 
     static class DummyRequest {
         @NotBlank(message = "Title is required")
         private String title;
+
+        @Size(max = 10, message = "Note is too long")
+        private String note;
+
+        public String getNote() {
+            return note;
+        }
+
+        public void setNote(String note) {
+            this.note = note;
+        }
 
         public String getTitle() {
             return title;

@@ -3,6 +3,8 @@ package com.example.UserService.controller;
 import com.example.UserService.dto.*;
 import com.example.UserService.entity.RoleName;
 import com.example.UserService.service.UserService;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.ResponseEntity;
@@ -47,8 +49,12 @@ public class InternalUserController {
         return ResponseEntity.ok(userCredentialDTO);
     }
 //instead of get we are using post because we are sending list of userids in the request body and get request does not support request body.
+    // B4 step 5: at most 50 ids, and no null ids.
+    // The only caller (NotificationService) sends 1 to 3. Without a cap, one request
+    // could ask for every user in the table in one go.
     @PostMapping("/UserSpecificDetails/batch")
-    public ResponseEntity<List<UserCredentialDTO>>getBatchOfUsers_SpecificDetails(@RequestBody List<UUID> userIds){
+    public ResponseEntity<List<UserCredentialDTO>>getBatchOfUsers_SpecificDetails(
+            @RequestBody @Size(max = 50, message = "At most 50 user ids per request") List<@NotNull UUID> userIds){
 
         List<UserCredentialDTO> userCredentialDTOList=service.GetBatchOfUsers_Credentials(userIds);
         return ResponseEntity.ok(userCredentialDTOList);

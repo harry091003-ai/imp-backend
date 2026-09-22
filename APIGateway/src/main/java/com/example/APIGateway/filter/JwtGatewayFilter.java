@@ -2,25 +2,20 @@ package com.example.APIGateway.filter;
 import com.example.APIGateway.services.AuthUserNotFoundException;
 import com.example.APIGateway.services.TokenVersionService;
 import com.example.APIGateway.utils.FailureDescription;
+import com.example.APIGateway.utils.GatewayErrorWriter;
 import com.example.APIGateway.utils.JwtUtil;
 import jakarta.validation.constraints.Email;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
-import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.http.MediaType;
-import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.List;
-import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -63,7 +58,7 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
     // Must match TraceIdFilter.TRACE_ID_HEADER in common-web. The gateway cannot share that
     // class: common-web is Spring MVC (servlet) and this app is WebFlux (reactive), so the
     // constant is duplicated on purpose rather than dragging the servlet stack in here.
-    private static final String TRACE_ID_HEADER = "X-Trace-Id";
+    private static final String TRACE_ID_HEADER = GatewayErrorWriter.TRACE_ID_HEADER;
 
     public JwtGatewayFilter(JwtUtil jwtUtil,
                             TokenVersionService tokenVersionService,
@@ -279,53 +274,15 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
         return builder;
     }
 
+    // B4 step 6: the JSON writing moved to GatewayErrorWriter, so RequestSizeFilter can share it.
     private Mono<Void> onError(ServerWebExchange exchange, String errorCode, String message, HttpStatus status) {
-
         String traceId = resolveTraceId(exchange);
-        String path = exchange.getRequest().getURI().getPath();
-
         logger.severe("[" + traceId + "] 🚫 Request rejected: " + errorCode + " (Status: " + status + ")");
-
-        ServerHttpResponse response = exchange.getResponse();
-        response.setStatusCode(status);
-        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-        response.getHeaders().set(TRACE_ID_HEADER, traceId);
-
-        String body = "{"
-                + "\"timestamp\":\"" + Instant.now() + "\","
-                + "\"status\":" + status.value() + ","
-                + "\"error\":\"" + jsonEscape(errorCode) + "\","
-                + "\"message\":\"" + jsonEscape(message) + "\","
-                + "\"path\":\"" + jsonEscape(path) + "\","
-                + "\"traceId\":\"" + jsonEscape(traceId) + "\""
-                + "}";
-
-        DataBuffer buffer = response.bufferFactory().wrap(body.getBytes(StandardCharsets.UTF_8));
-        return response.writeWith(Mono.just(buffer));
+        return GatewayErrorWriter.write(exchange, status, errorCode, message);
     }
 
-    /** Reuse an inbound trace id if the caller sent one, otherwise mint a short new one. */
     private String resolveTraceId(ServerWebExchange exchange) {
-        String inbound = exchange.getRequest().getHeaders().getFirst(TRACE_ID_HEADER);
-        if (inbound != null && !inbound.isBlank()) {
-            return inbound;
-        }
-        String existing = exchange.getResponse().getHeaders().getFirst(TRACE_ID_HEADER);
-        if (existing != null && !existing.isBlank()) {
-            return existing;
-        }
-        return UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-    }
-
-    /** Minimal JSON string escaping - the values here are our own codes, paths and messages. */
-    private String jsonEscape(String value) {
-        if (value == null) {
-            return "";
-        }
-        return value.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", " ")
-                .replace("\r", " ");
+        return GatewayErrorWriter.resolveTraceId(exchange);
     }
 
     //Lower number = higher priority...means run this filter early

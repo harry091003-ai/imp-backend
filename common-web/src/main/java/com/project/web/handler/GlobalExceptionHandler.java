@@ -12,18 +12,23 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
 import org.springframework.validation.FieldError;
+import org.springframework.validation.method.ParameterErrors;
+import org.springframework.validation.method.ParameterValidationResult;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -120,6 +125,38 @@ public class GlobalExceptionHandler {
 
         log.warn("[{}] {} {} -> 400 VALIDATION_FAILED: {}", traceId(request),
                 request.getMethod(), request.getRequestURI(), ex.getMessage());
+
+        return build(HttpStatus.BAD_REQUEST, "VALIDATION_FAILED",
+                "One or more parameters are invalid.", request, fieldErrors);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // 3b. A rule like @Min or @Max failed on a param, not a request body (B4 step 1).
+    //     Before this handler, it fell into the catch-all below and came back as a 500.
+    // ---------------------------------------------------------------------------------
+    @ExceptionHandler(HandlerMethodValidationException.class)
+    public ResponseEntity<ErrorResponse> handleMethodValidation(HandlerMethodValidationException ex,
+                                                                HttpServletRequest request) {
+
+        List<ErrorResponse.FieldValidationError> fieldErrors = new ArrayList<>();
+        for (ParameterValidationResult result : ex.getParameterValidationResults()) {
+            if (result instanceof ParameterErrors beanErrors) {
+                // param is an object with several fields - report each one
+                beanErrors.getFieldErrors().forEach(fe -> fieldErrors.add(toFieldError(fe)));
+            } else {
+                // param is a single value, like days=99999
+                String name = parameterName(result);
+                result.getResolvableErrors().forEach(error -> fieldErrors.add(
+                        ErrorResponse.FieldValidationError.builder()
+                                .field(name)
+                                .message(error.getDefaultMessage())
+                                .rejectedValue(safeRejectedValue(name, result.getArgument()))
+                                .build()));
+            }
+        }
+
+        log.warn("[{}] {} {} -> 400 VALIDATION_FAILED: {} parameter(s) rejected", traceId(request),
+                request.getMethod(), request.getRequestURI(), fieldErrors.size());
 
         return build(HttpStatus.BAD_REQUEST, "VALIDATION_FAILED",
                 "One or more parameters are invalid.", request, fieldErrors);
@@ -226,6 +263,14 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex, HttpServletRequest request) {
 
+        // B4 step 1: some Spring errors already know their real status - wrong method
+        // (405), wrong Content-Type (415), unknown URL (404). If Spring says it's a 4xx
+        // (the caller's mistake), use that instead of falling through to 500 below.
+        if (ex instanceof org.springframework.web.ErrorResponse springError
+                && springError.getStatusCode().is4xxClientError()) {
+            return handleClientError(springError.getStatusCode(), request);
+        }
+
         log.error("[{}] {} {} -> 500 INTERNAL_ERROR (unhandled {})", traceId(request),
                 request.getMethod(), request.getRequestURI(), ex.getClass().getName(), ex);
 
@@ -277,6 +322,34 @@ public class GlobalExceptionHandler {
                 .message(violation.getMessage())
                 .rejectedValue(safeRejectedValue(path, violation.getInvalidValue()))
                 .build();
+    }
+
+    /** Builds the reply for a 4xx Spring already caught. One WARN line, our own wording. */
+    private ResponseEntity<ErrorResponse> handleClientError(HttpStatusCode code,
+                                                            HttpServletRequest request) {
+        HttpStatus status = HttpStatus.resolve(code.value());
+        if (status == null) {
+            status = HttpStatus.BAD_REQUEST;
+        }
+
+        String message = switch (status) {
+            case NOT_FOUND -> "No endpoint exists at this path.";
+            case METHOD_NOT_ALLOWED -> "This HTTP method is not allowed on this path.";
+            case UNSUPPORTED_MEDIA_TYPE -> "This Content-Type is not supported. Send application/json.";
+            case NOT_ACCEPTABLE -> "This response format is not available. Accept application/json.";
+            default -> "The request could not be processed.";
+        };
+
+        log.warn("[{}] {} {} -> {} {}", traceId(request), request.getMethod(),
+                request.getRequestURI(), status.value(), status.name());
+
+        return build(status, status.name(), message, request, null);
+    }
+
+    /** The parameter's name, like "days". If Java did not keep the name, use its position. */
+    private String parameterName(ParameterValidationResult result) {
+        String name = result.getMethodParameter().getParameterName();
+        return name != null ? name : "parameter " + result.getMethodParameter().getParameterIndex();
     }
 
     /**
