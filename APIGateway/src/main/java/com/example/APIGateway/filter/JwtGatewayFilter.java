@@ -1,5 +1,6 @@
 package com.example.APIGateway.filter;
 import com.example.APIGateway.services.AuthUserNotFoundException;
+import com.example.APIGateway.services.TokenVersionResult;
 import com.example.APIGateway.services.TokenVersionService;
 import com.example.APIGateway.utils.FailureDescription;
 import com.example.APIGateway.utils.GatewayErrorWriter;
@@ -163,14 +164,33 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
 
             System.out.println("JwtGatewayFilter executed");
             // ✅ 5. Get latest version from AuthService
+            //
+            // FIXED 2026-09-25: catch errors from the LOOKUP only.
+            // Before, .onErrorResume(...) was attached AFTER chain.filter(...). So it also caught
+            // every error from further down (routing, the service being down) and called all of
+            // them "AUTH_SERVICE_UNAVAILABLE". A down IncidentService was blamed on AuthService.
+            //
+            // materialize() turns the lookup's answer - a value OR an error - into a normal
+            // value (a "Signal") that we can look at. So:
+            //   the lookup's own errors  -> handled here, in lookupFailed(...)
+            //   errors from chain.filter -> NOT caught here; they go up to
+            //                               GatewayExceptionHandler, which reports them honestly
             return tokenVersionService.getTokenVersion(Userid)
-                    .flatMap(result -> {
+                    .materialize()
+                    .flatMap(signal -> {
 
-                        // result can now mean "we don't know" (AuthService down and
-                        // nothing cached). Must check canCheckRevocation() FIRST - if we
-                        // compared tokenVersion.equals(null) directly, that quietly
-                        // returns false, and every user would get logged out for as long
-                        // as AuthService stays down.
+                        if (signal.isOnError()) {
+                            return lookupFailed(exchange, traceId, signal.getThrowable());
+                        }
+                        TokenVersionResult result = signal.get();
+                        if (result == null) {
+                            // The lookup finished with no answer at all. Should never happen.
+                            return lookupFailed(exchange, traceId,
+                                    new IllegalStateException("Token-version lookup returned no answer"));
+                        }
+
+                        // means jab tokenversion jo authservice se lekar ana tha: but auth service is down
+                        //then tier 1 and 2  bahi nahi valid hoye so tier 3 run keya jisse token version ki value null hai but still ham usko allow kar rahe hai  for availbality with safety
                         if (!result.canCheckRevocation()) {
                             // Already logged at SEVERE inside TokenVersionService, with the
                             // reason and a running count. Not logged twice here.
@@ -205,37 +225,6 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
                                                         .header(TRACE_ID_HEADER, traceId)
                                         )
                                         .build());
-                    })
-                    //onErrorResume handles asynchronous (reactive) errors!
-                    //this onErrorResume is to handle as if tokenVersionService fails
-                    .onErrorResume(e -> {
-
-                        // 404 from AuthService = this user no longer exists. That is a
-                        // real answer, not an outage - so it's a 401 (log in again),
-                        // not a 503 (retry later, which would never help).
-                        if (e instanceof AuthUserNotFoundException) {
-                            logger.severe("[" + traceId + "] Token belongs to a user that no"
-                                    + " longer exists - rejecting");
-                            return onError(exchange, "TOKEN_REVOKED",
-                                    "This token is no longer valid. Please log in again.",
-                                    HttpStatus.UNAUTHORIZED);
-                        }
-
-                        // Anything else here is genuinely unexpected - AuthService being
-                        // slow or down no longer reaches this point at all; the fallback
-                        // tiers in TokenVersionService already handle that.
-                        //
-                        // FailureDescription.of(e) instead of e.getMessage(): a timeout
-                        // exception carries NO message on purpose (a Netty design
-                        // choice), so getMessage() used to just print "null". This
-                        // prints the real cause chain and which setting to check.
-                        logger.log(Level.SEVERE,
-                                "❌ Auth service call failed: " + FailureDescription.of(e), e);
-                        // 503, not 401 - AuthService being unreachable is our problem,
-                        // not a sign the caller's token is bad.
-                        return onError(exchange, "AUTH_SERVICE_UNAVAILABLE",
-                                "Unable to verify the session right now. Please try again.",
-                                HttpStatus.SERVICE_UNAVAILABLE);
                     });
         }
         // this catch block is to handle any unexcepted error
@@ -272,6 +261,29 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
             builder.headers(headers -> headers.remove(header));
         }
         return builder;
+    }
+
+    // What to answer when the token-version LOOKUP itself fails.
+    // (Moved here from the old .onErrorResume, unchanged. Now it only ever sees lookup errors.)
+    private Mono<Void> lookupFailed(ServerWebExchange exchange, String traceId, Throwable e) {
+
+        // 404 from AuthService = this user no longer exists. That is a
+        // real answer, not an outage - so it's a 401 (log in again),
+        // not a 503 (retry later, which would never help).
+        if (e instanceof AuthUserNotFoundException) {
+            logger.severe("[" + traceId + "] Token belongs to a user that no"
+                    + " longer exists - rejecting");
+            return onError(exchange, "TOKEN_REVOKED",
+                    "This token is no longer valid. Please log in again.",
+                    HttpStatus.UNAUTHORIZED);
+        }
+        logger.log(Level.SEVERE,
+                "❌ Auth service call failed: " + FailureDescription.of(e), e);
+        // 503, not 401 - AuthService being unreachable is our problem,
+        // not a sign the caller's token is bad.
+        return onError(exchange, "AUTH_SERVICE_UNAVAILABLE",
+                "Unable to verify the session right now. Please try again.",
+                HttpStatus.SERVICE_UNAVAILABLE);
     }
 
     // B4 step 6: the JSON writing moved to GatewayErrorWriter, so RequestSizeFilter can share it.

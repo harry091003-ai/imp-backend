@@ -29,7 +29,7 @@ Last updated: 2026-09-22
 | B2 | Kafka dead letter topics | ✅ Done — 2026-09-08 |
 | B3 | Timeouts, resilience, the gateway hot path | ✅ Done — all 5 steps, 2026-09-16 |
 | B4 | Input checks | ✅ Done — all 7 steps, 2026-09-22 |
-| B5 | Rate limiting | ⬜ Planned, not started |
+| B5 | Rate limiting | ✅ Done — all 4 steps + 1 bug found and fixed, 2026-09-28 |
 | Track C | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
 
@@ -430,7 +430,7 @@ We agreed this list on 2026-09-01. There are 5 items. B1 is by far the most impo
 | B2 | Kafka messages can get stuck forever | ✅ Done |
 | B3 | One slow service can freeze everything | ✅ Done |
 | B4 | Missing input checks | ✅ Done |
-| B5 | Nothing stops someone spamming the app | ⬜ Not started |
+| B5 | Nothing stops someone spamming the app | ✅ Done |
 
 ---
 
@@ -1477,10 +1477,224 @@ Step 6  gateway size cap          → a huge request never reaches any service a
 
 ---
 
-**B5 — Nothing stops spamming.** Your login lockout protects one account. It does not stop someone
-trying one password across 10,000 accounts. More urgent: the AI endpoints cost real money per
-call. A loop, or a buggy frontend retry, could run up a large bill overnight. A rate limit on
-`/ai/**` is about an hour of work.
+## B5 — Nothing stops spamming ✅ Done 2026-09-28
+
+### What was wrong
+
+Two different problems, both about "how often", neither about "is the request valid" (that was
+B4):
+
+1. **Money.** `/ai/rag/suggestion` calls a **paid** Gemini API on every request. Nothing stopped
+   one user calling it 1000 times a minute.
+2. **Credential stuffing.** The account lockout counts wrong passwords **per account**. An
+   attacker guessing one password against 10,000 different accounts never fails 5 times on any
+   single one, so the lock never trips.
+
+### The plan — 4 steps
+
+| Step | What | Status |
+|---|---|---|
+| 1 | Limit on `/ai/**`, per logged-in user | ✅ Done |
+| 2 | Limit on login and signup, per IP address | ✅ Done |
+| 3 | A generous default limit on everything else, per user | ✅ Done |
+| 4 | Write it all down (PROGRESS.md, CLAUDE.md, LLD) | ✅ Done (this section) |
+
+### How a token bucket works (the idea behind every step)
+
+```
+Each caller gets a bucket holding a few coins.
+Every request takes 1 coin. No coins left -> refused (429).
+Coins refill slowly over time (not all at once) - so a person gets a
+small burst, then a steady trickle. A loop runs dry in seconds.
+```
+
+Every bucket actually carries **two** limits stacked together — a short window that stops a fast
+burst, and a long window that stops a slow, patient drain that stays inside the short one:
+
+| Rule | Short window | Long window |
+|---|---|---|
+| `/ai/**`, per user | 5 per minute | 100 per day |
+| login, per IP | 10 per minute | 100 per hour |
+| signup, per IP | 5 per hour | 20 per day |
+| everything else, per user | 20 per second | 300 per minute |
+
+Over the limit → **429**, our normal JSON error, plus a standard `Retry-After` header telling the
+caller how long to wait.
+
+---
+
+### Step 1 result — ✅ done 2026-09-23
+
+Rate limit on `/ai/**`, counted per logged-in user (the verified `X-User-Id` the gateway itself
+writes — not something a caller can fake).
+
+New reusable class, `KeyedRateLimiter`, keeps one Bucket4j "bucket" per caller, held in a
+Caffeine cache (same library as the B3 token cache) so memory stays bounded. A new gateway
+filter, `RateLimitFilter`, runs right after the JWT check (it needs the user id that check
+writes) and refuses over-the-limit requests with 429 before they ever reach Ai-Service.
+
+**Checked with 9 permanent tests** (a fake clock, so "wait 12 seconds" runs instantly) and then
+with the real gateway: 5 requests passed, the 6th and 7th got 429 with `Retry-After: 10`, a
+second user was unaffected, and after really waiting 13 seconds exactly one more request fit.
+
+### Step 2 result — ✅ done 2026-09-23
+
+Same idea, for `/auth/login` and `/auth/signup` — but counted by **IP address**, because there is
+no token yet at login to get a user id from.
+
+**Why IP catches something account lockout can't:** lockout counts failures per account; an IP
+limit counts requests per caller regardless of which account each one targets. Different attack,
+different net.
+
+**Three tricks were checked and blocked, each with a test:**
+- Faking the `X-Forwarded-For` header does nothing — we use the real connection address, which a
+  caller cannot lie about, not a header they can type anything into.
+- A trailing slash (`/auth/login/`) is treated as the same path as `/auth/login` — not a second,
+  fresh bucket.
+- A made-up `X-User-Id` on a login request is ignored — login/signup are always keyed by IP only.
+
+**Worth remembering:** one IP is not always one person. Office networks share one public address
+(NAT), so the limits are set generously enough that normal shared-office traffic should never
+notice them — they exist to catch a *script*, not a handful of humans. Also written down for
+later: if a load balancer is ever added in front of the gateway, every caller would appear to
+share its one address, and `X-Forwarded-For` would then need to be trusted — but **only** from
+that one known, fixed source, never from the public internet in general.
+
+**Checked with 10 more permanent tests plus the real gateway:** 6 signups from one IP (6th
+blocked), 11 logins **each for a different account** from one IP (11th blocked — the actual
+credential-stuffing attack, stopped), a faked forwarded-for header still blocked, a trailing-slash
+login still blocked, and per-rule counts correct on `/actuator/metrics/gateway.ratelimit.rejected`.
+
+### Step 3 result — ✅ done 2026-09-24
+
+**Goal:** steps 1 and 2 protected the money endpoint and the password endpoints. Every *other*
+endpoint (incidents, users, reports) still had no limit — a runaway script could hammer the
+database and there was nothing to stop it.
+
+**What it is:** one more rule, `default`, that covers **every** path and is counted per user, with
+a limit generous enough that a real person should never notice it: 20 requests a second, 300 a
+minute. It exists only to catch a script, not to police normal use.
+
+**Two design choices worth remembering:**
+- **It must be the LAST rule checked.** The filter uses the *first* rule that matches a path. If
+  `default` were checked first, it would swallow every request before the tighter `ai`/`login`/
+  `signup` rules ever got a turn.
+- **One default bucket covers every service.** Using 10 requests on `/incidents` and then 10 on
+  `/users` shares the *same* 20-a-second allowance — hopping between services buys nothing extra.
+
+**Checked with 5 more permanent tests, then the real gateway with genuinely parallel requests**
+(30 requests fired at the exact same instant): about 21 passed and 9 got 429 — close to the 20
+limit, with a small, expected spread from real network timing. A second user, a request to
+`/ai/...`, and `/actuator/health` were all unaffected — proving the default bucket doesn't leak
+into the other rules, and `/actuator` isn't rate-limited at all (gateway filters only run on
+*routed* requests).
+
+**Files:** `APIGateway/filter/RateLimitFilter.java` (now holds 4 rules, not 3),
+`APIGateway/src/test/.../RateLimitFilterTest.java` (24 tests total),
+`APIGateway/application.properties` (2 more settings).
+
+---
+
+### A real bug found while testing step 3 — ✅ fixed 2026-09-25
+
+**Not caused by rate limiting.** It was already there; step 3's parallel-request test just
+happened to be the first time a service was down *while* a valid token was used, which is exactly
+the situation that exposed it.
+
+**What was wrong, in one picture:**
+
+```
+JwtGatewayFilter does 2 jobs, one after another:
+  A) ask AuthService "is this token still valid?"
+  B) forward the request to the real service (Incident, User, ...)
+
+The "if anything fails" catch was wrapped around BOTH jobs, not just A.
+So when B failed (the service was down), it was reported as if A had
+failed: 503 "AUTH_SERVICE_UNAVAILABLE - Unable to verify the session".
+```
+
+**Real proof:** with IncidentService not running, a perfectly valid token got back
+*"Unable to verify the session, please try again"* — telling the user their **login** was the
+problem, when the real issue was that **IncidentService** was down. The log agreed with the wrong
+story: `Auth service call failed`, 35 times in one test run.
+
+**Why this matters:** the status code and message decide what a frontend *does*. 401-shaped
+answers mean "send the user to log in again". A perfectly good login being told to re-authenticate
+because an unrelated service crashed is exactly the kind of bug nobody would think to blame on the
+gateway.
+
+**The fix, in one sentence:** catch job A's errors only around job A, and give job B's errors —
+routing failures, a service being down — an honest home of their own.
+
+```
+Job A's errors  → still exactly the same as before: deleted user → 401,
+                   unexpected lookup failure → 503 (unchanged behaviour)
+Job B's errors  → NEW: GatewayExceptionHandler, the gateway's own
+                   last-resort handler, gives an HONEST status:
+                     service not registered / down → 503
+                     service too slow               → 504
+                     no route matches this path      → 404
+                     our own unexpected bug           → 500 (message hidden)
+```
+
+**How it was proven, test-first.** A test was written that captures the bug and confirmed it
+**failed** against the old code, then the fix was made and the same test **passed** — not "looks
+right", an actual before/after. 13 new tests total (6 for the filter's own error handling, 7 for
+the new handler), all 46 gateway tests green, then the exact real-world situation was reproduced
+on the running gateway: the log now correctly names `IncidentService`, not AuthService, and the
+count of wrongly-blamed lines dropped from 35 to **0**.
+
+**Files:** `APIGateway/filter/JwtGatewayFilter.java` (catches only the token-version lookup's own
+errors now, using `.materialize()`), `APIGateway/handler/GatewayExceptionHandler.java` (new — the
+gateway's equivalent of `common-web`'s `GlobalExceptionHandler`, since WebFlux cannot use that
+module), `APIGateway/src/test/.../JwtGatewayFilterTest.java` (new, 6 tests),
+`APIGateway/src/test/.../GatewayExceptionHandlerTest.java` (new, 7 tests).
+
+Full explanation, with a 3-step picture of what each part of the filter is actually for:
+`notes/jwt-gateway-error-handling.md`.
+
+---
+
+## B5 is complete — what it adds up to
+
+```
+Step 1  /ai/** limited, per user        → the paid API can't be looped into a large bill
+Step 2  login + signup limited, per IP  → credential stuffing is caught, not just single-account guessing
+Step 3  everything else limited         → a runaway script can't load the database for everyone
+Bug fix service failures told honestly  → a down service is no longer blamed on AuthService
+```
+
+### Not done in B5 (still open)
+
+- **Counts live in memory only.** A gateway restart resets every caller back to a full bucket.
+  With two gateways running, each counts separately. Same trade-off already accepted for the B3
+  token cache — Redis is only worth it once there is more than one gateway instance.
+- **An attacker spread across many IP addresses (a botnet) is not stopped.** Each IP just gets its
+  own fresh bucket. That needs protection in front of the whole system (a firewall service), out
+  of scope here.
+- **`X-Forwarded-For` is ignored everywhere, on purpose.** If a load balancer is ever put in front
+  of the gateway, every caller would appear to share the load balancer's one address. The fix at
+  that point is to trust the header **only** from that one known, fixed source — never from the
+  public internet in general.
+- **504 GATEWAY_TIMEOUT is wired up but never actually fires today.** Only the gateway's own call
+  to AuthService has a response timeout configured. Nothing limits how long a *routed* call to
+  Incident, User or Reporting is allowed to take, so a slow (not down) service just makes the
+  caller wait, rather than getting a clean 504. Adding route-level timeouts is a possible future
+  item.
+- **The default limit's numbers (20/sec, 300/min) are a starting point, not measured.** Watch
+  `/actuator/metrics/gateway.ratelimit.rejected?tag=rule:default` once this runs for real — if it
+  climbs during ordinary use, the numbers are too tight.
+
+### Files changed in B5, all together
+
+**APIGateway (9 files):** `services/KeyedRateLimiter.java` (new), `filter/RateLimitFilter.java`
+(new), `handler/GatewayExceptionHandler.java` (new), `filter/JwtGatewayFilter.java` (error
+handling narrowed to the token-version lookup only), `application.properties` (8 rate-limit
+settings), `pom.xml` (+Bucket4j), `src/test/.../RateLimitFilterTest.java` (new, 24 tests),
+`src/test/.../JwtGatewayFilterTest.java` (new, 6 tests),
+`src/test/.../GatewayExceptionHandlerTest.java` (new, 7 tests).
+
+**Notes (2 new):** `rate-limiting-on-ai-endpoints.md`, `jwt-gateway-error-handling.md`.
 
 ---
 
@@ -1717,3 +1931,81 @@ class in `jshell`, not by reading the code. Step 4 was checked against the real 
 Validator, also via `jshell`. Step 5 was checked with throwaway MockMvc tests (removed once they
 passed — they were not meant to stay). Step 6 got 9 new permanent tests plus a real running
 gateway sent real oversized/chunked/normal requests over `curl`.
+
+---
+
+## 2026-09-23 — B5 steps 1-2 (rate limiting on /ai/**, login, signup)
+
+### APIGateway — 5 files
+
+| File | What changed |
+|---|---|
+| `services/KeyedRateLimiter.java` | **New.** Reusable "one token bucket per key" helper — Bucket4j does the token-bucket maths, Caffeine holds one bucket per caller (bounded, same idea as the B3 token cache) |
+| `filter/RateLimitFilter.java` | **New.** Runs right after `JwtGatewayFilter`. Holds a small list of `Rule`s (`ai` by user id, `login`/`signup` by IP), each with its own limiter and counter. Over the limit → 429 + `Retry-After`, via the shared `GatewayErrorWriter` from B4 |
+| `application.properties` | 6 new settings: `gateway.ratelimit.ai.{per-minute,per-day}`, `.login.{per-minute,per-hour}`, `.signup.{per-hour,per-day}`, `.max-tracked-keys` |
+| `pom.xml` | Added Bucket4j (`bucket4j_jdk17-core`) — not managed by any Spring BOM, version pinned by hand |
+| `src/test/.../RateLimitFilterTest.java` | **New.** 19 tests (fake clock, no real waiting): both steps' limits, separate buckets per rule, the 3 login/signup tricks (faked `X-Forwarded-For`, trailing slash, faked `X-User-Id`) all confirmed blocked, per-rule metrics |
+
+**Verification:** 19/19 tests pass. Full 12-module build passes. Real gateway started on a spare
+port with throwaway secrets: hand-signed test JWTs proved the `/ai/**` limit (5 pass, then 429,
+`Retry-After: 10`, a second user unaffected, one coin back after really waiting 13s); real `curl`
+POSTs proved the login/signup limits (6 signups → 6th blocked; 11 logins **each for a different
+account** → 11th blocked, the actual credential-stuffing attack; faked header and trailing slash
+both still blocked); `/actuator/metrics/gateway.ratelimit.rejected` showed the right count per
+rule.
+
+**New note:** `notes/rate-limiting-on-ai-endpoints.md` — the token-bucket idea explained with
+coins, why IP limiting catches credential stuffing when account lockout can't, why one office can
+share one public IP (NAT), and why a future load balancer would need special handling.
+
+**Not done yet:** step 3 (a default limit on everything else) and step 4 (updating CLAUDE.md and
+the LLD files) are still open — see the B5 section above.
+
+---
+
+## 2026-09-24 to 2026-09-28 — B5 finished (steps 3-4, plus a bug found and fixed)
+
+### APIGateway — 4 more files
+
+| File | What changed |
+|---|---|
+| `filter/RateLimitFilter.java` | Added the 4th rule, `default` — covers every remaining path, per user, 20/sec + 300/min. Must stay LAST in the rule list, or it would swallow requests before the tighter rules ever ran |
+| `application.properties` | 2 more settings: `gateway.ratelimit.default.{per-second,per-minute}` |
+| `src/test/.../RateLimitFilterTest.java` | +5 tests for the default rule (24 total). 2 old tests that said "this path is not limited" were rewritten — that stopped being true once `default` covers everything |
+
+**Verification:** 24/24 tests pass. Real gateway sent 30 requests at the exact same instant —
+about 21 passed, 9 got 429, close to the 20-a-second limit. `/actuator/health` and a second user
+were both confirmed unaffected.
+
+### A bug found while testing step 3, fixed as its own change — 3 new files, 1 changed
+
+| File | What changed |
+|---|---|
+| `filter/JwtGatewayFilter.java` | The "if anything fails" catch used to wrap BOTH the AuthService check and the act of forwarding the request. So a routing failure (a service down) was wrongly reported as `AUTH_SERVICE_UNAVAILABLE`. Now `.materialize()` catches only the token-version lookup's own errors; forwarding errors are no longer caught here at all |
+| `handler/GatewayExceptionHandler.java` | **New.** The gateway's own last-resort error handler (WebFlux's equivalent of `common-web`'s `GlobalExceptionHandler`, which only works on Spring MVC). Gives forwarding failures an honest status: 503 service down, 504 too slow, 404 no route, 500 our own bug — always in the project's normal JSON shape, with the real details kept to the log only |
+| `src/test/.../JwtGatewayFilterTest.java` | **New**, 6 tests. Written **before** the fix — confirmed to fail against the old code, then passed once the fix was made |
+| `src/test/.../GatewayExceptionHandlerTest.java` | **New**, 7 tests |
+
+**Verification:** the exact real-world situation that exposed the bug (a valid token, IncidentService
+not running) was reproduced on the real gateway before and after. Before: 503
+`AUTH_SERVICE_UNAVAILABLE`, log blamed AuthService. After: 503 `SERVICE_UNAVAILABLE`, log correctly
+names `IncidentService`. 35 wrongly-blamed log lines in one run → 0.
+
+### Documentation
+
+`notes/rate-limiting-on-ai-endpoints.md` rewritten with a "quick revision page" at the top (the
+whole gateway flow in pictures, the 4 questions the rate limiter asks, 20 worked examples, 3
+worked-through stories with numbers) plus step 3 folded into the detail below it.
+
+`notes/jwt-gateway-error-handling.md` — **new**. The 3 different jobs inside `JwtGatewayFilter`
+(read the token / ask AuthService / forward the request), which of them the `try/catch` actually
+covers, why `lookupFailed` sometimes answers 401 and sometimes 503, and what
+`GatewayExceptionHandler` does with everything else.
+
+`CLAUDE.md` — §4 (auth flow) and §6 (inter-service calls) updated with the rate limiter and the
+error-handling split; §9 gets 2 new resolved issues (the blame bug, and the still-open 504 gap);
+§10 gets 2 new working agreements.
+
+`notes/LLD/LLD-APIGateway.md` and `LLD-overview.md` updated: the rate limiter is added to the
+filter-chain diagram and the resilience table; the error-responses section is rewritten to explain
+the split between the filter's own errors and `GatewayExceptionHandler`'s.

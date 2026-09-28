@@ -118,6 +118,27 @@ SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetric
    builds a `UsernamePasswordAuthenticationToken(userId, null, authorities)`.
 6. So in every downstream controller/service: **`auth.getName()` is the user's UUID string**,
    and authorities are the raw `ROLE_*` strings.
+7. **As of 2026-09-23 to 09-24 (Track B5) the gateway also rate-limits**, in
+   `filter/RateLimitFilter.java` (`GlobalFilter`, order `1` — runs *after* `JwtGatewayFilter`,
+   because it needs the `X-User-Id` header that filter writes). 4 rules, checked in order, first
+   match wins: `/ai/**` per user (5/min, 100/day — the paid Gemini calls), `/auth/login` per IP
+   (10/min, 100/hour — catches credential stuffing, which per-account lockout cannot), `/auth/signup`
+   per IP (5/hour, 20/day), everything else per user (20/sec, 300/min — a safety floor, must stay
+   **last** in the rule list or it would swallow every request before the tighter rules ran). Login
+   and signup deliberately ignore `X-Forwarded-For` (a caller-supplied header, easy to fake) and use
+   the real connection address instead. Buckets are Bucket4j, held per caller in a bounded Caffeine
+   cache (`services/KeyedRateLimiter.java`, reused across all 4 rules). Over a limit → 429 +
+   `Retry-After`, in the same JSON shape as every other gateway error. See §6 and
+   `notes/rate-limiting-on-ai-endpoints.md`.
+8. **As of 2026-09-25 (Track B5) `JwtGatewayFilter`'s own error handling covers *only* the
+   AuthService token-version lookup**, via `.materialize()`. Errors from forwarding the request
+   (the target service is down, unregistered, or too slow) are **not** caught there — they reach
+   `handler/GatewayExceptionHandler.java`, a `@Order(-2)` `ErrorWebExceptionHandler`, the gateway's
+   WebFlux equivalent of `common-web`'s `GlobalExceptionHandler`. **Before this split (found while
+   testing B5 step 3), any downstream failure was wrongly reported as `AUTH_SERVICE_UNAVAILABLE`**
+   — a down IncidentService made the caller think their session was the problem, and the log
+   blamed AuthService for someone else's outage. See §9 issue 48 and
+   `notes/jwt-gateway-error-handling.md`.
 
 Every downstream `SecurityConfig` is a copy-paste of the same shape: csrf disabled,
 `SessionCreationPolicy.STATELESS`, `addFilterBefore(headerAuthFilter, UsernamePasswordAuthenticationFilter)`,
@@ -229,9 +250,28 @@ Service ids used in `lb://` / URIs are inconsistently cased vs `spring.applicati
 `Content-Length`, so a chunked request slips past it — that is why this is a hand-written filter,
 not the built-in one). It applies to every route, including `/auth/**`. Downstream services do
 **not** re-check body size — they trust the gateway is the only door in, which holds only because
-they bind to `127.0.0.1` (Track B1). The JSON-error-writing code both gateway filters use lives in
-`utils/GatewayErrorWriter.java` (new, Track B4 step 6) — write to that one place, not to each
-filter separately, or the two error shapes will drift apart.
+they bind to `127.0.0.1` (Track B1). The JSON-error-writing code every gateway filter/handler uses
+lives in `utils/GatewayErrorWriter.java` (new, Track B4 step 6) — write to that one place, not to
+each filter separately, or the error shapes will drift apart.
+
+**Rate limiting (Track B5, steps 1-3, 2026-09-23 to 09-24).** `filter/RateLimitFilter.java`
+(`GlobalFilter`, order `1`) sits after `JwtGatewayFilter` (`-1`) and `RequestSizeFilter` (`-2`).
+4 rules, first path match wins — see §4 point 7 for the full list and numbers. Each rule owns its
+own `KeyedRateLimiter` (one Bucket4j bucket per caller, held in a bounded Caffeine cache) and its
+own Micrometer `Counter`, visible per rule at
+`/actuator/metrics/gateway.ratelimit.rejected?tag=rule:<name>`. **The `default` rule must stay
+last** in the rule list — the filter checks rules top to bottom and uses the first one that
+matches the path, so a rule placed before `default` keeps its own tighter bucket, and `default`
+placed anywhere else would swallow every request first. Settings: `gateway.ratelimit.*` in
+`application.properties`, one `{short-window, long-window}` pair per rule.
+
+**Error handling split (Track B5, 2026-09-25).** `JwtGatewayFilter` only catches errors from its
+own token-version lookup (`.materialize()`) — see §4 point 8. Every other error the gateway
+encounters (routing, a downstream service down or slow, no matching route) lands in
+`handler/GatewayExceptionHandler.java`, a `@Order(-2)` `ErrorWebExceptionHandler`. It maps
+`ResponseStatusException`/`ConnectException` to an honest status (503 service down, 504 too slow,
+404 no route) and anything unrecognised to 500, always via `GatewayErrorWriter`, with the real
+exception details kept in the log only (same no-leak rule as `common-web`'s handler).
 
 ---
 
@@ -277,8 +317,11 @@ module. Services throw `NotFoundException` / `ValidationException` / `ConflictEx
 `errorCode` and a fixed HTTP status). One shared `@RestControllerAdvice`
 (`com.project.web.handler.GlobalExceptionHandler`) turns them into a single JSON shape,
 auto-configured into every MVC service via `common-web`'s
-`AutoConfiguration.imports`. APIGateway is WebFlux so it hand-matches the same shape in
-`JwtGatewayFilter.onError`. **Do not add per-service advice classes** — extend the shared one.
+`AutoConfiguration.imports`. APIGateway is WebFlux so it hand-matches the same shape via
+`GatewayErrorWriter` — called directly from `JwtGatewayFilter.onError` for the gateway's own
+checks, and from `handler/GatewayExceptionHandler` (Track B5, 2026-09-25) for everything else
+(routing failures, a downstream service down). **Do not add per-service advice classes** — extend
+the shared one, or for the gateway, extend `GatewayExceptionHandler`.
 Remaining bare `RuntimeException`s are deliberate 500s (missing seed data) and are commented
 as such.
 
@@ -510,6 +553,23 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     `request.getUsername()` anywhere in it). A caller must still send *something* there because
     of `@NotBlank`. Pre-existing behaviour, documented in the file, not changed by Track B4.
 
+### Found during Track B5 (2026-09-23 to 09-28)
+
+48. ~~`JwtGatewayFilter`'s `.onErrorResume(...)` was attached AFTER `chain.filter(...)`, so it
+    caught errors from forwarding the request (a downstream service down, unregistered, or no
+    matching route) as well as errors from its own AuthService lookup — and reported ALL of them
+    as `503 AUTH_SERVICE_UNAVAILABLE`.~~ **RESOLVED 2026-09-25.** Real proof: with IncidentService
+    not running, a perfectly valid token got "Unable to verify the session", and the log said
+    "Auth service call failed" 35 times in one test run — both blaming AuthService for an
+    IncidentService outage. Fixed with `.materialize()` (catches only the lookup's own errors) and
+    a new `handler/GatewayExceptionHandler.java` for everything else. See §4 points 7-8, §6.
+49. **504 GATEWAY_TIMEOUT is wired up in `GatewayExceptionHandler` but never actually fires.**
+    Only the gateway's call to AuthService has a response timeout configured
+    (`gateway.httpclient.response-timeout-ms`). Nothing limits how long a *routed* call to
+    Incident, User, Reporting or Ai-Service is allowed to take — a slow (not down) service just
+    makes the caller wait. Found while fixing issue 48; not fixed, since it needs its own decision
+    about per-route timeout values.
+
 ---
 
 ## 9b. Companion documents
@@ -559,7 +619,8 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 - **Never use a user id (or any open-ended value) as a metric tag.** Every new value creates a new
   metric. Tags must have a small fixed set of values, like the 4 tiers.
 - APIGateway is WebFlux and cannot use `common-web`. If the error shape changes, update
-  `JwtGatewayFilter.onError` by hand to match.
+  `GatewayErrorWriter` by hand to match — both `JwtGatewayFilter` and `GatewayExceptionHandler`
+  call it, so one change covers every gateway error.
 - **Validate at the edge, declaratively (Track B4).** A request body gets `@Valid` + annotations
   on the DTO. A path/query value gets `@Min`/`@Max`/`@Size` directly on the parameter — Spring's
   own `HandlerMethodValidationException` handles it, already wired into `common-web`'s
@@ -570,3 +631,15 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 - **`@Valid` is not optional decoration.** A DTO covered in annotations does nothing if the
   controller method is missing `@Valid` on that parameter — the rules simply never run. This is
   exactly the mistake `RagController` had (issue 7 / Track B4 step 4) until it was added.
+- **In reactive code, attach an error handler around the ONE step that can fail — not around
+  everything after it too (Track B5, issue 48).** `.onErrorResume(...)` (or `.materialize()`)
+  placed after a `chain.filter(...)`/further chained call also catches errors from *that* later
+  call, not just the step before it. If different failures need different answers, catch each
+  one at its own step, or check the error's real cause before deciding what to say.
+- **A new gateway rate-limit rule that should cover "everything left over" must be added LAST**,
+  never first — `RateLimitFilter` uses the first rule (checked top to bottom) that matches the
+  request path.
+- **Rate-limit or trust decisions by IP must use the real connection address**
+  (`request.getRemoteAddress()`), never a caller-supplied header like `X-Forwarded-For` — a caller
+  can write anything into a header. Only trust that header once a specific, known reverse proxy or
+  load balancer sits in front of the gateway, and only for that one known source.
