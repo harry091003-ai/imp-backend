@@ -56,11 +56,6 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
     private final String internalSecret;
     private static final Logger logger = Logger.getLogger(JwtGatewayFilter.class.getName());
 
-    // Must match TraceIdFilter.TRACE_ID_HEADER in common-web. The gateway cannot share that
-    // class: common-web is Spring MVC (servlet) and this app is WebFlux (reactive), so the
-    // constant is duplicated on purpose rather than dragging the servlet stack in here.
-    private static final String TRACE_ID_HEADER = GatewayErrorWriter.TRACE_ID_HEADER;
-
     public JwtGatewayFilter(JwtUtil jwtUtil,
                             TokenVersionService tokenVersionService,
                             @Value("${internal.secret}") String internalSecret) {
@@ -98,10 +93,10 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
 
         String path = exchange.getRequest().getURI().getPath();
 
-        // Establish the traceId as early as possible so that even a rejected request has one,
-        // and so the SAME id is forwarded downstream - one id covers the whole call chain.
-        String traceId = resolveTraceId(exchange);
-        exchange.getResponse().getHeaders().set(TRACE_ID_HEADER, traceId);
+        // C1 step 2b: this filter used to MAKE the trace id and put it on the request and reply.
+        // TraceIdGatewayFilter (order -3, runs before this one) does that now, after checking a
+        // caller's id is safe. Here we only READ it, for our log lines.
+        String traceId = TraceIdGatewayFilter.currentTraceId(exchange);
 
         logger.info("[" + traceId + "] 🔍 JwtGatewayFilter processing path: " + path);
 
@@ -120,8 +115,7 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
             return chain.filter(
                     exchange.mutate()
                             .request(builder -> stripIdentityHeaders(builder)
-                                    .header(INTERNAL_SECRET_HEADER, internalSecret)
-                                    .header(TRACE_ID_HEADER, traceId))
+                                    .header(INTERNAL_SECRET_HEADER, internalSecret))
                             .build());
         }
 
@@ -160,9 +154,12 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
             List<String> roles = jwtUtil.getRolesFromToken(token);
             Integer tokenVersion = jwtUtil.getTokenVersion(token);
 
-            logger.info("✅ Claims extracted - Userid: " + Userid + ", Roles: " + roles+ " TOKEN VERSION: "+tokenVersion);
+            // C1 step 1b: INFO -> FINE (FINE is java.util.logging's word for debug). This fired on
+            // EVERY request. The user id is fine to log, but not as noise on every call.
+            logger.fine("✅ Claims extracted - Userid: " + Userid + ", Roles: " + roles+ " TOKEN VERSION: "+tokenVersion);
 
-            System.out.println("JwtGatewayFilter executed");
+            // C1 step 1: removed System.out.println("JwtGatewayFilter executed") - it fired on
+            // every request and said nothing the "Claims extracted" line above doesn't.
             // ✅ 5. Get latest version from AuthService
             //
             // FIXED 2026-09-25: catch errors from the LOOKUP only.
@@ -204,7 +201,8 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
                         }
 
                         logger.info("✅ Token version verified (source: " + result.source() + ")");
-                        logger.info("📤 Adding headers - X-User: " + Userid + ", X-Roles: " + String.join(",", roles));
+                        // C1 step 1b: INFO -> FINE, same reason - every request.
+                        logger.fine("📤 Adding headers - X-User: " + Userid + ", X-Roles: " + String.join(",", roles));
 
                         // this is the success case(as token validation is done) so here we are sending the request forward and also modifing the request  by  passing the user and its roles also in the request header
                         return chain.filter(
@@ -219,18 +217,20 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
                                                         // the secret word that tells the service
                                                         // "this really did come from the gateway"
                                                         .header(INTERNAL_SECRET_HEADER, internalSecret)
-                                                        // pass the id on so the downstream
-                                                        // TraceIdFilter reuses it instead of
-                                                        // inventing a second one
-                                                        .header(TRACE_ID_HEADER, traceId)
+                                                        // (No X-Trace-Id here any more - since
+                                                        // C1 step 2b, TraceIdGatewayFilter has
+                                                        // already put it on the request.)
                                         )
                                         .build());
                     });
         }
         // this catch block is to handle any unexcepted error
         catch (Exception e) {
-            logger.severe("❌ Token processing exception: " + e.getMessage());
-            e.printStackTrace();
+            // C1 step 1: was logger.severe(...) + e.printStackTrace(). printStackTrace() writes
+            // straight to the console, outside the logging system (no timestamp, no logger name,
+            // can't be filtered or sent anywhere). Now one call, with the exception attached, so
+            // the stack trace goes through the logger. Still SEVERE: this is an unexpected error.
+            logger.log(Level.SEVERE, "❌ Token processing exception: " + FailureDescription.of(e), e);
             return onError(exchange, "INVALID_TOKEN",
                     "The token could not be processed.", HttpStatus.UNAUTHORIZED);
         }
@@ -288,13 +288,9 @@ public class JwtGatewayFilter implements GlobalFilter, Ordered {
 
     // B4 step 6: the JSON writing moved to GatewayErrorWriter, so RequestSizeFilter can share it.
     private Mono<Void> onError(ServerWebExchange exchange, String errorCode, String message, HttpStatus status) {
-        String traceId = resolveTraceId(exchange);
+        String traceId = TraceIdGatewayFilter.currentTraceId(exchange);
         logger.severe("[" + traceId + "] 🚫 Request rejected: " + errorCode + " (Status: " + status + ")");
         return GatewayErrorWriter.write(exchange, status, errorCode, message);
-    }
-
-    private String resolveTraceId(ServerWebExchange exchange) {
-        return GatewayErrorWriter.resolveTraceId(exchange);
     }
 
     //Lower number = higher priority...means run this filter early

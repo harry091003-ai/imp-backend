@@ -76,11 +76,15 @@ public class GlobalExceptionHandler {
 
         // 4xx is somebody using the API wrong - worth a WARN, not worth a stack trace.
         // 5xx from our own code is a real problem - log it fully.
+        //
+        // C1 step 2: every log line in this class used to start with a hand-written "[traceId]".
+        // Removed: the log format now prints the traceId on EVERY line by itself
+        // (config/TraceIdLoggingDefaults), so it would have shown twice.
         if (status.is5xxServerError()) {
-            log.error("[{}] {} {} -> {} {}: {}", traceId(request), request.getMethod(),
+            log.error("{} {} -> {} {}: {}", request.getMethod(),
                     request.getRequestURI(), status.value(), ex.getErrorCode(), ex.getMessage(), ex);
         } else {
-            log.warn("[{}] {} {} -> {} {}: {}", traceId(request), request.getMethod(),
+            log.warn("{} {} -> {} {}: {}", request.getMethod(),
                     request.getRequestURI(), status.value(), ex.getErrorCode(), ex.getMessage());
         }
 
@@ -102,7 +106,7 @@ public class GlobalExceptionHandler {
                 .map(this::toFieldError)
                 .collect(Collectors.toList());
 
-        log.warn("[{}] {} {} -> 400 VALIDATION_FAILED: {} field(s) rejected", traceId(request),
+        log.warn("{} {} -> 400 VALIDATION_FAILED: {} field(s) rejected", 
                 request.getMethod(), request.getRequestURI(), fieldErrors.size());
 
         return build(HttpStatus.BAD_REQUEST, "VALIDATION_FAILED",
@@ -123,7 +127,7 @@ public class GlobalExceptionHandler {
                 .map(this::toFieldError)
                 .collect(Collectors.toList());
 
-        log.warn("[{}] {} {} -> 400 VALIDATION_FAILED: {}", traceId(request),
+        log.warn("{} {} -> 400 VALIDATION_FAILED: {}", 
                 request.getMethod(), request.getRequestURI(), ex.getMessage());
 
         return build(HttpStatus.BAD_REQUEST, "VALIDATION_FAILED",
@@ -155,7 +159,7 @@ public class GlobalExceptionHandler {
             }
         }
 
-        log.warn("[{}] {} {} -> 400 VALIDATION_FAILED: {} parameter(s) rejected", traceId(request),
+        log.warn("{} {} -> 400 VALIDATION_FAILED: {} parameter(s) rejected", 
                 request.getMethod(), request.getRequestURI(), fieldErrors.size());
 
         return build(HttpStatus.BAD_REQUEST, "VALIDATION_FAILED",
@@ -174,7 +178,7 @@ public class GlobalExceptionHandler {
         String required = ex.getRequiredType() != null ? ex.getRequiredType().getSimpleName() : "the expected type";
         String message = "Parameter '" + ex.getName() + "' is not a valid " + required + ".";
 
-        log.warn("[{}] {} {} -> 400 INVALID_PARAMETER: {}", traceId(request),
+        log.warn("{} {} -> 400 INVALID_PARAMETER: {}", 
                 request.getMethod(), request.getRequestURI(), message);
 
         return build(HttpStatus.BAD_REQUEST, "INVALID_PARAMETER", message, request, null);
@@ -189,7 +193,7 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleUnreadableBody(HttpMessageNotReadableException ex,
                                                               HttpServletRequest request) {
 
-        log.warn("[{}] {} {} -> 400 MALFORMED_REQUEST_BODY: {}", traceId(request),
+        log.warn("{} {} -> 400 MALFORMED_REQUEST_BODY: {}", 
                 request.getMethod(), request.getRequestURI(), ex.getMessage());
 
         return build(HttpStatus.BAD_REQUEST, "MALFORMED_REQUEST_BODY",
@@ -206,7 +210,7 @@ public class GlobalExceptionHandler {
 
         String message = "Required parameter '" + ex.getParameterName() + "' is missing.";
 
-        log.warn("[{}] {} {} -> 400 MISSING_PARAMETER: {}", traceId(request),
+        log.warn("{} {} -> 400 MISSING_PARAMETER: {}", 
                 request.getMethod(), request.getRequestURI(), message);
 
         return build(HttpStatus.BAD_REQUEST, "MISSING_PARAMETER", message, request, null);
@@ -220,7 +224,7 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleDataIntegrity(DataIntegrityViolationException ex,
                                                              HttpServletRequest request) {
 
-        log.warn("[{}] {} {} -> 409 DATA_INTEGRITY_VIOLATION: {}", traceId(request),
+        log.warn("{} {} -> 409 DATA_INTEGRITY_VIOLATION: {}", 
                 request.getMethod(), request.getRequestURI(), ex.getMostSpecificCause().getMessage());
 
         return build(HttpStatus.CONFLICT, "DATA_INTEGRITY_VIOLATION",
@@ -234,7 +238,7 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleAccessDenied(AccessDeniedException ex,
                                                             HttpServletRequest request) {
 
-        log.warn("[{}] {} {} -> 403 ACCESS_DENIED", traceId(request),
+        log.warn("{} {} -> 403 ACCESS_DENIED", 
                 request.getMethod(), request.getRequestURI());
 
         return build(HttpStatus.FORBIDDEN, "ACCESS_DENIED",
@@ -248,7 +252,7 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleAuthentication(AuthenticationException ex,
                                                               HttpServletRequest request) {
 
-        log.warn("[{}] {} {} -> 401 UNAUTHORIZED: {}", traceId(request),
+        log.warn("{} {} -> 401 UNAUTHORIZED: {}", 
                 request.getMethod(), request.getRequestURI(), ex.getMessage());
 
         return build(HttpStatus.UNAUTHORIZED, "UNAUTHORIZED",
@@ -271,7 +275,7 @@ public class GlobalExceptionHandler {
             return handleClientError(springError.getStatusCode(), request);
         }
 
-        log.error("[{}] {} {} -> 500 INTERNAL_ERROR (unhandled {})", traceId(request),
+        log.error("{} {} -> 500 INTERNAL_ERROR (unhandled {})", 
                 request.getMethod(), request.getRequestURI(), ex.getClass().getName(), ex);
 
         return build(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR",
@@ -340,7 +344,7 @@ public class GlobalExceptionHandler {
             default -> "The request could not be processed.";
         };
 
-        log.warn("[{}] {} {} -> {} {}", traceId(request), request.getMethod(),
+        log.warn("{} {} -> {} {}", request.getMethod(),
                 request.getRequestURI(), status.value(), status.name());
 
         return build(status, status.name(), message, request, null);

@@ -26,7 +26,8 @@ public class SignupController {
                 .email(Request.getEmail())
                 .password(Request.getPassword())
                 .build();
-System.out.println(user.getRoles());
+        // C1 step 1: removed System.out.println(user.getRoles()). It always printed an empty
+        // set (roles are added later, in the service). RegisteringUserService logs the result.
         service.RegisteringTheUser(user);
 return ResponseEntity.ok(new SignupResponseDTO(user.getUsername(),"Registered Successfully"));
     }

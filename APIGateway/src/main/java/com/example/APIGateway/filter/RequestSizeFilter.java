@@ -73,7 +73,7 @@ public class RequestSizeFilter implements GlobalFilter, Ordered {
     }
 
     private Mono<Void> reject(ServerWebExchange exchange, HttpStatus status, String errorCode, String message) {
-        String traceId = GatewayErrorWriter.resolveTraceId(exchange);
+        String traceId = TraceIdGatewayFilter.currentTraceId(exchange);
         // WARNING, not SEVERE: this is a bad request from outside, not our bug.
         logger.warning("[" + traceId + "] Request rejected: " + errorCode + " (" + status.value() + ") "
                 + exchange.getRequest().getMethod() + " " + exchange.getRequest().getURI().getPath());

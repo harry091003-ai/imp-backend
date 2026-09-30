@@ -1,1 +1,2 @@
 com.project.kafka.config.KafkaErrorHandlingAutoConfig
+com.project.kafka.config.KafkaTraceIdAutoConfig

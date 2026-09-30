@@ -137,6 +137,16 @@
             <artifactId>common-web</artifactId>
             <version>1.0.0</version>
         </dependency>
+
+        <!-- C1 step 3: puts the trace id on every Kafka message this service SENDS (a message
+             header), so the services that receive it can carry the same number in their logs.
+             Auto-configures itself, no wiring needed. This service only sends, it has no
+             listeners, so the retry / dead-letter part of common-kafka simply sits unused. -->
+        <dependency>
+            <groupId>com.project.kafka</groupId>
+            <artifactId>common-kafka</artifactId>
+            <version>1.0.0</version>
+        </dependency>
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>

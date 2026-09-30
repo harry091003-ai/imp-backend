@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Same Spring Boot version as the services (3.5.11), like common-web and common-kafka. -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.11</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.project.trace</groupId>
+    <artifactId>common-trace</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>common-trace</name>
+    <description>The trace id (a request's tracking number): its name, its safety check, and how
+        every log line prints it. Shared by common-web (HTTP) and common-kafka (Kafka) so the two
+        can never disagree. Deliberately tiny.</description>
+
+    <properties>
+        <!-- Java 17, like common-web and common-kafka: Ai-Service is still on 17. -->
+        <maven.compiler.release>17</maven.compiler.release>
+    </properties>
+
+    <dependencies>
+        <!-- 'provided': every service already has Spring Boot. We only need it to compile. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Only for the tests: real Spring Boot logging + JUnit. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

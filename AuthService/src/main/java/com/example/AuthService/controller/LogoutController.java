@@ -19,7 +19,8 @@ public class LogoutController {
     }
     @RequestMapping("/user")
     public String LogoutOfOwn(){
-        System.out.println("Enter the Logout Controller: " );
+        // C1 step 1: removed System.out.println("Enter the Logout Controller"). Pure noise -
+        // LogoutUserService logs the actual logout (with the user id) one step later.
         service.LogoutUser();
         return "Logout Successfully";
     }

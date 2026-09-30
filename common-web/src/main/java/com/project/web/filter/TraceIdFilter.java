@@ -4,11 +4,11 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import com.project.trace.TraceId;
 import org.slf4j.MDC;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
-import java.util.UUID;
 
 /**
  /**
@@ -30,9 +30,11 @@ import java.util.UUID;
  *
  * 3. so how the Logs looks when we use MDC :
  * The logging pattern uses "%X{traceId}".
+ *    (C1 step 2: this was NOT true until 2026-09-28 - no service's log format printed it.
+ *     config/TraceIdLoggingDefaults now adds it for every service that uses common-web.)
  *    - Example:
- *        [traceId=ABC123] Creating incident
- *        [traceId=ABC123] Saving incident
+ *        ... [nio-8083-exec-1] [ABC123] c.e.I.service.IncidentService : Creating incident
+ *        ... [nio-8083-exec-1] [ABC123] c.e.I.service.IncidentService : Saving incident
  *
  * 4. Continue the request using filterChain.doFilter().
  *    - The controller/service/repository can now execute normally.
@@ -78,10 +80,13 @@ import java.util.UUID;
  */
 public class TraceIdFilter extends OncePerRequestFilter {
 
-    public static final String TRACE_ID_HEADER = "X-Trace-Id";
+    // C1 step 3: the two names now come from common-trace (TraceId), which common-kafka uses too,
+    // so an HTTP request and a Kafka message can never disagree about them.
+    // The public names stay, so nothing that uses them has to change.
+    public static final String TRACE_ID_HEADER = TraceId.HEADER;
 
     /** Key used both in the SLF4J MDC and as a servlet request attribute. */
-    public static final String TRACE_ID_KEY = "traceId";
+    public static final String TRACE_ID_KEY = TraceId.MDC_KEY;
 
     @Override
     protected void doFilterInternal(HttpServletRequest request,
@@ -93,7 +98,7 @@ public class TraceIdFilter extends OncePerRequestFilter {
         if (traceId == null || traceId.isBlank()) {
             // 8 hex chars is enough to be unique within a log retention window and short
             // enough that a user can read it off a screen and tell it to you over the phone.
-            traceId = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+            traceId = TraceId.newId();
         }
 
         MDC.put(TRACE_ID_KEY, traceId);

@@ -147,7 +147,7 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
         long retryAfterSeconds = Math.max(1, (probe.getNanosToWaitForRefill() + 999_999_999L) / 1_000_000_000L);
 
         rule.rejected().increment();
-        String traceId = GatewayErrorWriter.resolveTraceId(exchange);
+        String traceId = TraceIdGatewayFilter.currentTraceId(exchange);
         logger.warning("[" + traceId + "] Rate limit hit: rule=" + rule.name() + ", caller=" + key
                 + ", retry in " + retryAfterSeconds + "s");
 

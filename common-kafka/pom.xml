@@ -33,6 +33,15 @@
     </properties>
 
     <dependencies>
+        <!-- C1 step 3: the trace id's name and safety check (see that module). Not 'provided':
+             it is our own tiny library, so it travels WITH common-kafka into every service.
+             That is also how NotificationService (no common-web) gets the [traceId] log slot. -->
+        <dependency>
+            <groupId>com.project.trace</groupId>
+            <artifactId>common-trace</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+
         <!-- 'provided' because every service that uses this module already has spring-kafka
              itself. We need it to compile; we must not drag a second copy in at runtime. -->
         <dependency>
@@ -45,6 +54,20 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-autoconfigure</artifactId>
             <scope>provided</scope>
+        </dependency>
+
+        <!-- Tests only. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- An IN-MEMORY Kafka broker started inside the test, so we can prove the trace id really
+             travels through Kafka without needing your Docker Kafka running. -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

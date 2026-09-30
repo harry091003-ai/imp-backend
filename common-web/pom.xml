@@ -37,6 +37,15 @@
 
     <dependencies>
 
+        <!-- C1 step 3: the trace id's name, safety check and log format (see that module).
+             NOT 'provided': it is our own tiny library, so it must travel WITH common-web into
+             every service, or the log format default would not be found at runtime. -->
+        <dependency>
+            <groupId>com.project.trace</groupId>
+            <artifactId>common-trace</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+
         <!-- All dependencies below are 'provided': this module needs them to COMPILE, but every
              consuming service already brings its own copy at runtime. Keeping them non-transitive
              stops this library from dragging the servlet web stack into anything that shouldn't

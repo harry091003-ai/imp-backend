@@ -6,6 +6,8 @@ import com.example.AuthService.repository.UserRepository;
 import com.project.events.UserLoggedInEvent;
 import com.project.events.UserLoggedOutAtEvent;
 import com.project.web.exception.NotFoundException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
@@ -15,6 +17,8 @@ import java.util.UUID;
 
 @Service
 public class LogoutUserService {
+    private static final Logger log = LoggerFactory.getLogger(LogoutUserService.class);
+
     private final UserRepository userRepository;
 private final UserLoggedOutEventProducer userLoggedOutEventProducer;
     public LogoutUserService(UserRepository userRepository,UserLoggedOutEventProducer userLoggedOutEventProducer) {
@@ -24,14 +28,12 @@ private final UserLoggedOutEventProducer userLoggedOutEventProducer;
 // this method we use when we want to logout the current user
     public void LogoutUser(){
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        System.out.println("Userid is: " + auth.getName());
 
         String UserId=auth.getName();
         User user = userRepository.findById(UUID.fromString(UserId))
                 .orElseThrow(() -> new NotFoundException("USER_NOT_FOUND", "User not found: " + UserId));
 
         user.setTokenVersion(user.getTokenVersion()+1);
-        System.out.println("User token version is : " + user.getTokenVersion());
         // update the LastLogout time
         user.setLastLogoutAt(LocalDateTime.now());
        User updatedUser= userRepository.save(user);
@@ -41,7 +43,9 @@ private final UserLoggedOutEventProducer userLoggedOutEventProducer;
                  .userLastLoggedOutAt(updatedUser.getLastLogoutAt())
                  .build();
          userLoggedOutEventProducer.sendUserLoggedOutEvent(updatedUser.getUserid(),event);
-        System.out.println("Token Version Updated sucessfully so u are successfully logged out " );
+        // C1 step 1: 3 System.out.println lines in this method (user id, token version, "success")
+        // became this ONE line. Token version is a plain counter, fine to log.
+        log.debug("User {} logged out, token version is now {}", UserId, updatedUser.getTokenVersion());
     }
     public void LogoutUserByAdmin(UUID userId){
 
@@ -57,6 +61,8 @@ private final UserLoggedOutEventProducer userLoggedOutEventProducer;
                 .userLastLoggedOutAt(updatedUser.getLastLogoutAt())
                 .build();
         userLoggedOutEventProducer.sendUserLoggedOutEvent(updatedUser.getUserid(),event);
-        System.out.println("admin sucessfully update Token Version Updated  of" + user.getUsername()+" so user is  successfully logged out  " );
+        // C1 step 1: was System.out.println with the username. Trimmed to the user id.
+        log.debug("User {} logged out by an admin, token version is now {}", userId,
+                updatedUser.getTokenVersion());
     }
 }

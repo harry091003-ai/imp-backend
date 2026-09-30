@@ -6,6 +6,8 @@ import com.example.UserService.entity.User;
 import com.example.UserService.service.UserService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Size;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.ResponseEntity;
@@ -17,11 +19,12 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import java.util.UUID;
-import java.util.logging.Logger;
 
 @RestController
 @RequestMapping("/users")
 public class UserController {
+
+    private static final Logger log = LoggerFactory.getLogger(UserController.class);
 
     private final UserService service;
 
@@ -34,8 +37,9 @@ public class UserController {
     @GetMapping("/engineers")
     public ResponseEntity<List<UserResponseDTO>> getAllEngineers() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        System.out.println("User: " + auth.getName());
-        System.out.println("Authorities: " + auth.getAuthorities());
+        // C1 step 1: was 2 System.out.println lines (user id, authorities). Authorities trimmed -
+        // @PreAuthorize above already guarantees ADMIN or SUPERVISOR.
+        log.debug("Engineer list requested by user {}", auth.getName());
         return ResponseEntity.ok(service.GetRoleSpecifiedUsers(RoleName.ROLE_ENGINEER));
     }
 

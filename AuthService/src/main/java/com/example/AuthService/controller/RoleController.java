@@ -4,6 +4,8 @@ import com.example.AuthService.dto.UpdateUserRolesRequestDTO;
 import com.example.AuthService.dto.UserRoleResponseDTO;
 import com.example.AuthService.service.UpdateRoleService;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
@@ -13,6 +15,8 @@ import org.springframework.web.bind.annotation.*;
 @RestController
 @RequestMapping("/roles")
 public class RoleController {
+
+    private static final Logger log = LoggerFactory.getLogger(RoleController.class);
 
 private final UpdateRoleService service;
 
@@ -25,12 +29,11 @@ private final UpdateRoleService service;
     public ResponseEntity<UserRoleResponseDTO> UpdateUserRoles(@PathVariable String username
             , @Valid @RequestBody UpdateUserRolesRequestDTO requestDTO)
     {
-        System.out.println("We entered the controller and the username is: " + username + " and the requested roles are: " + requestDTO.getRole());
-
-
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
-        System.out.println("User: " + auth.getName());
-        System.out.println("Authorities: " + auth.getAuthorities());
+        // C1 step 1: was 3 System.out.println lines (target username, caller id, caller authorities).
+        // Trimmed: no username (personal data), no authorities (the /roles/** rule already
+        // guarantees ROLE_ADMIN). Kept: who asked (their id) and what they asked for.
+        log.debug("Role update requested by user {}: roles {}", auth.getName(), requestDTO.getRole());
         return   service.UpdatingUserRoles( username,requestDTO);
 
     }

@@ -6,6 +6,7 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration;
 import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.kafka.KafkaException;
@@ -54,7 +55,16 @@ import java.util.Map;
  *
  * Full write-up: notes/kafka-dead-letter-topics.md
  */
-@AutoConfiguration
+// C1 step 3 - FIX for a startup failure introduced by B2:
+//   this class registers two KafkaTemplate beans (the dead-letter ones). Spring Boot creates its
+//   OWN default "kafkaTemplate" only if NO KafkaTemplate exists yet. Auto-configs run in
+//   alphabetical order by default ("com.project..." comes before "org.springframework..."), so
+//   ours ran FIRST, and Boot's default template was never created.
+//   Then every producer asking for the default one (KafkaTemplate<String,Object> in
+//   ReportingService and Ai-Service) found nothing, and the service could not start.
+// "after = KafkaAutoConfiguration" makes Boot create its default template first. Ours are then
+// simply extra, alongside it.
+@AutoConfiguration(after = KafkaAutoConfiguration.class)
 @ConditionalOnClass(KafkaTemplate.class)
 public class KafkaErrorHandlingAutoConfig {
 

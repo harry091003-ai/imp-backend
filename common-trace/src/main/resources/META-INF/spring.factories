@@ -1,0 +1,4 @@
+# Tells Spring Boot to run TraceIdLoggingDefaults while it reads the settings, BEFORE logging is
+# set up - so every service's log lines show the traceId.
+# (C1 step 2, moved from common-web to common-trace in step 3.)
+org.springframework.boot.env.EnvironmentPostProcessor=com.project.trace.TraceIdLoggingDefaults

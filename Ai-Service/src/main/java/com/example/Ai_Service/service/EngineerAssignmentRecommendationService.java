@@ -22,7 +22,10 @@ public class EngineerAssignmentRecommendationService {
     private final VectorStore vectorStore;
 private final ReportingServiceFeignClient reportingServiceFeignClient;
     public List<EngineerCandidateDTO> recommendedEngineers(EngineerRecommendationRequestDTO request) {
-        log.info("Enter the service layer recommendedEngineers function with request : {}",request);
+        // C1 step 1b: was log.info of the whole request object. Today that printed only a memory
+        // address (no toString), but the request holds the incident title + description - one
+        // @Data away from printing them. Now debug, with just the 2 values this method uses.
+        log.debug("Recommending engineers for category {}, service {}", request.getCategory(), request.getServiceName());
         Filter.Expression filter = buildFilter(request.getCategory(), request.getServiceName());
 
 

@@ -8,6 +8,8 @@
 package com.example.AuthService.security;
 
 import com.example.AuthService.entity.User;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.userdetails.UserDetails;
@@ -15,6 +17,8 @@ import org.springframework.security.core.userdetails.UserDetails;
 import java.util.Collection;
 
 public class CustomUserDetails implements UserDetails {
+
+    private static final Logger log = LoggerFactory.getLogger(CustomUserDetails.class);
 
     private User user;
 
@@ -60,16 +64,15 @@ public class CustomUserDetails implements UserDetails {
 
     @Override
     public Collection<? extends GrantedAuthority> getAuthorities() {
-        System.out.println("Hiiiii" + user.getRoles().stream().toList());
-        System.out.println("Hiiiii" + user.getRoles().stream().toList());
-
         Collection<? extends GrantedAuthority> authorities =
                 user.getRoles()
                         .stream()
                         .map(role -> new SimpleGrantedAuthority("" + role.getRolename()))
                         .toList();
 
-        System.out.println("🔥 GRANTED AUTHORITIES FOR USER = " + authorities);
+        // C1 step 1: was 3 System.out.println lines - "Hiiiii" + the Role objects (twice, the
+        // same line), then the authorities. Now one line: the role names, e.g. [ROLE_ENGINEER].
+        log.debug("Granted authorities for user {}: {}", user.getUserid(), authorities);
         return authorities;
     }
 }

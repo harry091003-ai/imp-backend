@@ -49,14 +49,19 @@ public class EmailNoticationService {
                 UserNotificationlog.setSentAt(LocalDateTime.now());
                 UserNotificationlog.setMessage("Email Successfully sent to "+user.getEmail()+" for Incident Created Event with Incident Id: "+incidentId);
                 UserNotificationlog.setFailureReason("No Failure");
-                log.info("Email Successfully sent to {} for {} Event with Incident Id: {}", user.getEmail(), eventType,incidentId);
+                // C1 step 1b: the 3 log lines in this method printed the recipient's EMAIL. Now the
+                // user id. (The email is still stored in the notification_log table - that is data,
+                // not a log line.) Wording kept: "sent" is untrue today, but that is known
+                // issue 16 (no email is really sent), not this step's job.
+                log.info("Email Successfully sent to user {} for {} Event with Incident Id: {}", user.getUserid(), eventType,incidentId);
             }
             catch (Exception e){
                 //3 if in try block we get any exception while sending the email then we will catch block
                 UserNotificationlog.setStatus(NotificationStatus.FAILED);
                 UserNotificationlog.setFailureReason(e.getMessage());
                 UserNotificationlog.setMessage("Failed to send Email to "+user.getEmail()+" for "+ eventType + " Event with Incident Id: "+incidentId+" due to "+e.getMessage());
-                log.info("Failed to send Email to {} for {} Event with Incident Id: {} due to {}", user.getEmail(),eventType, incidentId, e.getMessage());
+                // Also INFO -> WARN: a failure should not look like normal news.
+                log.warn("Failed to send Email to user {} for {} Event with Incident Id: {} due to {}", user.getUserid(),eventType, incidentId, e.getMessage());
             }
             //Since in kafka  multiple threads system : as multiple consumer at same time can consume the same event and try to save the same event for same user in database and if we do not handle that then we will get duplicate entry in database and also we will send multiple email to same user for same event which is not good for user experience .
             // A. so to avoid this we will use the unique constraint on the combination of eventId and recipientEmail in database level so that if multiple threads try to insert the same event for same user then only one thread will succeed and other thread will get exception and we can handle that exception to avoid sending email again for same event to same user.
@@ -67,8 +72,8 @@ public class EmailNoticationService {
                 notificationLogRepository.save(UserNotificationlog);
             }
             catch(DataIntegrityViolationException ex) {
-                log.warn("Duplicate event ignored for eventId={} email={}",
-                        eventId,user.getEmail());
+                log.warn("Duplicate event ignored for eventId={} user={}",
+                        eventId,user.getUserid());
             }
         }
     }

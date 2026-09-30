@@ -36,8 +36,9 @@ but we have Two modules where:
         <!-- Shared libraries: plain JARs, not runnable. Everything else depends on these. -->
         <module>shared-events</module>      <!-- Kafka event classes -->
         <module>common-security</module>    <!-- HeaderAuthFilter -->
-        <module>common-web</module>         <!-- error handling: exceptions + handler + traceId -->
-        <module>common-kafka</module>       <!-- Kafka safety net: retry + dead letter topic -->
+        <module>common-trace</module>       <!-- trace id: its name, safety check, log format (used by web + kafka) -->
+        <module>common-web</module>         <!-- error handling: exceptions + handler + traceId filter -->
+        <module>common-kafka</module>       <!-- Kafka safety net (retry + dead letter) + trace id on messages -->
 
         <!-- Infrastructure services -->
         <module>Eureka</module>             <!-- service registry -->

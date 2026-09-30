@@ -1,6 +1,8 @@
 package com.example.IncidentService.config;
 
 import com.project.security.filter.HeaderAuthFilter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
@@ -15,6 +17,8 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
     @EnableMethodSecurity
     @EnableWebSecurity
     public class SecurityConfig {
+
+        private static final Logger log = LoggerFactory.getLogger(SecurityConfig.class);
 
         private final HeaderAuthFilter headerAuthFilter;
 
@@ -50,7 +54,9 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
             // below are not the filter ,they are just the configuration of the filters ...
             // when a particular  filter run then it will takes  its configuration from here
 
-            System.out.println("headerAuthFilter is:"+ headerAuthFilter);
+            // C1 step 1: was System.out.println of the filter object (it only printed a memory address).
+            // A startup detail, so debug - hidden unless you turn debug logging on.
+            log.debug("HeaderAuthFilter added to the security chain");
 
 
             http

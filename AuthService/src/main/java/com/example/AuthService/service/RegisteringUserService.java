@@ -9,6 +9,8 @@ import com.example.AuthService.repository.UserRepository;
 import com.project.events.UserRegisteredEvent;
 import com.project.web.exception.ConflictException;
 import jakarta.transaction.Transactional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 
@@ -18,6 +20,7 @@ import java.util.stream.Collectors;
 @Transactional
 @Service
 public class RegisteringUserService {
+private static final Logger log = LoggerFactory.getLogger(RegisteringUserService.class);
 private final PasswordEncoder passwordEncoder;
 private final RoleRepository roleRepository;
 private final UserRepository userRepository;
@@ -60,11 +63,13 @@ public RegisteringUserService(PasswordEncoder password_encoder, RoleRepository r
 
 
        //make the user know the role
-        System.out.println(user.getRoles());
 //        if(user.getRoles()==null){}
         user.getRoles().add(role);
 
            userRepository.save(user);
+        // C1 step 1: was System.out.println(user.getRoles()) BEFORE the role was added, so it
+        // always printed an empty set. Moved here, after the save, where the user id exists.
+        log.debug("New user {} registered with role {}", user.getUserid(), role.getRolename());
 
 
 

@@ -23,7 +23,8 @@ public UserEventConsumer(RoleRepository role_repository, UserRepository user_Rep
 }
     @KafkaListener(topics = "user.registered",groupId ="user-service-group" )
     private void consumeUserRegisteredEvent(UserRegisteredEvent userRegistered_InAuthService) {
-System.out.println("Received UserRegisteredEvent from Kafka Topic: userRegistered");
+        // C1 step 1: this file's 4 System.out.println lines now use the @Slf4j "log" it already had.
+        log.debug("Received user.registered event for user {}", userRegistered_InAuthService.getUserid());
         if(userRepository.existsByUsername(userRegistered_InAuthService.getUsername())){
             log.warn("Username already exists, skipping event");
             return;
@@ -46,9 +47,9 @@ System.out.println("Received UserRegisteredEvent from Kafka Topic: userRegistere
                 .passwordUpdatedAt(userRegistered_InAuthService.getPasswordUpdatedAt())
                 .status(Status.INACTIVE)
                 .build();
-        System.out.println("User Created inside The UserService from the UserRegisteredEvent: " + user);
+        // The whole User object (it holds the email) is no longer printed - just the id.
         userRepository.save(user);
-        System.out.println("Sucessfully save the User in the UserService Database");
+        log.debug("User {} saved in UserService", user.getUserid());
     }
 
    @KafkaListener(topics="user.Updated",groupId ="user-service-group")
@@ -64,6 +65,6 @@ System.out.println("Received UserRegisteredEvent from Kafka Topic: userRegistere
            user.setUsername(updatingUserEvent.getUpdatedUserName());
        }
        userRepository.save(user);
-       System.out.println("User Details Updated Successfully in our UserService ");
+       log.debug("User {} details updated in UserService", user.getUserid());
    }
 }

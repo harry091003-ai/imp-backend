@@ -1,5 +1,6 @@
 package com.example.APIGateway.handler;
 
+import com.example.APIGateway.filter.TraceIdGatewayFilter;
 import com.example.APIGateway.utils.FailureDescription;
 import com.example.APIGateway.utils.GatewayErrorWriter;
 import org.springframework.boot.web.reactive.error.ErrorWebExceptionHandler;
@@ -41,7 +42,7 @@ public class GatewayExceptionHandler implements ErrorWebExceptionHandler {
         }
 
         HttpStatus status = statusFor(ex);
-        String traceId = GatewayErrorWriter.resolveTraceId(exchange);
+        String traceId = TraceIdGatewayFilter.currentTraceId(exchange);
         String where = exchange.getRequest().getMethod() + " " + exchange.getRequest().getURI().getPath();
 
         if (status.is5xxServerError()) {
