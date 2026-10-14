@@ -23,6 +23,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 
 import java.time.Duration;
@@ -41,6 +42,9 @@ private final UserClient userClient;
 private static final Logger log= LoggerFactory.getLogger(IncidentService.class);
 private final IncidentRepository incidentRepository;
 private final IncidentEventProducer incidentEventProducer;
+// Outbox step 2: runs "save incident + save its event row" as ONE short transaction.
+// Made by Spring Boot itself (there is one transaction manager), nothing to configure.
+private final TransactionTemplate transactionTemplate;
 
    public CreateIncidentResponseDTO  CreateIncident(UUID userId, CreateIncidentRequestDTO request){
    //firstly we are checking is the User who try to create the incident is Active or not
@@ -67,11 +71,15 @@ private final IncidentEventProducer incidentEventProducer;
                .updatedAt(LocalDateTime.now())
                .createdBy(userId)
                .build();
+       // Outbox step 2: the UserService check above ran BEFORE any transaction (never hold a
+       // database connection while waiting on another service). Now ONE short transaction:
+       // save the incident AND its event row together - both are saved, or neither is.
+       Incident createdIncident = transactionTemplate.execute(status -> {
          // Save the incident to the database
        Incident ourIncident= incidentRepository.save(incident);
 
        // as Incident is created in Db
-       //So Trigger the Kafka Event using The EventProducer
+       //So save the event in the outbox (the relay sends it to Kafka a moment later)
 
      //    1. create Event
     IncidentCreatedEvent event=  IncidentCreatedEvent.builder()
@@ -88,11 +96,12 @@ private final IncidentEventProducer incidentEventProducer;
             .category(ourIncident.getCategory()!=null?ourIncident.getCategory().toString():null)
             .message("Incident is successfully created!!")
                .build();
-        //2.publish Incident Created Event to Kafka Topic
+        //2.save the Incident Created Event in the outbox (same transaction as the incident)
        incidentEventProducer.PublishIncidentCreated(ourIncident.getId().toString(),event);
+       return ourIncident;
+       });
 
-
-       return CreateIncidentResponseDTO.builder().incidentId(ourIncident.getId()).
+       return CreateIncidentResponseDTO.builder().incidentId(createdIncident.getId()).
                message("Incident created Successfully").build();
    }
 
@@ -163,10 +172,13 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
     incident.setUpdatedAt(LocalDateTime.now());
     incident.setIncidentStatus(IncidentStatus.ASSIGNED);
 
+    // Outbox step 2: all UserService calls are done above, outside any transaction.
+    // Now ONE short transaction: save the change AND its event row together.
+    Incident assignedIncident = transactionTemplate.execute(status -> {
     Incident updatedIncident = incidentRepository.save(incident);
 
     // as Incident is Assigned in Db
-    //So Trigger the Kafka Event using The EventProducer
+    //So save the event in the outbox (the relay sends it to Kafka a moment later)
     //1.Create Event
         IncidentAssignedEvent  event=IncidentAssignedEvent
                 .builder()
@@ -183,14 +195,15 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
                 .message("Incident is successfully assigned to Engineer with id " + assignedToUserId)
                 .build();
 
-        //2.publish IncidentAssigned Event to Kafka Topic
+        //2.save the IncidentAssigned Event in the outbox (same transaction as the change)
     incidentEventProducer.PublishIncidentAssigned(IncidentId.toString(),event);
-
+    return updatedIncident;
+    });
 
     return AssignIncidentResponseDTO.builder()
-            .enginerId(updatedIncident.getAssignedTo())
-            .assignedBy(updatedIncident.getAssignedBy())
-            .incidentid(updatedIncident.getId())
+            .enginerId(assignedIncident.getAssignedTo())
+            .assignedBy(assignedIncident.getAssignedBy())
+            .incidentid(assignedIncident.getId())
             .message("Incident assigned successfully to Engineer with id " + assignedToUserId.toString()).build();
 
 }
@@ -508,6 +521,9 @@ return incident;
         incident.setRootCause(request.getRootCause());
         incident.setResolutionNotes(request.getResolutionNotes());
 
+        // Outbox step 2: the UserService calls (IsUserActive, team list) are done above, outside any
+        // transaction. Now ONE short transaction: save the change AND its event row together.
+        Incident statusChangedIncident = transactionTemplate.execute(transactionStatus -> {
         Incident updated = incidentRepository.save(incident);
 
 //  if incident is resolved then we will publish an the IncidentResolvedEvent  that will be consumed by ai service only for storing in vector db
@@ -554,13 +570,15 @@ return incident;
             event.setResolutionNotes(updated.getResolutionNotes());
             event.setResolvedAt(updated.getUpdatedAt());
         }
-log.info("Publishing IncidentStatusUpdatedEvent for incidentId: {} with new status: {}", updated.getId(), updated.getIncidentStatus().name());
-        //2.publish IncidentStatusUpdated Event to Kafka Topic
+log.info("Saving IncidentStatusUpdatedEvent to the outbox for incidentId: {} with new status: {}", updated.getId(), updated.getIncidentStatus().name());
+        //2.save the IncidentStatusUpdated Event in the outbox (same transaction as the change)
         incidentEventProducer.PublishIncidentStatusUpdated(updated.getId().toString(),event);
+        return updated;
+        });
 
         return UpdateIncidentStatus_ResponseDTO.builder()
-                .id(updated.getId())
-                .updatedStatus(updated.getIncidentStatus())
+                .id(statusChangedIncident.getId())
+                .updatedStatus(statusChangedIncident.getIncidentStatus())
                 .message("Incident status updated successfully")
                 .build();
     }

@@ -1,31 +1,35 @@
 package com.example.AuthService.kafka.producer;
 
 import com.project.events.UserRegisteredEvent;
+import com.project.outbox.OutboxWriter;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
+// CHANGED 2026-10-13 (Outbox step 3): this class no longer talks to Kafka.
+//
+// BEFORE: kafkaTemplate.send(...) INSIDE RegisteringUserService's @Transactional method, before the
+//         commit. Two things could go wrong: the send worked but the commit failed (a GHOST user
+//         event for a user that does not exist), or the commit worked but the send failed (a LOST
+//         event: UserService never learns about the user, and that person can never create an incident).
+// NOW:    outboxWriter.save(...) puts the event in the outbox_event table, in the SAME transaction
+//         as the user row. common-outbox's relay sends it to Kafka about a second later.
+//
+// The Kafka KEY is now the user id. Before, this event had NO key. A key keeps all events of one
+// user in order (user.registered always before that user's roles.update).
+// These methods MUST run inside a transaction: outboxWriter.save refuses otherwise, on purpose.
 @Service
-@RequiredArgsConstructor  // means all the required field automatically gets Injected via constructor like here kafkaTemplate
+@RequiredArgsConstructor
 public class UserRegisteredEventProducer {
 
     private static final Logger log = LoggerFactory.getLogger(UserRegisteredEventProducer.class);
-    //  we define this kafkaTemplate field so that we use it in our class, also we add the additional thinks <key,value>
-    //  here value :UserRegisteredEvent , means we can only send this (UserRegisteredEvent) event object
-//    similarly for key:string that we only use the string type key.
-//    although we are only using value here not using key,but must use key as it helps in Partitioning (VERY IMPORTANT)
-//    without using <k,v>  any can be added so that crash the consumers
-    private final KafkaTemplate<String, UserRegisteredEvent> kafkaTemplate;
 
+    private final OutboxWriter outboxWriter;
     private static final String TOPIC = "user.registered";
 
-
     public void publishUserRegisteredEvent(UserRegisteredEvent event) {
-        kafkaTemplate.send(TOPIC, event);
-        // C1 step 1: was System.out.println("... Published Successfully ...").
-        // Reworded: send() only HANDS the event to Kafka. Kafka confirms later, and could still fail.
-        log.debug("UserRegisteredEvent handed to Kafka, topic {}, userId {}", TOPIC, event.getUserid());
+        outboxWriter.save(TOPIC, event.getUserid().toString(), event);
+        log.debug("UserRegisteredEvent saved to the outbox, topic {}, userId {}", TOPIC, event.getUserid());
     }
 }

@@ -24,12 +24,15 @@ Root: `E:\dev-spring-boot\IMP` — **not a git repository**, no root `.gitignore
 | `shared-events` | — | plain JAR: Kafka event DTOs (`com.project.events`) | no |
 | `common-security` | — | plain JAR: `HeaderAuthFilter` + auto-config | no |
 | `common-web` | — | plain JAR: exception family, `ErrorResponse`, global `@RestControllerAdvice`, `TraceIdFilter` + auto-config | no |
-| `common-kafka` | — | plain JAR: retry-then-dead-letter error handler + 2 DLT producers, auto-config | no |
+| `common-kafka` | — | plain JAR: retry-then-dead-letter error handler + 2 DLT producers, **trace-id producer/consumer interceptors** (Track C), auto-config | no |
+| `common-outbox` | — | plain JAR (Phase 2, 2026-10-12): the outbox pattern — `OutboxWriter` (save an event in the business transaction), `OutboxRelay` + `OutboxScheduler` (send it to Kafka), auto-config. **Used by IncidentService** (step 2), **AuthService** (step 3) and **ReportingService** (step 4), all 2026-10-13; **proved on the real system 2026-10-14** (Kafka down, service restart). Full notes: `notes/outbox-pattern.md` | no |
+| `common-trace` | — | plain JAR (Track C, 2026-09-30): `TraceId` (header name, MDC key, safety rule, id maker) + `TraceIdLoggingDefaults` (fills Boot's log-pattern slot). Used by `common-web` and `common-kafka`. Java 17 bytecode | no |
 
 Root `pom.xml` (`com.example:incident-management-platform:1.0-SNAPSHOT`, `packaging=pom`)
-lists **all 12 modules** as of 2026-09-01 (Track A4), so `mvn clean install` at the root builds
-everything in one command. It previously listed only 6, and the other 6 built individually - see
-issue 24.
+lists **all 14 modules** (all 12 as of 2026-09-01 in Track A4; `common-trace` added 2026-09-30 in
+Track C; `common-outbox` added 2026-10-12), so `mvn clean install` at the root builds everything in one command. `common-trace` is
+listed before `common-web` and `common-kafka` because both depend on it. It previously listed only
+6, and the other 6 built individually - see issue 24.
 
 **Still true:** no service declares the root pom as its `<parent>`; every service parents directly
 to `spring-boot-starter-parent`, so the root pom's `<properties>` are decorative and inert.
@@ -86,8 +89,8 @@ self-referencing hierarchy: `supervisor` (`@ManyToOne`) / `engineers` (`@OneToMa
 `Environment`, `affectedSource`, `location`, `rootCause`, `resolutionNotes`, timestamps.
 
 **ReportingService** — read-model built from events: `IncidentReport` (heavily indexed, with
-SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetrics`,
-`EngineerPerformanceStats`, `EngineerWorkload`, `ProcessedEvent` (idempotency keys).
+SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetrics` (**never written** - issue 61),
+`EngineerPerformanceStats`, `EngineerWorkload`, `ProcessedEvent` (idempotency keys - stop a repeat since 2026-10-13, issue 60 fixed).
 
 **NotificationService** — `NotificationLog`, unique constraint on `(eventId, recipientEmail)`.
 
@@ -140,6 +143,13 @@ SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetric
    blamed AuthService for someone else's outage. See §9 issue 48 and
    `notes/jwt-gateway-error-handling.md`.
 
+9. **Gateway filter order (Track C, 2026-09-30):** `TraceIdGatewayFilter` **-3** (makes/accepts the
+   trace id, first, so every other filter and every error carries it) → `RequestSizeFilter` **-2** →
+   `JwtGatewayFilter` **-1** → `RateLimitFilter` **1**. Later filters get the id with
+   `TraceIdGatewayFilter.currentTraceId(exchange)`, an exchange **attribute** — not from the request
+   header, because `exchange.mutate()` makes a copy and a header set on one copy is invisible to the
+   others. See section 6 and `notes/trace-id-and-logging.md`.
+
 Every downstream `SecurityConfig` is a copy-paste of the same shape: csrf disabled,
 `SessionCreationPolicy.STATELESS`, `addFilterBefore(headerAuthFilter, UsernamePasswordAuthenticationFilter)`,
 `@EnableMethodSecurity` + `@EnableWebSecurity`.
@@ -158,7 +168,13 @@ Per-service permitAll rules:
 ## 5. Kafka event flow
 
 Events live in `shared-events` (`com.project.events`), JSON-serialized, key = entity UUID.
-Consumers use `spring.json.trusted.packages=*`.
+Consumers use `spring.json.trusted.packages=com.project.events` (narrowed from `*` in B2). **This is an exact
+package match, not "starts with"** (issue 65): `com.project.events.enumsUsedByEvents.SlaBreachingRiskEvent` is
+rejected by that setting, even though the comment in each `application.properties` says otherwise.
+**As of Track C (2026-09-30) every message also carries an `X-Trace-Id` header**, added by
+`common-kafka`'s `TraceIdProducerInterceptor` on send and restored into the MDC by
+`TraceIdRecordInterceptor` on receive. A message parked in a `-dlt` topic keeps the same header. Any
+service with `common-kafka` on its classpath gets both automatically.
 
 | Topic | Producer | Consumers |
 |---|---|---|
@@ -178,13 +194,28 @@ Consumers use `spring.json.trusted.packages=*`.
 | `Sla-Resolution-BreachingRisk-Topic` | ReportingService | **none** |
 | `incident.resolved` | declared, publisher commented out | none |
 
+**Outbox (Phase 2):** IncidentService's three `incident.*` events no longer use `kafkaTemplate.send`. They are
+saved in an `outbox_event` row in the same transaction as the incident (Flyway `V3`), and `common-outbox`'s
+relay sends them about a second later - same topics, keys and message bytes, so consumers are unchanged.
+AuthService's five events (`user.*`, `roles.update`) went through the outbox in step 3 (Flyway `V3`; `user.registered`
+and `roles.update` now have a Kafka key = the user id). ReportingService's five events (resolved report + 4 SLA
+topics) went through the outbox in step 4 (Flyway `V2`): the listener's event joins its `@Transactional`, and each
+SLA scheduler page saves its event rows and its flags in one `TransactionTemplate` transaction (issue 22 closed).
+**No service calls `kafkaTemplate.send` for a business event any more** (Ai-Service's `ai.classification.result`
+producer is switched off with the classifier, issue 17).
+**Proved on the real system (step 5, 2026-10-14, run by hand):** normal case, Kafka stopped (the request still
+succeeds, the row waits as `NEW`, and is sent after `docker start kafka`), and a service restart while Kafka is
+down (the waiting row survives). **Not run by hand:** the SLA timers (test D) and the inbox on the real system.
+A row stuck in `FAILED` needs a person - checklist and SQL in `notes/outbox-pattern.md` section 25.
+
 Consumer groups: `user-service-group`, `notification-service-group`, `Reporting-service-group`,
 `Ai-service-group`.
 
-**Idempotency**: ReportingService `IdempotencyService.isDuplicate(eventId)` inserts into
-`ProcessedEvent` and lets the unique-constraint violation bubble into the consumer's catch block
-(deliberate — see the long comment in that file). NotificationService relies on the
-`(eventId, recipientEmail)` unique constraint instead.
+**Idempotency**: ReportingService `IdempotencyService.isDuplicate(eventId)` checks `existsById` first and throws
+`DataIntegrityViolationException` for a repeat, which the consumer's catch block turns into "skip". **Fixed
+2026-10-13 (issue 60):** before, it only did `save()`, which is a merge for an id the code assigns, so a repeat
+just updated the old row and the work ran again. NotificationService relies on the `(eventId, recipientEmail)` unique constraint
+instead, and that one does work (its row id is generated, so every save is a real INSERT).
 
 ---
 
@@ -273,6 +304,15 @@ encounters (routing, a downstream service down or slow, no matching route) lands
 404 no route) and anything unrecognised to 500, always via `GatewayErrorWriter`, with the real
 exception details kept in the log only (same no-leak rule as `common-web`'s handler).
 
+**Tracing (Track C, 2026-09-30).** One id follows a request from the gateway through HTTP calls and
+Kafka messages, and shows in every log line as `[id]`. Who does what: `TraceIdGatewayFilter`
+(gateway) makes or accepts the id → `common-web`'s `TraceIdFilter` (MVC services) puts it in the MDC →
+`common-kafka`'s producer interceptor copies it onto a message → the consumer interceptor puts it back
+in the MDC on the other side. The log slot itself is filled by `common-trace`'s
+`TraceIdLoggingDefaults` (an `EnvironmentPostProcessor` in `META-INF/spring.factories` — it has to run
+before logging starts, so a normal bean would be too late). An incoming id is used only if it matches
+`[A-Za-z0-9-]{1,64}` (stops log-line injection). Five flow charts: `notes/trace-id-and-logging.md`.
+
 ---
 
 ## 7. Conventions actually in use
@@ -331,11 +371,14 @@ every failure returns `{timestamp, status, error, message, path, traceId}` plus 
 `fieldErrors` array on `@Valid` failures. `LoginResponseDTO`/`SignupResponseDTO` still carry
 legacy `status`/`message` fields on the SUCCESS path only.
 
-**Logging**: three styles coexist —
-SLF4J (`LoggerFactory.getLogger`, no `@Slf4j`) in Incident/Reporting/Notification/Ai,
-`java.util.logging.Logger` in `HeaderAuthFilter`, `JwtGatewayFilter`, `TokenVersionService`,
-and **~40 `System.out.println` calls** (24 in AuthService, 12 in UserService), several of which
-print user ids, roles and token versions.
+**Logging** (cleaned up in Track C1, 2026-09-30): **no `System.out.println` or `printStackTrace`
+left in live code** (38 became `log.debug`; the few hits a search still finds are comments).
+Two styles remain: SLF4J (`LoggerFactory.getLogger`, `@Slf4j` in `UserEventConsumer`) in all MVC
+services, and `java.util.logging.Logger` in `HeaderAuthFilter`, the gateway filters/handlers,
+`TokenVersionService` and AuthService `SecurityConfig`. Rule: **log user ids only** — never emails,
+roles, passwords, tokens or whole objects. Every MVC log line gets `[traceId] ` from the log pattern
+automatically; do **not** write it into the message by hand. Gateway log lines still write `[id]`
+by hand (issue 52).
 
 **Transactions**: `jakarta.transaction.Transactional` (not the Spring one) applied ad hoc —
 present on some services/consumers/producers, absent from most read paths and from
@@ -367,7 +410,8 @@ mvn -f common-security/pom.xml clean install
 mvn -f <Service>/pom.xml clean package
 ```
 
-The root reactor (`mvn clean install`) only covers 6 of the 10 modules.
+The root reactor (`mvn clean install`) covers all 14 modules (fixed in A4; `common-trace` builds
+first of the shared libraries).
 
 **Startup order**: Kafka (`docker compose -f kafka-docker/docker-compose.yml up -d`)
 → MySQL + Postgres → `Eureka` (8081) → `AuthService` → everything else → `APIGateway` (8082).
@@ -384,9 +428,17 @@ Ai-Service needs `flyway-core` + `flyway-database-postgresql`.
 See `notes/FLYWAY-NOTES.md` for the full explanation and per-migration log (personal notes
 folder, gitignored - see PROGRESS.md).
 
-**Tests**: 8 auto-generated `contextLoads()` classes, **no real tests anywhere**. They will fail
-without the env vars and running infrastructure. `spring-boot-starter-test` and
-`spring-security-test` are on the classpath, unused. There are no `target/*.jar` artifacts — the
+**Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
+`common-web` 19, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
+Kafka + real JPA), `APIGateway` 53, `IncidentService` 9, `AuthService` 16 and `ReportingService` 15 (outbox:
+H2 + embedded Kafka + a full-start test each) = 172. ReportingService's wiring test uses a test-only
+`src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
+with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest` - the old `contextLoads()`
+still needs real MySQL/Kafka and would connect to them.
+The other services (and Eureka) still have only the auto-generated
+`contextLoads()` class, which fails without the env vars and running infrastructure. Run one
+module's tests with `./mvnw.cmd -f <module>/pom.xml test` (shared libs have no wrapper - use any
+service's). There are no `target/*.jar` artifacts — the
 project has been run from IntelliJ (`out/production/` exists at root), not via Maven packaging.
 
 ---
@@ -395,10 +447,18 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 ### Correctness bugs
 
-1. `ChangePasswordService.changePassword` — mutates a **detached** `User` (no `@Transactional`,
-   no `save`) then delegates to `LogoutUserService.LogoutUser()`, which re-loads the user and
-   saves only `tokenVersion`/`lastLogoutAt`. **The new password is never persisted**, and
-   `passwordUpdatedAt` is never set. The `if (user == null)` after `orElseThrow` is dead code.
+1. `ChangePasswordService.changePassword` — sets the new password on a `User` with no
+   `@Transactional` and no `save`, then delegates to `LogoutUserService.LogoutUser()`, which re-loads
+   the user and saves it. **CORRECTED 2026-10-01: the password IS saved today — but only by luck.**
+   Spring Boot's default *open-session-in-view* keeps one database session for the whole request, so
+   the user object is the same one `LogoutUser()` saves, and the new password rides along. Proven in a
+   throwaway project that copies this code shape (`notes/experiments/transaction-rollback-and-osiv/`):
+   open-session-in-view ON → password saved; OFF → password lost. AuthService does not set the option,
+   so it is ON. **Still wrong:** it depends on that hidden setting (no `@Transactional`, no explicit
+   `save`), and `passwordUpdatedAt` is never set. **The same hidden dependency was found in `UpdateRoleService`**
+   (it saved a user loaded before the forced logout, which would overwrite the token-version bump); fixed
+   2026-10-13 in outbox step 3 by loading the user inside the transaction. (This entry used to say "never persisted" — that was
+   reasoned from reading the code and was not tested.)
 2. `InternalUserController.getOwnSpecificDetails` — `@GetMapping("/UserSpecificDetails/{userId}")`
    but the parameter is `@PathVariable UUID userid`. Name mismatch, so the mapping cannot resolve.
    Both `IncidentService` and `NotificationService` `UserClient`s call this endpoint.
@@ -412,6 +472,8 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
    unreachable.
 6. Account lockout has **no unlock path**: 5 failures set `accountLocked=true`; the pre-check
    rejects before authentication, and the reset to `false` only runs after a successful login.
+   **But see issue 55: since Track A1 the failure counter is rolled back, so the lock normally never
+   gets set in the first place.**
 7. `RagController` uses `@GetMapping` with `@RequestBody` on both endpoints — GET-with-body is
    dropped by many clients and by gateways. **Still true as of Track B4 step 4** — both bodies are
    now validated (`@Valid`, `@NotBlank`/`@Size`), but the HTTP method itself is unchanged.
@@ -440,9 +502,13 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     `NotFoundException` (a proper 404, not a raw `RuntimeException`) for a well-formed but unknown
     id — that part was already fixed under issue 40/`common-web`. The `permitAll` exposure itself
     is unchanged.
-12. `System.out.println` of user ids, roles, authorities and token versions across AuthService,
-    UserService and the gateway.
-13. `spring.json.trusted.packages=*` on every consumer.
+12. ~~`System.out.println` of user ids, roles, authorities and token versions across AuthService,
+    UserService and the gateway.~~ **RESOLVED 2026-09-30** (Track C1 steps 1 and 1b). 38 calls in 18
+    files became `log.debug`, logging user ids only. Emails no longer appear in NotificationService
+    logs either. See PROGRESS.md C1.
+13. ~~`spring.json.trusted.packages=*` on every consumer.~~ **RESOLVED in B2** (narrowed to
+    `com.project.events` in UserService, NotificationService, ReportingService and Ai-Service; this
+    entry was left stale until 2026-09-30).
 14. Signup hardcodes `ROLE_ENGINEER` and sets `enabled=true`, contradicting the entity comment
     ("initially when user register the account is not enabled"). There is no activation flow.
 15. ~~`SignupFormDTO.password` has `@Size(min=6)` but **no `@NotBlank`**, so a null password passes
@@ -466,8 +532,9 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 21. `IncidentService/utils/IncidentUtils.java` is an empty class.
     `shared-events/.../Main.java` is an IDE-scaffold `main` inside a library JAR.
     `AuthService/exception/` and `AuthService/dao/` are **empty directories**.
-22. `SLA_BreachedSchedular` publishes then marks-as-published (at-least-once with a crash window).
-    The author's own comment says an Outbox pattern is needed.
+22. ~~`SLA_BreachedSchedular` publishes then marks-as-published (at-least-once with a crash window).
+    The author's own comment says an Outbox pattern is needed.~~ **RESOLVED 2026-10-13** (outbox step 4): each
+    page saves its outbox rows and its "published" flags in one transaction. Same for `SLA_BreachingRiskSchedular`.
 
 ### Structural / duplication
 
@@ -487,8 +554,8 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 27. `common-security`'s source dir is literally `src/main/java/com.project.security/` (one flat
     directory name, not `com/project/security/`). It compiles under Maven but breaks conventions
     and tooling assumptions.
-28. `JwtUtil` exists **three times** (APIGateway active, AuthService commented, common-security
-    commented), and `generateToken` is duplicated in `APIGateway/utils/JwtUtil` (unused there) and
+28. `JwtUtil` exists **four times** (APIGateway active; AuthService, UserService and common-security
+    all commented out - UserService's `jwt.secret` setting and `jjwt` dependencies are therefore unused too), and `generateToken` is duplicated in `APIGateway/utils/JwtUtil` (unused there) and
     inside `AuthService/config/SecurityConfig`.
 29. **`AuthService.SecurityConfig` (a `@Configuration`) contains `generateToken` and is injected
     into `LoginUserService`** as a collaborator.
@@ -570,6 +637,99 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     makes the caller wait. Found while fixing issue 48; not fixed, since it needs its own decision
     about per-route timeout values.
 
+### Found during Track C (2026-09-30)
+
+50. ~~`KafkaErrorHandlingAutoConfig` (B2) defined two `KafkaTemplate` beans, which switched off Spring
+    Boot's own default `kafkaTemplate` (it is `@ConditionalOnMissingBean`).~~ **RESOLVED 2026-09-30.**
+    A service that only *sends* messages (ReportingService, Ai-Service) would have had no
+    `KafkaTemplate<String, SomeEvent>` to inject. Fixed with
+    `@AutoConfiguration(after = KafkaAutoConfiguration.class)`; proven by
+    `KafkaTraceIdAutoConfigTest`. **Not confirmed in the real system** - whether ReportingService and
+    Ai-Service actually failed to start between B2 and now has not been checked.
+    **Update 2026-10-14:** moot for ReportingService - since outbox step 4 its producers no longer inject a
+    `KafkaTemplate`, and the service ran in the step 5 real-system test. Still open for **Ai-Service only**
+    (`AiResponseProducer` injects one). Close this when Ai-Service has been seen starting fine.
+51. Services' `TraceIdFilter` (common-web) still reuses any incoming `X-Trace-Id` **without the safety
+    check** the gateway and Kafka code apply. Safe today (services only accept the gateway), but not
+    defence in depth. Not fixed.
+52. Gateway log lines write the trace id **by hand** (`[id] ...`). The gateway is reactive, so the MDC
+    does not follow a request across threads without extra work. Not fixed.
+53. The trace id is a plain string in logs. It gives no timings, no spans and no UI.
+    **Micrometer Tracing / Zipkin / Prometheus (C1 step 4)** was deliberately left for later.
+54. **The trace id rules exist twice.** `common-trace`'s `TraceId` (used by `common-web` and
+    `common-kafka`) and `APIGateway`'s `TraceIdGatewayFilter` each hold the header name `X-Trace-Id`,
+    the safety pattern `[A-Za-z0-9-]{1,64}` and the 8-character id maker. The gateway's `pom.xml` has no
+    `common-trace`. If someone changes one (say, the length), the gateway and the services would
+    disagree silently. Found 2026-10-01 while re-reading the LLD notes against the code. Not fixed.
+    Fix when wanted: add `common-trace` to the gateway and delete the gateway's copy. Check first: the
+    module also fills the log-format `[id]` slot, which would then print an empty `[-]` on gateway lines
+    (the gateway writes its own `[id]` by hand - issue 52).
+55. **Account lockout never triggers (found 2026-10-01 while re-reading the AuthService LLD).**
+    `LoginUserService` is `@Transactional` (jakarta, class level). On a wrong password it adds 1 to
+    `failedLoginAttempts`, calls `save`, and then **throws** `UnauthorizedException` — a
+    `RuntimeException`, so the transaction rolls back and the saved counter is undone. Reproduced in a
+    throwaway project: 6 wrong passwords → six 401s, stored counter still 0, never locked
+    (`notes/experiments/transaction-rollback-and-osiv/`). Before Track A1 this method *returned* a 401
+    instead of throwing, so the counter was kept; A1's change to "throw" broke it quietly.
+    **Effect:** per-account brute-force protection is off. What still protects `/auth/login` is the
+    gateway's per-IP limit (10/min, 100/hour, Track B5) — which does not stop a slow attacker or one
+    spread over many IPs. Accounts already locked in the database stay locked (issue 6). **Not fixed.**
+    Proper fix: write a failing test first (5 wrong logins → `accountLocked` is true in the database),
+    then keep the counter in its own transaction (`REQUIRES_NEW`) or stop throwing inside the
+    transaction. Reproduced in a copy of the code shape, not yet against the real service.
+
+### Found while re-reading the LLD notes against the code (2026-10-01) - none fixed
+
+56. **IncidentService: the assign endpoint has no ownership check.** `AssignIncident` checks that the caller
+    is ACTIVE, the incident exists, and the target is an ACTIVE engineer - never that the target is in
+    this supervisor's team, or that the incident is the supervisor's. Any supervisor can assign any incident
+    to any engineer, and can re-assign a `RESOLVED` incident. (Read, update-details and change-status do
+    have data-level checks.)
+57. **IncidentService: the "what may a supervisor touch" rule is typed four times and the copies disagree**
+    (list, read-one, update, status), and a supervisor with no engineers gets an **empty list even for the
+    incidents they created** (the code returns before the query runs).
+58. **IncidentService: a read returns only 8 fields** (`IncidentResponseDTO`). No endpoint returns the
+    description, category, service, environment, location, timestamps, root cause or resolution notes.
+59. **`CRITICAL` priority has no SLA rule.** IncidentService accepts `LOW/MEDIUM/HIGH/CRITICAL`;
+    `SLAConfiguration` only handles the first three. For `CRITICAL` the `switch` default gives a resolution SLA
+    of **0 seconds** (and assignment 3600). Every CRITICAL incident is "breached" at creation.
+60. **RESOLVED 2026-10-13 (outbox step 4)** - `IdempotencyService` now checks `existsById` first. Proved test-first
+    on the real code: `ReportingOutboxTest` failed 3 times before the fix (workload +2, resolved event saved twice,
+    report reset to OPEN) and passes after. The original entry, kept for the record:
+    **ReportingService: the idempotency ledger does not catch a repeated event.** `ProcessedEvent` has an id
+    the code assigns itself, so `repository.save()` does a `merge` - the second delivery finds the old row
+    and updates it, no exception, and the listener runs the work again. Reproduced in a replica
+    (`notes/experiments/transaction-rollback-and-osiv/`, `Ledger.java`): one event delivered twice ran
+    the work twice, ledger rows = 1. Effects of a real redelivery: a `created` event resets the report to
+    OPEN, an `assigned` event adds 1 to the workload again, a `RESOLVED` event double-counts the engineer's
+    stats and republishes the resolved event. (Normal retries after a failure are fine - the transaction
+    rolls back with the ledger row.) Fix: `existsById` first, or make `ProcessedEvent` implement `Persistable`.
+61. **ReportingService: `daily_metrics` is never written.** The table, entity and repository exist; nothing
+    inserts into it. `/reports/metrics` (its controller method is called `getDailyMetrics`) returns all-time
+    totals counted from `incident_report`, not daily numbers.
+62. **ReportingService: the active-incident count drifts.** On assign it adds 1 to the assignee but never
+    removes 1 from the previous assignee; on resolve it removes 1 from whoever sent `RESOLVED`
+    (`resolvedBy`), not from the assignee. `resolvedBy` and the engineer's expertise stats are therefore
+    credited to whoever pressed the button, which may be a supervisor or admin.
+63. **UserService returns fields that are never updated.** `UserResponseDTO` includes `enabled`,
+    `accountLocked` and `failedLoginAttempts`, but nothing writes those columns after registration, so
+    every user shows `enabled=false`, `accountLocked=false`, `failedLoginAttempts=0` - even though
+    AuthService has `enabled=true`.
+64. **No entity in any service has `@Version`**, so two people changing the same row at the same moment
+    silently overwrite each other (last save wins). Most visible on `Incident` (two supervisors assigning
+    the same incident). Fix: add a `version` column + `@Version`, map the optimistic-lock failure to a 409
+    `ConflictException`, and write a test that proves the second save fails.
+
+### Found during the outbox (2026-10-13)
+
+65. **`spring.json.trusted.packages` is an exact match, not "starts with".** UserService, NotificationService,
+    ReportingService and Ai-Service all say in `application.properties` that `com.project.events` "also covers
+    `com.project.events.enumsUsedByEvents`". It does not. A reader with that setting rejects
+    `SlaBreachingRiskEvent` ("not in the trusted packages"). **No harm today** - nobody reads the SLA topics
+    (issue 18). The first SLA-risk consumer must add `com.project.events.enumsUsedByEvents` to its setting (or
+    the class must move up a package). Proved by `ReportingEventsOverKafkaTest.todaysTrustedSettingRejectsTheRiskEvent`.
+    **Not fixed** (the comments in the 4 files are still wrong).
+
 ---
 
 ## 9b. Companion documents
@@ -593,7 +753,7 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   producer/consumer services will compile.
 - `auth.getName()` is always a **UUID string**, never a username or email.
 - Prefer fixing the section 9 items deliberately, one cluster at a time, with a test alongside —
-  the codebase has almost no safety net (only `common-web`'s 12 contract tests).
+  the codebase has almost no safety net (real tests exist only in `common-trace`, `common-web`, `common-kafka`, `common-outbox`, `APIGateway`, and the outbox tests of IncidentService, AuthService and ReportingService).
 - **Error handling is centralized now.** Throw one of `common-web`'s five exceptions; never add a
   per-service `@ControllerAdvice`, and never go back to bare `RuntimeException` for a business
   failure. A bare `RuntimeException` now means precisely "this is our bug, return 500" — a few
@@ -643,3 +803,38 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   (`request.getRemoteAddress()`), never a caller-supplied header like `X-Forwarded-For` — a caller
   can write anything into a header. Only trust that header once a specific, known reverse proxy or
   load balancer sits in front of the gateway, and only for that one known source.
+- **No `System.out.println` / `printStackTrace` (Track C).** Use SLF4J. Per-request chatter is
+  `log.debug` (off by default in production). Log **user ids only** — never emails, roles, passwords,
+  tokens or whole objects.
+- **Do not write the trace id into a log message by hand in an MVC service.** The `[id]` slot in the
+  log pattern (filled by `common-trace`) does it. A hand-written one shows twice.
+- **The trace id's name and safety rule live in `common-trace`'s `TraceId`** — use it from every
+  module that can (`common-web`, `common-kafka`). Never retype `"X-Trace-Id"` or `"traceId"` there.
+  **One exception, on purpose-by-necessity:** `APIGateway` does not depend on `common-trace`, so
+  `TraceIdGatewayFilter` keeps its own copy of the header name, the safety pattern and the id maker
+  (issue 54). If one changes, change the other by hand. In a gateway filter, read the id with
+  `TraceIdGatewayFilter.currentTraceId(exchange)` (an attribute), not from the request header.
+- **Any Spring Boot auto-config we write that defines a bean Boot also creates conditionally
+  (`@ConditionalOnMissingBean`) must declare `after = <Boot's auto-config>`.** Otherwise ours is
+  created first and silently switches Boot's off (issue 50). Test it with `ApplicationContextRunner`.
+- **A new service that sends or receives Kafka messages needs `common-kafka` in its `pom.xml`.** It
+  brings the retry/dead-letter handling *and* the trace-id interceptors with no extra code.
+- **Outbox (Phase 2, from step 2 on): a service that uses `common-outbox` must never call
+  `kafkaTemplate.send(...)` for a business event.** Call `outboxWriter.save(topic, key, event)` inside the
+  transaction that saves the data. `save` refuses to run without a transaction - that refusal is the point.
+  Do any call to another service (Feign) **before** that transaction starts, never inside it.
+- **A Kafka producer class must NOT carry its own `@Transactional` (Outbox).** It would start a separate
+  transaction just around the outbox insert and silently split the event from the data. The **caller**
+  (the service method that changes the data) owns the transaction. Where a service method has none, wrap
+  "save data + producer call" in a `TransactionTemplate`; it joins an existing transaction if there is one.
+- **Connecting a new service to the outbox (checklist, details in `notes/outbox-pattern.md` section 26):**
+  (1) `common-outbox` + `common-kafka` in the pom; test-only `h2` 2.2.224 and `spring-kafka-test`;
+  (2) the table as an **exact copy** of `common-outbox/.../outbox/outbox_event_mysql.sql` in a new Flyway file;
+  (3) producer class calls `OutboxWriter.save`, no `@Transactional` on it; (4) the data-changing method owns the
+  transaction, Feign calls before it; (5) 3 tests: both-or-neither, round trip of every event class over a real
+  embedded Kafka, whole-service wiring - and break the code once to see a test fail; (6) the **reading** side
+  gets an inbox that checks `existsById` first.
+- **`outbox.enabled=false` switches off the whole outbox, writer included** - a service that has producers using
+  `OutboxWriter` would then fail to start. Use it only in a test that must not run the relay.
+- **A `FAILED` outbox row is never retried by itself.** It means the message could not be built or sent (for
+  example the event class was renamed or removed). Do not rename or move an event class while rows for it exist.

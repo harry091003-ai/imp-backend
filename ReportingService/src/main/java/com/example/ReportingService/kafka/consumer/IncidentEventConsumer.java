@@ -187,6 +187,8 @@ IncidentAuditLog incidentAuditLog=IncidentAuditLog.builder()
             engineerPerformanceService.updateEngineerStats(incidentReport);
 
             //Now we produce the Incident Resolved Report Event that is consumed by Ai-Service as now we can see all required info collected from incident service and also that we calculated here together to ai service.
+            //Outbox step 4: this now SAVES the event in the outbox, inside this listener's transaction (the
+            //@Transactional on this class). If anything below fails, the event row rolls back with the report.
             incidentResolvedReportEventProducer.publishIncidentResolvedReportAsEvent(incidentReport,event);
 
             // as the Incident is resolved so we need to update (decrease) the Active incident count for that engineer in EngineerWorkloadService

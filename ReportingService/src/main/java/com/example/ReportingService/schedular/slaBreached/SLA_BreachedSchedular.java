@@ -10,10 +10,14 @@ import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDateTime;
 import java.util.List;
-//in future we need to apply Outbox Pattern instead of the following approach as there many bugs...
+//Outbox step 4 (2026-10-13): the Outbox Pattern is now applied here (this line used to say "in future").
+//Before: send to Kafka, THEN mark "published" in a second step. A crash in between = the event sent twice, or a
+//failed send = marked published but never sent (known issue 22). Now each page is ONE transaction: the event rows
+//go into the outbox table AND the flags are set, together. The background relay sends the rows a moment later.
 //we use bulk update because it is atomic, prevents race conditions, avoids duplicate processing, and scales efficiently in distributed systems, whereas setter + save is non-atomic and unsafe in concurrent environments.
 
 @RequiredArgsConstructor
@@ -22,6 +26,8 @@ public class SLA_BreachedSchedular {
 private final IncidentReportRepository incidentReportRepository;
         private static final Logger log = LoggerFactory.getLogger(SLA_BreachedSchedular.class);
         private final SLA_BreachedEventProducer slaBreachedEventProducer;
+        // Outbox step 4: one short transaction per page (events saved + flags set, or neither).
+        private final TransactionTemplate transactionTemplate;
 
     @Scheduled(fixedDelay = 70000)
     @SchedulerLock(name = "slaScheduler",lockAtLeastFor = "PT50S",lockAtMostFor = "PT2M")
@@ -40,39 +46,46 @@ private final IncidentReportRepository incidentReportRepository;
         log.info("Resolution SLA breached count: {}", resolutionUpdated);
 
         //Fetch candidates in Batches of 100 using Pagenation (where Assignment breach is true but did not publish event yet)
+        // Always page 0: the rows we just marked no longer match the query, so the next page 0 is the next 100.
         PageRequest pagerequest= PageRequest.of(0,100);
-        List<IncidentReport> assignmentBreachesIncidentReports;
+        int assignmentPageSize;
 do {
-     assignmentBreachesIncidentReports = incidentReportRepository.findAssignmentEventsToPublish(pagerequest);
-// 🔹 Step 3: Publish the events and then mark as published
-    for (IncidentReport incident : assignmentBreachesIncidentReports) {
-        //publish
-        slaBreachedEventProducer.publishAssignmentBreachedEvent(incident);
-        //  mark that incidentreport as published
-        incident.setAssignmentSlaEventPublished(true);
-    }
-    ;
-    //save in bulk
-    incidentReportRepository.saveAll(assignmentBreachesIncidentReports);
+    // 🔹 Step 3: ONE transaction per page: save each event in the outbox AND mark the report as published.
+    // If anything fails, the whole page rolls back (no flag, no event) and the next run tries it again.
+    assignmentPageSize = transactionTemplate.execute(status -> {
+        List<IncidentReport> assignmentBreachesIncidentReports = incidentReportRepository.findAssignmentEventsToPublish(pagerequest);
+        for (IncidentReport incident : assignmentBreachesIncidentReports) {
+            //save the event in the outbox (the relay sends it to Kafka a moment later)
+            slaBreachedEventProducer.publishAssignmentBreachedEvent(incident);
+            //  mark that incidentreport as published
+            incident.setAssignmentSlaEventPublished(true);
+        }
+        //save in bulk
+        incidentReportRepository.saveAll(assignmentBreachesIncidentReports);
+        return assignmentBreachesIncidentReports.size();
+    });
 }
-while (!assignmentBreachesIncidentReports.isEmpty());
+while (assignmentPageSize > 0);
 
 
         //Fetch candidates in Batches of 100 using Pagenation (where Resolution breach is true but did not publish event yet)
-        List<IncidentReport> resolvementBreachesIncidentReports;
+        int resolutionPageSize;
 do {
-     resolvementBreachesIncidentReports = incidentReportRepository.findResolutionEventsToPublish(pagerequest);
-    // 🔹 Step 3: Publish the events and then mark as published
-     for (IncidentReport incident : resolvementBreachesIncidentReports) {
-        //publish
-        slaBreachedEventProducer.publishResolutionBreachedEvent(incident);
-        //  mark that incidentreport as published
-        incident.setResolutionSlaEventPublished(true);
-    }
-    //save in bulk
-    incidentReportRepository.saveAll(resolvementBreachesIncidentReports);
+    // 🔹 Step 3: same as above - one transaction per page.
+    resolutionPageSize = transactionTemplate.execute(status -> {
+        List<IncidentReport> resolvementBreachesIncidentReports = incidentReportRepository.findResolutionEventsToPublish(pagerequest);
+        for (IncidentReport incident : resolvementBreachesIncidentReports) {
+            //save the event in the outbox
+            slaBreachedEventProducer.publishResolutionBreachedEvent(incident);
+            //  mark that incidentreport as published
+            incident.setResolutionSlaEventPublished(true);
+        }
+        //save in bulk
+        incidentReportRepository.saveAll(resolvementBreachesIncidentReports);
+        return resolvementBreachesIncidentReports.size();
+    });
 }
-while (!resolvementBreachesIncidentReports.isEmpty());
+while (resolutionPageSize > 0);
 
     }
 

@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -23,6 +24,10 @@ import java.util.UUID;
 public class SLA_BreachingRiskSchedular {
     private final IncidentReportRepository incidentReportRepository;
     private final SLA_BreachingRiskEventProducer SLA_BreachingRiskEventProducer;
+    // Outbox step 4: one short transaction per page: the new risk levels AND their outbox event rows are
+    // saved together, or neither. Before, the event was sent first and the level saved after - a crash in
+    // between sent the event but kept the old level, so the next run sent the same event again.
+    private final TransactionTemplate transactionTemplate;
 
     private static final Logger log= LoggerFactory.getLogger(SLA_BreachingRiskSchedular.class);
 @Scheduled(fixedDelay = 60000)
@@ -37,15 +42,20 @@ public class SLA_BreachingRiskSchedular {
     LocalDateTime deadlineWindow = now.plusMinutes(30);
     PageRequest pageRequest=PageRequest.of(0,50);
     do {
+        // the cursor values must be final to be used inside the transaction below
+        LocalDateTime cursorDeadline = BatchLastEntry_AssignedDeadline;
+        UUID cursorIncidentId = BatchLastEntry_IncidentId;
+        // Outbox step 4: ONE transaction for this page (read, change levels, save events + levels)
+        incidents = transactionTemplate.execute(status -> {
         List<IncidentReport> modifiedIncidents = new ArrayList<>();
 
-        incidents = incidentReportRepository
+        List<IncidentReport> page = incidentReportRepository
                 .findAssignmentSLARiskIncidents(
                         deadlineWindow,
-                        BatchLastEntry_AssignedDeadline,BatchLastEntry_IncidentId,pageRequest
+                        cursorDeadline,cursorIncidentId,pageRequest
                 );
-        log.info("incidents fetched for Assignment SLA Breaching Risk  → {}",incidents.size());
-        for (IncidentReport incident : incidents) {
+        log.info("incidents fetched for Assignment SLA Breaching Risk  → {}",page.size());
+        for (IncidentReport incident : page) {
 
             processAssignmentRisk(incident, now,modifiedIncidents);
         }
@@ -53,6 +63,8 @@ public class SLA_BreachingRiskSchedular {
         if(!modifiedIncidents.isEmpty()){
             incidentReportRepository.saveAll(modifiedIncidents);
         }
+        return page;
+        });
 
         //Update the BatchLastEntry_CreatedAt and BatchLastEntry_IncidentId for then next batch as its used in cursor pagination
           if(!incidents.isEmpty()){
@@ -142,15 +154,20 @@ log.info("as the AssignmentSLA new level {} and old level is {} so we need to pu
         LocalDateTime deadlineWindow = now.plusMinutes(30);
         PageRequest pageRequest=PageRequest.of(0,50);
         do {
+            // the cursor values must be final to be used inside the transaction below
+            LocalDateTime cursorDeadline = BatchLastEntry_ResolutionDeadline;
+            UUID cursorIncidentId = BatchLastEntry_IncidentId;
+            // Outbox step 4: ONE transaction for this page (read, change levels, save events + levels)
+            incidents = transactionTemplate.execute(status -> {
             List<IncidentReport> modifiedIncidents = new ArrayList<>();
 
-            incidents = incidentReportRepository
+            List<IncidentReport> page = incidentReportRepository
                     .findResolutionSLARiskIncidents(
                             deadlineWindow,
-                            BatchLastEntry_ResolutionDeadline,BatchLastEntry_IncidentId,pageRequest
+                            cursorDeadline,cursorIncidentId,pageRequest
                     );
-            log.info("incidents fetched for Resolution SLA Breaching Risk  → {}",incidents.size());
-            for (IncidentReport incident : incidents) {
+            log.info("incidents fetched for Resolution SLA Breaching Risk  → {}",page.size());
+            for (IncidentReport incident : page) {
 
                 processResolutionRisk(incident, now,modifiedIncidents);
             }
@@ -158,6 +175,8 @@ log.info("as the AssignmentSLA new level {} and old level is {} so we need to pu
             if(!modifiedIncidents.isEmpty()){
                 incidentReportRepository.saveAll(modifiedIncidents);
             }
+            return page;
+            });
 
             //Update the BatchLastEntry_ResolutionDeadline and BatchLastEntry_IncidentId for then next batch as its used in cursor pagination
             if(!incidents.isEmpty()){

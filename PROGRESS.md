@@ -13,7 +13,7 @@ Other files that go with this one:
 - `notes/` — personal learning notes (not tracked by git - see below). Includes
   `FLYWAY-NOTES.md`, `ERROR_HANDLING_FLOW.md`, and topic notes on things learned along the way.
 
-Last updated: 2026-09-22
+Last updated: 2026-09-30
 
 ---
 
@@ -30,10 +30,13 @@ Last updated: 2026-09-22
 | B3 | Timeouts, resilience, the gateway hot path | ✅ Done — all 5 steps, 2026-09-16 |
 | B4 | Input checks | ✅ Done — all 7 steps, 2026-09-22 |
 | B5 | Rate limiting | ✅ Done — all 4 steps + 1 bug found and fixed, 2026-09-28 |
-| Track C | Not decided yet | ❓ Need to discuss |
+| C1 | Logging and trace ids | ✅ Done — steps 1, 1b, 2, 2b, 3 on 2026-09-30 (step 4, Zipkin/Prometheus, left for later) |
+| LLD re-check | Every LLD file read against the code, 3 doubtful claims tested | ✅ Done — 2026-10-01 (10 new issues, 5 wrong claims corrected) |
+| Outbox (Phase 2) | Events can no longer be lost between "saved" and "sent" | ✅ Done — all 6 steps (module 2026-10-12; 3 services 2026-10-13; proved on the real system and documented 2026-10-14) |
+| Track C (rest) | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
 
-**Track A is finished. Track B is almost finished — only B5 is left.**
+**Track A and Track B are finished. Track C has started: C1 is done. The rest of Track C and Track D are not decided yet.**
 
 ---
 
@@ -1698,9 +1701,436 @@ settings), `pom.xml` (+Bucket4j), `src/test/.../RateLimitFilterTest.java` (new, 
 
 ---
 
-# Track C and D — not decided yet
+# Track C — Logging, tracing, and more
+
+## C1 — Logs were messy and one request could not be followed ✅ Done 2026-09-30
+
+*(Built over three days: steps 1 to 3 between 09-28 and 09-29, flow charts and wrap-up on 09-30.)*
+
+### What was wrong
+
+1. About 38 `System.out.println` / `printStackTrace` calls. Some printed emails, roles, whole `User`
+   objects and token versions. Nobody could turn them off or filter them.
+2. Only the MVC services had a trace id, and log lines only showed it if someone typed it by hand.
+3. The gateway had no trace id of its own for its own errors. A request that crossed the gateway
+   and a Kafka topic could not be followed from start to end.
+4. Kafka messages carried no trace id at all.
+
+### What we did — 5 steps
+
+```
+Step 1   println → log.debug            → off by default, only user ids inside
+Step 1b  3 more places cleaned          → emails gone from Notification logs, noisy INFO → debug
+Step 2   log pattern gets an [id] slot  → every log line shows the trace id by itself
+Step 2b  TraceIdGatewayFilter (gateway) → the id is made ONCE, first, and every gateway filter reuses it
+Step 3   new module common-trace        → the same id travels through Kafka messages too
+```
+
+**Step 1 + 1b.** 38 calls in 18 files became `log.debug`. Rule used: log **user ids only** — never
+emails, roles, passwords, tokens or whole objects. Extra: `UpdateRoleService` had a `Logger` that did
+nothing (a Java-util-logging call with no handler) — it now writes a real line.
+
+**Step 2.** Spring Boot has a slot in its log format for a "correlation id"
+(`logging.pattern.correlation`). `common-trace` fills it with `[%X{traceId:--}] ` using an
+`EnvironmentPostProcessor` registered in `META-INF/spring.factories`. It must run **before** logging
+starts, which is why it is a `spring.factories` entry and not a normal bean. After this, the 13 hand-written
+`"[{}] " + traceId(request)` bits in `GlobalExceptionHandler` were removed — the slot does it.
+
+**Step 2b.** `filter/TraceIdGatewayFilter.java` (order **-3**, runs before every other gateway filter):
+takes a safe `X-Trace-Id` from the caller or makes one, saves it as an exchange **attribute**
+(`gateway.traceId`), puts it on the response, and forwards it to the service. Other filters call
+`TraceIdGatewayFilter.currentTraceId(exchange)`. Why an attribute and not just the header: a filter that
+uses `exchange.mutate()` makes a *copy* of the request. Headers on the copy are not seen by the original,
+but attributes are shared by both.
+
+**Step 3.** New plain-JAR module **`common-trace`** (`com.project.trace:common-trace:1.0.0`, Java 17
+bytecode). It holds `TraceId` (the header name, the MDC key, the safety rule, the id maker) and the
+`TraceIdLoggingDefaults` from step 2. Both `common-web` and `common-kafka` depend on it, so they agree.
+
+`common-kafka` gained:
+- `TraceIdProducerInterceptor` — when a service **sends** a message, copies the id from the MDC onto the
+  message header.
+- `TraceIdRecordInterceptor` — when a service **receives** a message, reads the header, puts it back in
+  the MDC, and clears it after the message is done.
+- `KafkaTraceIdAutoConfig` — wires both into Spring Boot's producers and listener containers by itself.
+
+AuthService and IncidentService got `common-kafka` added to their `pom.xml` (they were the two
+producers that did not have it yet).
+
+### A real bug found while testing step 3 — fixed
+
+`KafkaErrorHandlingAutoConfig` (from B2) defines two `KafkaTemplate` beans for the dead-letter topics.
+Spring Boot's default `kafkaTemplate` is `@ConditionalOnMissingBean(KafkaTemplate.class)` — so those
+two beans **hid** it. In a service that only *sends* messages (ReportingService, Ai-Service) no
+`KafkaTemplate<String, SomeEvent>` existed. Fix: `@AutoConfiguration(after = KafkaAutoConfiguration.class)`
+so Boot's default template is created first. Proven with a test on the real auto-config
+(`bootsDefaultTemplateIsNotSuppressedByTheDeadLetterTemplates`).
+
+**Not yet seen in the real running system.** It was reproduced in an isolated test. Whether
+ReportingService and Ai-Service really failed to start between B2 and now has not been checked.
+
+### How we know it works
+
+- **108 tests pass** in the four modules Track C touched: common-trace 8, common-web 19,
+  common-kafka 28, APIGateway 53.
+- `TraceIdOverKafkaTest` uses a **real embedded Kafka broker**: a trace id is sent, received, forwarded
+  to a second topic, and parked in a dead-letter topic — and it is the same id every time.
+- Full 13-module build passes. All 6 service jars contain `common-trace` and `common-kafka`
+  (NotificationService has no `common-web`).
+
+### Not done in C1 (still open)
+
+- **Step 4: Micrometer Tracing / Zipkin / Prometheus.** Deliberately left. It is the "real" tracing
+  system with spans and a UI. Our trace id is a simple string in logs; it does not measure time.
+- **Nothing seen with real services yet.** The user should start Kafka and all services, send one request,
+  and check that the same `[id]` appears in the gateway, IncidentService, ReportingService and
+  NotificationService logs.
+- **Services' `TraceIdFilter` still reuses any incoming `X-Trace-Id` without checking it** (the gateway
+  does check). Safe today because services only accept calls from the gateway, but not defence in depth.
+- **The trace id rules exist twice (CLAUDE.md issue 54).** The gateway has no `common-trace` dependency, so `TraceIdGatewayFilter` keeps its own copy of the header name, safety pattern and id maker. Found on 2026-10-01 while re-reading the LLD notes against the code.
+- **Gateway log lines still write the `[id]` by hand.** The gateway is reactive; the MDC does not follow
+  a request across threads there without extra work.
+- **Reload Maven projects in IntelliJ** — there is a new module.
+
+### Files changed in C1, all together
+
+**New module `common-trace` (6 files):** `pom.xml`, `TraceId.java`, `TraceIdLoggingDefaults.java`,
+`META-INF/spring.factories`, `TraceIdTest`, `TraceIdLoggingDefaultsTest`.
+
+**common-kafka (9):** `pom.xml`, `TraceIdProducerInterceptor`, `TraceIdRecordInterceptor`,
+`KafkaTraceIdAutoConfig`, `KafkaErrorHandlingAutoConfig` (bug fix), `AutoConfiguration.imports`, and 4 test classes.
+
+**common-web (4):** `pom.xml`, `TraceIdFilter`, `GlobalExceptionHandler`, `TraceIdLoggingDefaultsTest`.
+
+**APIGateway (7):** `TraceIdGatewayFilter` (new), `TraceIdGatewayFilterTest` (new),
+`JwtGatewayFilter`, `RateLimitFilter`, `RequestSizeFilter`, `GatewayExceptionHandler`, `GatewayErrorWriter`.
+
+**println clean-up (about 22 files across AuthService, UserService, NotificationService, Ai-Service).**
+**Root `pom.xml`** — now 13 modules. **AuthService / IncidentService `pom.xml`** — +`common-kafka`.
+
+**Notes:** `trace-id-and-logging.md` (new, with 5 "who calls whom" flow charts), plus updates to
+`kafka-dead-letter-topics.md`, the B4/B5 notes, `system-design-HLD.md` and the LLD files.
+
+---
+
+## LLD re-check (2026-10-01) — reading the notes against the code
+
+**Why:** the LLD notes had been updated by searching for keywords, not by reading each file against the
+code. The user asked for a full read. Every service file was read end to end, every claim compared with the
+real source, and three claims that could not be decided by reading were **run** in a small throwaway project
+(`notes/experiments/transaction-rollback-and-osiv/`).
+
+### Old claims that turned out to be WRONG
+
+| Old claim | The truth | How we know |
+|---|---|---|
+| Password change **never saves** the new password (issue 1) | It **is saved today — by luck.** It depends on Spring's open-session-in-view, which is on by default. If someone turns that off, it breaks silently | experiment |
+| Account lockout works after 5 wrong passwords, but cannot be undone (issue 6) | The lockout **never triggers**: `LoginUserService` saves the counter then throws, and the throw rolls the save back. Per-account brute-force protection is off since Track A1 (new issue 55) | experiment |
+| ReportingService has "the best idempotency in the project" | Its ledger **does not catch a repeated event** — the id is assigned by the code, so `save()` merges instead of failing (new issue 60) | experiment |
+| Changing your email does not cancel old tokens | It does: `UpdateCredentialsService` calls `LogoutUser()`, which bumps the token version. The commented-out line is a harmless leftover | read |
+| `daily_metrics` is upserted by the consumer | **Nothing writes it** (new issue 61) | read + search |
+| The recipient of an assigned incident is "the assignee" | Three people: creator, assigner, assignee | read |
+| Ai-Service "N+1: ten candidates, 100 seconds" | The search keeps 4 incidents, so at most 4 candidates and 8 calls (about 40 s) | read |
+| `trusted.packages=*`, "no real tests", "6 of 10 modules" in CLAUDE.md | Already fixed in B2 / A4 / Track B+C; the text had not been updated | read |
+
+### New issues found (all in CLAUDE.md section 9; none fixed)
+
+54 the trace-id rules exist twice (gateway has no `common-trace`) · 55 lockout never triggers · 56 assign has
+no ownership check · 57 supervisor visibility rules disagree, and an empty team hides your own incidents ·
+58 an incident read returns only 8 fields · 59 `CRITICAL` priority gets a 0-second SLA · 60 idempotency ledger
+does not work · 61 `daily_metrics` never written · 62 active-incident counts drift / `resolvedBy` is whoever
+pressed RESOLVED · 63 UserService returns `enabled` / `accountLocked` / `failedLoginAttempts` that are never
+updated · 64 no `@Version` anywhere.
+
+### What changed for the plan
+
+The first thing to fix is no longer the password change. In order of value for the effort: **(1)** lockout
+(issue 55) and **(2)** the idempotency check (issue 60) — both small, both security or data-integrity, both
+found by experiments that become the first real tests; **(3)** the assign ownership check (56); **(4)** the
+`CRITICAL` SLA (59) with the other SLA values; **(5)** `@Version` (64). The password change should be made
+*explicit* (`@Transactional` + `save`) so it stops depending on a hidden setting. The proposed phases are in
+`notes/LLD/LLD-improvements.md` section F (still a proposal).
+
+### Files changed in this pass
+
+`CLAUDE.md` (issues 1, 6, 28 corrected; 54–64 added; section 5 idempotency paragraph; one working agreement
+reworded) · `PROGRESS.md` (this section) · all 7 `notes/LLD/LLD-<service>.md` files · `LLD-overview.md`,
+`LLD-QA.md` (Q3, Q7, Q8), `LLD-improvements.md` (A4 rewritten, C8, C9, E6, section F),
+`system-design-HLD.md`, `rate-limiting-on-ai-endpoints.md`, `kafka-dead-letter-topics.md`, `FLYWAY-NOTES.md`,
+`ERROR_HANDLING_FLOW.md`, `README.md` · **new:** `notes/experiments/transaction-rollback-and-osiv/`.
+
+---
+
+# Outbox — events can no longer be lost (Phase 2, started 2026-10-12)
+
+## What is wrong today
+
+A service saves data, then sends a Kafka event as a second, separate step. The two can split:
+
+| Service | Today | What can go wrong |
+|---|---|---|
+| IncidentService | `save()` (committed at once, no `@Transactional`), then `send()` | crash or Kafka down between them → the event is **lost**; Reporting, Notification and Ai never hear |
+| AuthService | `send()` **inside** a `@Transactional` method, before the commit | send ok + commit fails → a **ghost** event; commit ok + send fails → a **lost** `user.registered`, and that user can never create an incident |
+| ReportingService | resolved-report `send()` inside the listener transaction; SLA scheduler sends, then marks | ghosts and duplicates (issue 22) |
+
+`kafkaTemplate.send()` is asynchronous, and nobody checks its result, so a failed send is silent.
+
+## The agreed design (chosen 2026-10-12)
+
+```
+WRITE (inside the business transaction)        RELAY (separate thread, every ~1 s)
+  BEGIN                                           1. claim up to 50 NEW rows, oldest first   (short transaction)
+    save business data                            2. send each to Kafka, WAIT for the ack     (NO transaction open)
+    insert row in outbox_event (status NEW)       3. ok -> SENT;  Kafka down -> back to NEW, stop the batch;
+  COMMIT  -> both saved, or neither                  broken message -> FAILED, carry on
+```
+
+- **Polling relay**, not Debezium (Debezium needs Kafka Connect and MySQL binlog — too much for one laptop).
+- **One table per service**, in that service's own MySQL schema, created by a Flyway file.
+- **New shared module `common-outbox`** (like `common-kafka`), plain `JdbcTemplate` — no JPA entity, so no
+  entity-scan setup in every service, and the insert joins the business transaction automatically.
+- **The relay sends exactly what the service sends today** (it rebuilds the event and uses the service's
+  own Kafka settings), so **consumers do not change**.
+- **Two headers on every message:** the saved trace id (`X-Trace-Id` — the relay thread has no notepad) and
+  the outbox row id (`X-Event-Id` — 7 of our 13 event classes have no `eventId`).
+- **No database transaction is held open while talking to Kafka or to another service.**
+- **Inbox (duplicates):** the outbox delivers *at least once*. Notification, Ai-Service and UserService are
+  already safe; ReportingService's ledger is broken (issue 60) and is fixed in step 4.
+
+## Steps
+
+| Step | What | Status |
+|---|---|---|
+| 1 | `common-outbox` module + tests (H2 + embedded Kafka) | ✅ done 2026-10-12 — 24 tests pass |
+| 2 | IncidentService uses it (3 events) + Flyway `V3` | ✅ done 2026-10-13 — 9 tests pass (3 added during step 3) |
+| 3 | AuthService uses it (5 events) + Flyway `V3` | ✅ done 2026-10-13 — 16 tests pass |
+| 4 | ReportingService (resolved report + SLA events) + Flyway `V2` + **fix the inbox (issue 60)** | ✅ done 2026-10-13 — 15 tests pass |
+| 5 | Prove it on the real system (stop Kafka, create an incident, start Kafka, see it arrive) | ✅ done 2026-10-14 — tests A, B and C passed by hand (you ran them); D not run, see below |
+| 6 | Docs: CLAUDE.md, LLD notes, a notes page | ✅ done 2026-10-14 |
+
+**No new Docker image and no new third-party library** — everything needed is already in the services.
+
+### Step 1 result — ✅ done 2026-10-12
+
+A new shared module, **`common-outbox`** (`com.project.outbox:common-outbox:1.0.0`, Java 17 bytecode), listed in
+the root `pom.xml` (14 modules now). **No service uses it yet** — that is steps 2 to 4.
+
+| File | What it does |
+|---|---|
+| `OutboxWriter` | What a service will call instead of `kafkaTemplate.send(...)`. Saves the event as one row with `JdbcTemplate`, in the transaction that is already open. **Refuses to run outside a transaction.** Saves the request's trace id too |
+| `OutboxRelay` | One round: **claim** up to 50 `NEW` rows (short transaction) → **send** each and wait for Kafka's ack (**no transaction open**) → `SENT`. Kafka down → back to `NEW` and stop the round (keeps the order). Broken message → `FAILED`, carry on. Also: puts back rows left half-sent by a crash, deletes `SENT` rows after 7 days, warns if events pile up |
+| `OutboxScheduler` | Runs a round every second on its **own thread** (`outbox-relay`), so it never delays a service's other scheduled jobs. A round can never throw (one throw would stop it for good) |
+| `OutboxAutoConfig` | Switches all of this on by itself in a service that has a database, transactions and Kafka. Runs after Spring Boot's own Kafka/JDBC setup. Does **not** add an `ObjectMapper` bean (that would replace the service's own) |
+| `OutboxProperties` | Settings under `outbox.*`; every one has a default |
+| `OutboxStatus`, `OutboxHeaders` | The four states (`NEW`, `SENDING`, `SENT`, `FAILED`) and the `X-Event-Id` header name |
+| `outbox/outbox_event_mysql.sql` | The table. Each service copies it into its own Flyway file; the tests run this exact file |
+
+**Tests (24):** writer 6, relay 10 (real embedded Kafka), auto-config 5, scheduler 1, and **2 that use real JPA +
+`jakarta.transaction.Transactional`**, like our services: commit → both rows saved; exception → **neither** saved.
+One relay test proves the message is **byte-for-byte what a direct send produces today** (same JSON, same
+`__TypeId__` header), so consumers will not need to change.
+
+**Checked that the tests can fail:** the "stop the round when Kafka is down" rule was broken on purpose; the test
+caught it (`expected 0 attempts on the 2nd event, was 1`), then the code was restored and rebuilt.
+
+**Dependencies:** nothing new for the services. The module's own test-only extras: `spring-kafka-test`,
+`spring-boot-starter-data-jpa`, `spring-boot-starter-json`, and `h2` (pinned to 2.2.224, already in the local
+Maven cache).
+
+### Step 2 result — ✅ done 2026-10-13
+
+IncidentService's three events (`incident.created`, `incident.assigned`, `incident.status.updated`) now go
+through the outbox. **No direct `kafkaTemplate.send` is left in IncidentService.**
+
+```
+BEFORE:  check user (Feign) -> save incident (committed at once) -> kafkaTemplate.send   <- lost if crash/Kafka down
+AFTER:   check user (Feign) -> [ BEGIN  save incident + save outbox row  COMMIT ] -> relay sends ~1 s later
+```
+
+| File | What changed |
+|---|---|
+| `pom.xml` | + `common-outbox`; + `h2` (tests only) |
+| `db/migration/V3__outbox_event.sql` | **new** — the outbox table, an exact copy of the module's SQL (checked with `diff`) |
+| `kafka/producer/IncidentEventProducer.java` | same 3 methods, same topics and keys, but they call `outboxWriter.save(...)` instead of `kafkaTemplate.send(...)` |
+| `service/IncidentService.java` | `CreateIncident`, `AssignIncident`, `updateIncidentStatusBasedOnRole`: the save + the event are wrapped in **one `transactionTemplate.execute(...)`**. Every UserService call stays **before** it, outside any transaction |
+| `src/test/.../service/IncidentServiceOutboxTest.java` | **new**, 5 tests on the real service code (H2 + fake UserService, no Kafka) |
+| `src/test/.../OutboxWiringTest.java` | **new**, 1 test: the whole service starts with the outbox on (relay running) |
+
+**Tests (6):** create → incident + one `NEW` row (topic, key = incident id, type, payload); **the event insert
+fails → the incident is not saved either**; assign → `incident.assigned` row; resolve → `incident.status.updated`
+row carrying the root cause; an inactive user → nothing saved. Every test also checks that **UserService was
+called with no transaction open**.
+
+**Checked that the tests can fail:** the incident save was moved outside the transaction on purpose (the old
+behaviour). The test caught it: *"both or neither: no incident without its event — expected 0 but was 1"*. Code
+restored and re-tested.
+
+**Not changed on purpose (separate known issues):** the root cause wiped on every status change (issue 3), the
+double UserService call in assign (issue 38), the missing ownership check on assign (issue 56).
+
+**You need to do:** nothing by hand for the table — Flyway creates it at the next start (your still-pending `V2`
+runs first, then `V3`). Reload Maven in IntelliJ (new dependency).
+
+### Step 2, one more check added during step 3
+
+`IncidentEventsOverKafkaTest` (3 tests, new): each real IncidentService event goes into the outbox, through the
+real relay, into a real embedded Kafka, and is read back the way Reporting / Notification / Ai read it. All 3
+arrive as the same object (including `IncidentStatusUpdatedEvent`, which has capital-letter fields). Step 2's
+own tests only looked at the saved rows; this one proves the relay can **rebuild** the real classes.
+
+### Step 3 result — ✅ done 2026-10-13
+
+AuthService's five events (`user.registered`, `user.Updated`, `user.logged-in`, `user.logged-out`,
+`roles.update`) now go through the outbox. **No direct `kafkaTemplate.send` is left in AuthService.**
+
+```
+BEFORE:  save user -> kafkaTemplate.send  (inside @Transactional, BEFORE the commit)   <- ghost event OR lost event
+AFTER:   [ BEGIN  save user change + save outbox row  COMMIT ] -> relay sends ~1 s later
+```
+
+| File | What changed |
+|---|---|
+| `pom.xml` | + `common-outbox`; test only: + `h2`, + `spring-kafka-test` |
+| `db/migration/V3__outbox_event.sql` | **new** — an exact copy of the module's table SQL (checked with `diff`) |
+| `UserRegisteredEventProducer`, `UserUpdatedEventProducer` | `outboxWriter.save(...)` instead of `kafkaTemplate.send(...)` |
+| `UserLoggedInEventProducer`, `UserLoggedOutEventProducer` | the same, **and the class-level `@Transactional` is removed** (see below) |
+| `RoleUpdatedEventProducer` | the same, plus a new `userId` parameter, used as the Kafka key |
+| `LogoutUserService` | both methods run in a `transactionTemplate` (token version + event row together). It **joins** the caller's transaction when there is one |
+| `UpdateRoleService` | the roles change, the forced logout and both events are now **one** transaction. The user is loaded **inside** it |
+
+**Kafka keys:** `user.registered` and `roles.update` used to be sent with **no key**. Both are keyed by the user
+id now, so all of one user's events stay in order (this closes the ordering gap noted in the LLD).
+
+**Why the two `@Transactional` annotations on the producers had to go:** with the annotation on the producer
+class, a caller **without** a transaction would get a **separate** one started just around the outbox insert.
+`OutboxWriter` sees "a transaction is open" and does not complain, but the user change and its event are no
+longer saved together. Without the annotation, `OutboxWriter` refuses loudly instead.
+
+**Found while doing this (reported, and fixed because it sits inside the new transaction):**
+`UpdateRoleService` loaded the user **before** its work, then saved that same object **after** the forced logout
+had raised the token version — which writes the **old** token version back. It only worked because Spring's
+open-session-in-view hands back the same object (the same hidden dependency as known issue 1). Now the user is
+loaded inside the transaction, so it is correct with or without that setting. Proved: undoing the fix makes a
+test fail with "tokens are revoked, and the bump was not overwritten — expected 1 but was 0".
+
+**Tests (16):**
+
+| Class | Count | What it proves |
+|---|---|---|
+| `AuthServiceOutboxTest` | 10 | each of the 5 events: the change + one row saved together, topic and key right; **if the event row cannot be saved, the change is not saved either** (signup, logout, roles); wrong password and a taken username save no event; the roles change is all-or-nothing, including the forced logout |
+| `AuthEventsOverKafkaTest` | 5 | each real event, through the real relay and a real embedded Kafka, is read back (like UserService) as the **same object** |
+| `OutboxWiringTest` | 1 | the whole AuthService starts with the outbox on and the relay running |
+
+**Checked that the tests can fail:** (1) the logged-out event was moved outside the transaction → "both or
+neither: the token version did not move, expected 0 but was 1". (2) The load-inside fix was undone → the roles
+test failed as above. Both files restored.
+
+**Not changed on purpose (separate known issues):** the account lockout that never triggers (issue 55 — note the
+login still *rolls back* on a wrong password, which is why no event is saved then), the password change that works
+only by luck (issue 1, `ChangePasswordService` is untouched), `@PreAuthorize` inert (issue 10).
+
+**You need to do:** nothing by hand for the table — Flyway creates it at the next start. Reload Maven in IntelliJ.
+
+### Step 4 result — ✅ done 2026-10-13
+
+ReportingService's five events (`Incident-Resolved-Report-Topic` and the 4 SLA topics) now go through the
+outbox. **No `KafkaTemplate` is left in ReportingService's code.** And the inbox (known issue 60) is fixed.
+
+```
+LISTENER  BEFORE: [ BEGIN save report ... kafkaTemplate.send ... COMMIT ]  <- sent even if the commit then failed
+          AFTER:  [ BEGIN save report + save outbox row COMMIT ] -> relay sends ~1 s later
+
+SCHEDULER BEFORE: send event -> mark "published" (no transaction)          <- known issue 22
+          AFTER:  per page of 100: [ BEGIN save outbox rows + mark "published" COMMIT ]
+```
+
+| File | What changed |
+|---|---|
+| `pom.xml` | + `common-outbox`; test only: + `h2`, + `spring-kafka-test` |
+| `db/migration/V2__outbox_event.sql` | **new** — an exact copy of the module's table SQL (checked with `diff`). V2 because this service only had V1 |
+| `IncidentResolvedReportEventProducer`, `SLA_BreachedEventProducer`, `SLA_BreachingRiskEventProducer` | `outboxWriter.save(...)` instead of `kafkaTemplate.send(...)`. Same methods, topics and keys |
+| `IncidentEventConsumer` | no code change, one comment. It already had `@Transactional`, so the event row now joins that transaction |
+| `SLA_BreachedSchedular` | each page of 100 is **one** `transactionTemplate` transaction: event rows + "published" flags, together |
+| `SLA_BreachingRiskSchedular` | each page of 50 is one transaction: new risk level + its event row, together |
+| `IdempotencyService` | **fix for issue 60:** `existsById` first. A repeat now really is skipped |
+
+**Issue 60, test first.** The new tests were run on the OLD `IdempotencyService` first. 3 failed, showing the bug
+on the real code: the same `assigned` event twice → workload +2; the same `RESOLVED` event twice → Ai-Service told
+twice; a late repeat of `created` → the report reset to OPEN. After the fix, all 3 pass.
+
+**Issue 22 is closed:** the flag and the event can no longer disagree. If the event row cannot be saved, the flag
+stays "not published" and the next run tries again (tested).
+
+**Tests (15):**
+
+| Class | Count | What it proves |
+|---|---|---|
+| `service/ReportingOutboxTest` | 9 | the real listener and both real schedulers: RESOLVED → report + 1 row; the row cannot be saved → nothing saved and the event is **not** marked handled, so Kafka's retry works; issue 60 (3 tests); breach flag + event together, no repeat on the next run; risk level + event together, no repeat |
+| `ReportingEventsOverKafkaTest` | 4 | each of the 3 event classes, through the real relay and a real embedded Kafka, arrives as the **same object**; plus the finding below |
+| `OutboxWiringTest` | 2 | the whole service starts with the outbox on; the 3 real SLA timers run and take their ShedLock lock |
+
+**Checked that the tests can fail:** (1) issue 60 fix undone → 3 tests fail; (2) breach page run without a
+transaction → 2 tests fail; (3) risk page without a transaction → 1 test fails. All files restored and re-tested.
+
+**Found while doing this (reported, NOT fixed — new known issue 65):** every consumer's `application.properties`
+says the trusted-packages check is "starts with", so `com.project.events` "also covers"
+`com.project.events.enumsUsedByEvents`. **It does not** — Spring Kafka matches the package exactly. A reader with
+today's setting rejects `SlaBreachingRiskEvent`. No harm today (nobody reads the SLA topics, issue 18), but the first
+SLA-risk consumer will need its package added. `todaysTrustedSettingRejectsTheRiskEvent` proves it.
+
+**Test-only file:** `src/test/resources/shedlock_for_tests.sql` (the `shedlock` table, for the wiring test). It is
+not in the jar (checked).
+
+**Not changed on purpose (separate known issues):** workload counting the wrong engineer (62), `daily_metrics`
+never written (61), CRITICAL with no SLA (59), test SLA values (19), the hardcoded ShedLock name (34).
+
+**You need to do:** nothing by hand for the table — Flyway creates it at the next start. Reload Maven in IntelliJ.
+
+### Step 5 result — ✅ done 2026-10-14 (you ran it by hand on the real system)
+
+The tests so far used a fake database and a small Kafka made inside the test. Step 5 used the **real** setup:
+real MySQL, the real Kafka in Docker, the real services and the gateway. I gave a plan; **you** ran it and
+told me the result. I did not see the tables myself (I have no database login), so these results are your report.
+
+| Test | What you did | Result |
+|---|---|---|
+| **A. Normal case** | login, create an incident through the gateway, look at `outbox_event` and the report | ✅ worked: row `NEW` then `SENT`, and the report appeared in ReportingService |
+| **B. Kafka down** | `docker stop kafka`, create an incident, look at the row, `docker start kafka` | ✅ worked: the request still succeeded, the row waited, and after Kafka came back it was sent and arrived |
+| **C. Service restart while Kafka is down** | same, and restart IncidentService before starting Kafka | ✅ worked: the waiting row survived the restart and was sent |
+| **D. SLA timers** (optional) | create a HIGH incident, leave it unassigned, wait ~2 minutes | ⬜ **not run by hand.** Covered by the automated tests only (`ReportingOutboxTest`, `OutboxWiringTest`) |
+
+**What this proves that the tests could not:** the real Flyway migrations create the table; the real relay thread
+starts inside the real services; a real Kafka outage loses nothing; and a service restart loses nothing. This is
+the main promise of the outbox, and it holds.
+
+**What it does not prove yet:**
+- **Test D** (the SLA timers on the real system), and the **inbox on the real system** (issue 60 was proved by
+  tests only; a real repeat is hard to cause by hand).
+- **Ai-Service starting up.** Issue 50 (the `KafkaTemplate` that Boot's default was hidden by) is now moot for
+  ReportingService (its producers no longer inject one, and it ran in this test). Ai-Service still injects one
+  in `AiResponseProducer`; if you saw it start fine, issue 50 can be closed.
+
+### Step 6 result — ✅ done 2026-10-14
+
+| File | What changed |
+|---|---|
+| `notes/outbox-pattern.md` | header and contents updated; sections 5 and 19 corrected; **new** sections 24 (the real-system proof), 25 (what to do when something looks wrong: a checklist with the SQL), 26 (how to connect a NEW service, in order), 27 (what the outbox does NOT do) |
+| `CLAUDE.md` | outbox paragraph says "proved on the real system"; issue 50 note; a new working agreement with the checklist for connecting a service; module row |
+| `notes/LLD/LLD-overview.md`, `LLD-improvements.md` | the "outbox is missing" text now says it is done (history kept) |
+| `PROGRESS.md` | this section |
+
+**Left for a later time (not part of the outbox):** the SLA topics still have no reader (issue 18, phase 3);
+`ai.classification.result` still uses a direct send, but it is switched off with the classifier (issue 17); the
+trusted-packages finding (issue 65).
+
+**You need to do:** commit steps 4–6 (message below), and run test D if you want that last proof.
+
+---
+
+# Track C (rest) and Track D — not decided yet
 
 You mentioned these but we never discussed what is in them. **Do not guess.** Ask first.
+
 
 ---
 
@@ -2009,3 +2439,24 @@ error-handling split; §9 gets 2 new resolved issues (the blame bug, and the sti
 `notes/LLD/LLD-APIGateway.md` and `LLD-overview.md` updated: the rate limiter is added to the
 filter-chain diagram and the resilience table; the error-responses section is rewritten to explain
 the split between the filter's own errors and `GatewayExceptionHandler`'s.
+
+---
+
+## 2026-09-30 — C1 done (logging and trace ids)
+
+Full list is in the C1 section above ("Files changed in C1, all together"). Short version:
+
+| Area | What changed |
+|---|---|
+| New module `common-trace` | `TraceId` (shared name + safety rule + id maker) and `TraceIdLoggingDefaults` (fills Spring Boot's log-pattern slot). Root `pom.xml` now lists 13 modules |
+| `common-kafka` | Producer + consumer interceptors carry the trace id inside Kafka messages. Auto-config wires them in. **Bug fix:** `KafkaErrorHandlingAutoConfig` now runs after `KafkaAutoConfiguration`, so its dead-letter templates no longer hide Boot's default `kafkaTemplate` |
+| `common-web` | `TraceIdFilter` uses `TraceId`; 13 hand-written `[id]` prefixes removed from `GlobalExceptionHandler` |
+| APIGateway | `TraceIdGatewayFilter` (order -3, new). All gateway filters + `GatewayErrorWriter` read the id from it. 7 new tests (53 total) |
+| 5 services | 38 `println` / `printStackTrace` calls became `log.debug`; only user ids are logged |
+| AuthService, IncidentService | `pom.xml` gets `common-kafka` |
+
+**Verification:** 108 tests pass (common-trace 8, common-web 19, common-kafka 28, gateway 53); a real
+embedded Kafka broker test proves one id survives send, receive, forward and dead-letter; full
+13-module build passes.
+
+**Committed by the user as `b2c7c10`.** Not yet run against the real system (Kafka + all services).

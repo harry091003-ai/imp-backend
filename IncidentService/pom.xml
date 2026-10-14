@@ -93,6 +93,20 @@
             <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Tests only: a tiny in-memory database (MySQL mode), so the outbox tests can run the real
+             IncidentService code without a real MySQL. Version = the one already in the local cache. -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <version>2.2.224</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Tests only: a real Kafka broker started inside the test (IncidentEventsOverKafkaTest). -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
 <!--        <dependency>-->
 <!--            <groupId>com.example</groupId>-->
 <!--            <artifactId>AuthService</artifactId>-->
@@ -127,6 +141,16 @@
         <dependency>
             <groupId>com.project.kafka</groupId>
             <artifactId>common-kafka</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+
+        <!-- Outbox step 2: events are saved in the SAME database transaction as the incident and
+             sent to Kafka a moment later by a background relay. So an event can never be lost
+             between "incident saved" and "event sent". Auto-configures itself. The table comes
+             from Flyway V3__outbox_event.sql. -->
+        <dependency>
+            <groupId>com.project.outbox</groupId>
+            <artifactId>common-outbox</artifactId>
             <version>1.0.0</version>
         </dependency>
 

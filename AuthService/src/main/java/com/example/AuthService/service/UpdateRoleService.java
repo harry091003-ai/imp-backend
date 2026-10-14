@@ -18,6 +18,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.bind.annotation.RequestBody;
 
 import java.util.Set;
@@ -30,11 +31,15 @@ public class UpdateRoleService {
     private final RoleRepository roleRepository;
     private final RoleUpdatedEventProducer roleUpdatedEventProducer;
 private final LogoutUserService logoutUserService;
-    public UpdateRoleService(UserRepository userRepository, RoleRepository roleRepository, RoleUpdatedEventProducer roleUpdatedEventProducer, LogoutUserService logoutUserService) {
+// Outbox step 3: runs "roles + forced logout + both events" as ONE short transaction.
+private final TransactionTemplate transactionTemplate;
+    public UpdateRoleService(UserRepository userRepository, RoleRepository roleRepository, RoleUpdatedEventProducer roleUpdatedEventProducer, LogoutUserService logoutUserService,
+                             TransactionTemplate transactionTemplate) {
         this.userRepository = userRepository;
         this.roleRepository = roleRepository;
         this.roleUpdatedEventProducer = roleUpdatedEventProducer;
         this.logoutUserService=logoutUserService;
+        this.transactionTemplate = transactionTemplate;
 
     }
     public ResponseEntity<UserRoleResponseDTO> UpdatingUserRoles(String username, @RequestBody @Valid UpdateUserRolesRequestDTO requestDTO) {
@@ -58,25 +63,40 @@ private final LogoutUserService logoutUserService;
                 .collect(Collectors.toSet());
         // C1 step 1: removed System.out.println of the Role objects ("for just checking").
         // The outcome is logged once below, after the save.
+        // Outbox step 3: this change used to be THREE separate writes (the roles, the forced logout,
+        // and the Kafka event) with no transaction around them. A crash in between could change the
+        // roles but never tell UserService. Now it is ONE transaction: the new roles, the token
+        // revocation (and its logged-out event) and the roles.update event are all saved, or none.
+        // LogoutUserByAdmin has its own transactionTemplate: inside this one it JOINS it.
+        User updateduser = transactionTemplate.execute(status -> {
+        // Re-load the user INSIDE the transaction. The `user` above was read before it. LogoutUserByAdmin
+        // below raises the token version on the user it loads; saving the OLD `user` object afterwards
+        // would write the old token version back and silently undo the logout. It only worked before
+        // because Spring's open-session-in-view happens to hand back the same object (the same hidden
+        // dependency as known issue 1). One user object inside one transaction works either way.
+        User target = userRepository.findById(user.getUserid())
+                .orElseThrow(() -> new NotFoundException("USER_NOT_FOUND", "User not found: " + username));
 //        assigning the new roles to User
-        user.setRoles(roles);
+        target.setRoles(roles);
 
 // then that user also logged out by admin
-        logoutUserService.LogoutUserByAdmin(user.getUserid());
+        logoutUserService.LogoutUserByAdmin(target.getUserid());
 
 //            saving to database
-        User updateduser = userRepository.save(user);
+        User saved = userRepository.save(target);
 
         // C1 step 1: this line used to be Logger.getLogger("Now start preparing..."), which logs
         // NOTHING - getLogger() only creates a logger whose name is that sentence. Now a real line.
-        log.debug("Roles saved for user {}: {}. Publishing roles.update event", updateduser.getUserid(),
+        log.debug("Roles saved for user {}: {}. Saving roles.update event to the outbox", saved.getUserid(),
                 requestDTO.getRole());
-// Updating Roles in UserService Microservice also, using kafka
-        UpdatingRoleEvent updatingRoleEvent= UpdatingRoleEvent.builder().username(user.getUsername())
-                .role(user.getRoles().stream().map((role -> role.getRolename().name())).collect(Collectors.toSet()))// convert role from RoleName type  to String type
+// Updating Roles in UserService Microservice also: the event goes into the outbox (same transaction)
+        UpdatingRoleEvent updatingRoleEvent= UpdatingRoleEvent.builder().username(target.getUsername())
+                .role(target.getRoles().stream().map((role -> role.getRolename().name())).collect(Collectors.toSet()))// convert role from RoleName type  to String type
                 .build();
-        //publish event
-      roleUpdatedEventProducer.publishUpdatedRoleEvent(updatingRoleEvent);
+        //save the event (key = the user id, so it stays in order with that user's other events)
+      roleUpdatedEventProducer.publishUpdatedRoleEvent(saved.getUserid(), updatingRoleEvent);
+      return saved;
+        });
 
 
         return ResponseEntity.ok(UserRoleResponseDTO.builder().

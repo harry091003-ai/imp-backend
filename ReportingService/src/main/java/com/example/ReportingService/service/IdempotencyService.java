@@ -24,6 +24,17 @@ public class IdempotencyService {
     private  final ProcessedEventRepository processedEventRepository;
 
     public void isDuplicate(UUID eventId) {
+        // FIX for known issue 60 (Outbox step 4, 2026-10-13): look first, THEN save.
+        // The save below never threw for a repeat. ProcessedEvent's id is set by us (not by the database), so
+        // Spring Data's save() does a "merge": it finds the old row and simply UPDATES it - no error, so the
+        // listener handled the same event again (workload +1 twice, Ai-Service told twice, report reset to OPEN).
+        // Proved by ReportingOutboxTest (3 tests failed before this line, pass after it).
+        // Two copies of one event arriving at the SAME moment is still safe: both see "not there", both insert,
+        // and the second insert breaks the primary key when its transaction commits -> that listener fails ->
+        // Kafka retries it -> this check now finds the row and skips it.
+        if (processedEventRepository.existsById(eventId)) {
+            throw new DataIntegrityViolationException("Entry with same eventId already exist in  processedEvent table");
+        }
         ProcessedEvent processedEvent=ProcessedEvent.builder()
                 .eventId(eventId)
                 .processedAt(LocalDateTime.now())//Here for ProcessedAt , Always store: when system processed event not when event happened
