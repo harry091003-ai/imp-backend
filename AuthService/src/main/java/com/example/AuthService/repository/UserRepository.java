@@ -2,7 +2,11 @@ package com.example.AuthService.repository;
 
 import com.example.AuthService.entity.RoleName;
 import com.example.AuthService.entity.User;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.util.Optional;
@@ -20,4 +24,11 @@ public interface UserRepository extends JpaRepository<User,UUID>{
     public Boolean existsByUsername(String roleName);
     public Boolean existsByEmail(String email);
     Optional<User> findByUsername(String username);
+
+    // Issue 55 fix (2026-10-14): read the user AND lock the row until the transaction ends.
+    // Two wrong passwords sent at the same moment then wait for each other, so both are counted
+    // (without the lock, both could read 3 and both write 4).
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT u FROM User u WHERE u.email = :email")
+    Optional<User> findByEmailForUpdate(@Param("email") String email);
 }

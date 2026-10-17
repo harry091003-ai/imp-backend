@@ -33,6 +33,7 @@ Last updated: 2026-09-30
 | C1 | Logging and trace ids | ✅ Done — steps 1, 1b, 2, 2b, 3 on 2026-09-30 (step 4, Zipkin/Prometheus, left for later) |
 | LLD re-check | Every LLD file read against the code, 3 doubtful claims tested | ✅ Done — 2026-10-01 (10 new issues, 5 wrong claims corrected) |
 | Outbox (Phase 2) | Events can no longer be lost between "saved" and "sent" | ✅ Done — all 6 steps (module 2026-10-12; 3 services 2026-10-13; proved on the real system and documented 2026-10-14) |
+| Lockout fix (Phase 1) | 5 wrong passwords really lock the account, and the lock ends after 15 minutes (issues 55 + 6) | ✅ Done — 2026-10-14, test first (not yet tried by hand on the real system) |
 | Track C (rest) | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
 
@@ -2124,6 +2125,59 @@ the main promise of the outbox, and it holds.
 trusted-packages finding (issue 65).
 
 **You need to do:** commit steps 4–6 (message below), and run test D if you want that last proof.
+
+---
+
+# Lockout fix — 5 wrong passwords really lock the account (Phase 1, 2026-10-14)
+
+**The problem (known issue 55):** `LoginUserService` is `@Transactional`. On a wrong password it added 1 to
+`failedLoginAttempts`, saved it, and then **threw** the 401. A thrown error rolls the transaction back, so the
+save was undone every time. The counter stayed 0 and the account never locked.
+
+**The second problem (known issue 6):** if an account ever did get locked, nothing unlocked it. Fixing only
+issue 55 would have let anyone lock any user out forever by typing 5 wrong passwords for their email.
+
+```
+BEFORE: [ BEGIN  count +1, save  ->  throw 401  ->  ROLLBACK ]           -> counter still 0
+AFTER:  [ BEGIN  login ... [ BEGIN own  count +1, save  COMMIT ]  throw 401  ->  ROLLBACK ]
+                                  ^ kept: it finished before the throw
+```
+
+**Test first:** `AccountLockoutTest` was written and run on the OLD code first. It failed exactly as expected:
+3 wrong passwords → "expected 3 but was 0"; 5 wrong → "expected 5 but was 0". That is issue 55, proved on the real
+AuthService code for the first time (before, only in a copy).
+
+| File | What changed |
+|---|---|
+| `service/LoginAttemptService.java` | **new.** `recordFailedLogin(email)` counts one wrong password in its **own** transaction (`REQUIRES_NEW`), so the login's rollback cannot undo it. `isLockedNow(user)` says if the lock is still running. It has to be a separate class: Spring only applies `@Transactional` to calls that come from outside the class |
+| `service/LoginUserService.java` | the `catch` calls `recordFailedLogin` instead of saving by itself; the lock check uses `isLockedNow`; a right password also clears `lockedUntil` |
+| `entity/User.java` | new field `lockedUntil` (when the lock ends) |
+| `repository/UserRepository.java` | new `findByEmailForUpdate` — reads the user and locks the row, so two wrong passwords at the same moment are both counted |
+| `db/migration/V4__add_locked_until.sql` | **new** — adds the `locked_until` column |
+| `application.properties` | `auth.lockout.max-attempts=5`, `auth.lockout.lock-minutes=15` |
+
+**The rules now:**
+1. Each wrong password: +1 (kept, even though the login fails).
+2. At 5: locked until now + 15 minutes. Even the right password gets `ACCOUNT_LOCKED` until then.
+3. After the 15 minutes: the user may try again, and the counter starts from 0 (one more wrong password does not lock again at once).
+4. A right password: counter 0, unlocked.
+5. **An account locked before this fix** (locked, but no end time): treated as finished, so it is released. Without this, those accounts would stay locked forever.
+
+**Tests (8, new; AuthService now has 24):** each wrong password counted; 5 lock it for about 15 minutes; locked
+rejects even the right password (and never checks it); after the time the right password works and everything
+resets; after the time one wrong password does not re-lock; an old lock with no end time is released; a right
+password resets the counter; an unknown email gets the same answer and changes nothing.
+
+**Checked that the tests can fail:** the "own transaction" (`REQUIRES_NEW`) was removed on purpose → 4 tests failed
+with the counter back at 0. Restored and re-tested. All 24 AuthService tests pass; the jar has `V4` and no test files.
+
+**Not changed on purpose:** UserService still shows `accountLocked`/`failedLoginAttempts` that are never updated
+(issue 63); the `ACCOUNT_LOCKED` answer still tells a caller that the email exists (it did before too); there is no
+admin "unlock now" button (the time-based unlock needs no person). The gateway's per-IP login limit is unchanged.
+
+**You need to do:** nothing by hand for the column — Flyway runs `V4` at the next start. If you want, try it on the
+real system: 5 wrong logins, then the right one → `ACCOUNT_LOCKED`; then
+`SELECT failed_login_attempts, account_locked, locked_until FROM users WHERE email = '...'`.
 
 ---
 

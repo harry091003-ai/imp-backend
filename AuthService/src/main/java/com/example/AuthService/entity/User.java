@@ -62,6 +62,11 @@ public class User {
     @Column(nullable = false, columnDefinition = "TINYINT(1)")
     private Boolean accountLocked = false;
 
+    // Issue 55/6 fix (2026-10-14): WHEN the lock ends. After this time the user may log in again.
+    // null = no end time. Column added by Flyway V4__add_locked_until.sql.
+    @Column(nullable = true)
+    private LocalDateTime lockedUntil;
+
 //    for initially when user register the account is not enabled.
     @Builder.Default
     @Column(nullable = false)

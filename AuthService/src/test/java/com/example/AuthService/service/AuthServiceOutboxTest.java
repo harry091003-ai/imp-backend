@@ -68,7 +68,7 @@ import static org.mockito.Mockito.doThrow;
         "spring.sql.init.schema-locations=classpath:outbox/outbox_event_mysql.sql"
 })
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import({RegisteringUserService.class, LoginUserService.class, LogoutUserService.class,
+@Import({RegisteringUserService.class, LoginUserService.class, LoginAttemptService.class, LogoutUserService.class,
         UpdateCredentialsService.class, UpdateRoleService.class,
         UserRegisteredEventProducer.class, UserLoggedInEventProducer.class, UserLoggedOutEventProducer.class,
         UserUpdatedEventProducer.class, RoleUpdatedEventProducer.class,

@@ -74,7 +74,7 @@ to `spring-boot-starter-parent`, so the root pom's `<properties>` are decorative
 **AuthService** (`users`, `roles`, `user_roles`) — credentials owner.
 `User`: `userid` (UUID, `GenerationType.UUID`), username, email, **password (BCrypt)**,
 `createdAt/updatedAt/lastLoginAt/lastLogoutAt/passwordUpdatedAt`, `failedLoginAttempts`,
-`accountLocked`, `enabled`, **`TokenVersion`** (drives JWT revocation), `Set<Role>` (`@ManyToMany`).
+`accountLocked`, `lockedUntil` (when the lock ends, Flyway `V4`, 2026-10-14), `enabled`, **`TokenVersion`** (drives JWT revocation), `Set<Role>` (`@ManyToMany`).
 
 **UserService** (`users`, `roles`, `user_roles`) — profile mirror, populated from Kafka.
 Same `User` shape **minus password**, plus `status` (`ACTIVE/INACTIVE/SUSPENDED`) and a
@@ -430,8 +430,8 @@ folder, gitignored - see PROGRESS.md).
 
 **Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
 `common-web` 19, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
-Kafka + real JPA), `APIGateway` 53, `IncidentService` 9, `AuthService` 16 and `ReportingService` 15 (outbox:
-H2 + embedded Kafka + a full-start test each) = 172. ReportingService's wiring test uses a test-only
+Kafka + real JPA), `APIGateway` 53, `IncidentService` 9, `AuthService` 24 (16 outbox + 8 `AccountLockoutTest`)
+and `ReportingService` 15 (outbox: H2 + embedded Kafka + a full-start test each) = 180. ReportingService's wiring test uses a test-only
 `src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
 with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest` - the old `contextLoads()`
 still needs real MySQL/Kafka and would connect to them.
@@ -470,10 +470,10 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 5. `LogoutController.LogoutOfOwn` uses a bare `@RequestMapping("/user")` (accepts **every** HTTP
    verb, including GET); `LogoutController.LogoutAnyUser(User)` has **no mapping at all** and is
    unreachable.
-6. Account lockout has **no unlock path**: 5 failures set `accountLocked=true`; the pre-check
-   rejects before authentication, and the reset to `false` only runs after a successful login.
-   **But see issue 55: since Track A1 the failure counter is rolled back, so the lock normally never
-   gets set in the first place.**
+6. ~~Account lockout has **no unlock path**: 5 failures set `accountLocked=true`; the pre-check
+   rejects before authentication, and the reset to `false` only runs after a successful login.~~
+   **RESOLVED 2026-10-14** (with issue 55): a lock now ends after `auth.lockout.lock-minutes` (15), stored in
+   the new `users.locked_until` column. An old lock with no end time is treated as finished. No admin button.
 7. `RagController` uses `@GetMapping` with `@RequestBody` on both endpoints — GET-with-body is
    dropped by many clients and by gateways. **Still true as of Track B4 step 4** — both bodies are
    now validated (`@Valid`, `@NotBlank`/`@Size`), but the HTTP method itself is unchanged.
@@ -664,7 +664,12 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     Fix when wanted: add `common-trace` to the gateway and delete the gateway's copy. Check first: the
     module also fills the log-format `[id]` slot, which would then print an empty `[-]` on gateway lines
     (the gateway writes its own `[id]` by hand - issue 52).
-55. **Account lockout never triggers (found 2026-10-01 while re-reading the AuthService LLD).**
+55. **RESOLVED 2026-10-14, test first.** `AccountLockoutTest` failed on the old code ("expected 5 but was 0" -
+    the first proof on the real service). Fix: the new `LoginAttemptService.recordFailedLogin` counts a wrong
+    password in its **own** transaction (`REQUIRES_NEW`, row locked with `findByEmailForUpdate`), so the login's
+    rollback cannot undo it. 5 wrong → locked for 15 minutes (see issue 6). Not yet tried by hand on the real
+    system. The original entry, kept for the record:
+    **Account lockout never triggers (found 2026-10-01 while re-reading the AuthService LLD).**
     `LoginUserService` is `@Transactional` (jakarta, class level). On a wrong password it adds 1 to
     `failedLoginAttempts`, calls `save`, and then **throws** `UnauthorizedException` — a
     `RuntimeException`, so the transaction rolls back and the saved counter is undone. Reproduced in a
@@ -836,5 +841,9 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   gets an inbox that checks `existsById` first.
 - **`outbox.enabled=false` switches off the whole outbox, writer included** - a service that has producers using
   `OutboxWriter` would then fail to start. Use it only in a test that must not run the relay.
+- **A save that must survive a thrown error needs its own transaction, in ANOTHER class (issue 55).** Throwing a
+  `RuntimeException` (all of `common-web`'s exceptions are one) rolls back everything saved in that transaction.
+  Use `@Transactional(TxType.REQUIRES_NEW)` on a method of a separate bean, like `LoginAttemptService`. Calling
+  such a method from the same class does nothing: Spring only applies `@Transactional` to calls from outside.
 - **A `FAILED` outbox row is never retried by itself.** It means the message could not be built or sent (for
   example the event class was renamed or removed). Do not rename or move an event class while rows for it exist.

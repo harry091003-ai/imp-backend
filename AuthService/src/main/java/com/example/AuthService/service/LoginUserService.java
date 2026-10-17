@@ -32,13 +32,17 @@ public class LoginUserService {
     private final SecurityConfig securityConfig;
     private final UserRepository userRepository;
     private final UserLoggedInEventProducer userLoggedInEventProducer;
+    // Issue 55 fix: counts a wrong password in its OWN transaction (see LoginAttemptService for why).
+    private final LoginAttemptService loginAttemptService;
     public LoginUserService(AuthenticationManager authentication_manager,
-                            UserDetailsService TheuserDetailsService,UserRepository userRepository,SecurityConfig securityConfig,UserLoggedInEventProducer userLoggedInEventProducer){
+                            UserDetailsService TheuserDetailsService,UserRepository userRepository,SecurityConfig securityConfig,UserLoggedInEventProducer userLoggedInEventProducer,
+                            LoginAttemptService loginAttemptService){
         authenticationManager=authentication_manager;
         userDetailsService=TheuserDetailsService;
     this.securityConfig=securityConfig;
         this.userRepository=userRepository;
         this.userLoggedInEventProducer= userLoggedInEventProducer;
+        this.loginAttemptService = loginAttemptService;
     }
 
     public ResponseEntity<LoginResponseDTO> LoginUser(LoginFromDTO request) {
@@ -60,13 +64,10 @@ public class LoginUserService {
              catch (BadCredentialsException e) {
 //          setting the number of failed login attempts and updating it to the database and
 //          also locked the account if the failed login attempts is greater than or equal to 5 account will set to locked
-            User user=userRepository.findByEmail(request.getEmail());
-            if(user!=null){
-                user.setFailedLoginAttempts(user.getFailedLoginAttempts()+1);
-                if(user.getFailedLoginAttempts()>=5){
-                    user.setAccountLocked(true);}
-                userRepository.save(user);
-            }
+            // FIX for known issue 55 (2026-10-14): this used to change the counter HERE and save it, then throw
+            // below. The throw rolled back this method's transaction, so the save was undone every time and
+            // the account never locked. Now the counting runs in its OWN transaction, finished before we throw.
+            loginAttemptService.recordFailedLogin(request.getEmail());
             // Same message whether the email exists or not. Saying "email not registered"
             // would let anyone probe this endpoint to harvest a list of valid accounts.
             throw new UnauthorizedException("INVALID_CREDENTIALS", "Invalid email or password.");
@@ -92,6 +93,7 @@ public class LoginUserService {
         // resetting the failed login attempts to 0 and also make the unlock the account after successful login
         OurUser.setFailedLoginAttempts(0);
         OurUser.setAccountLocked(false);
+        OurUser.setLockedUntil(null);
 
     User updatedUser=    userRepository.save(OurUser);
 
@@ -124,9 +126,11 @@ public class LoginUserService {
                 // Same generic message as a wrong password - do not reveal which emails exist.
                 throw new UnauthorizedException("INVALID_CREDENTIALS", "Invalid email or password.");
             }
-            if(user.getAccountLocked()){
+            // Issue 6 fix (2026-10-14): a lock now ENDS. Locked only while the lock time has not passed yet;
+            // before, a locked account stayed locked forever (nothing ever unlocked it).
+            if(loginAttemptService.isLockedNow(user)){
                 throw new UnauthorizedException("ACCOUNT_LOCKED",
-                        "Account is locked due to multiple failed login attempts.");
+                        "Account is locked due to multiple failed login attempts. Try again later.");
             }
         }
     }
