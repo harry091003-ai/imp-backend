@@ -11,22 +11,12 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
 
 /**
- * Known issue 55 + issue 6 (2026-10-14): the account lockout.
- *
- * WHY THIS IS A SEPARATE CLASS
- * LoginUserService is @Transactional. On a wrong password it THROWS a 401, and a thrown error rolls the
- * whole transaction back - so the "+1 failed attempt" it had just saved was undone every time. The counter
- * stayed 0 and the lock never happened (proved by AccountLockoutTest before this fix).
- *
- * recordFailedLogin() runs in its OWN transaction (REQUIRES_NEW): it is saved and finished before the login
- * throws. The login's rollback can no longer undo it. It must be in another class: Spring only applies
- * @Transactional when the call comes from OUTSIDE the class.
- *
- * THE RULES
- *   - each wrong password: +1
- *   - at maxAttempts (5): locked until now + lockMinutes (15)
- *   - after that time: the user may try again, and the counter starts from 0
- *   - a right password: everything back to 0 (done in LoginUserService)
+ * Counts wrong passwords and locks the account (issues 55 and 6).
+ * Why a separate class: the login throws a 401, which rolls back the login's own transaction.
+ *   So the count is saved here, in its OWN transaction (REQUIRES_NEW), before that happens.
+ *   Spring only applies @Transactional to calls coming from another class.
+ * Rules: each wrong password +1; at 5 -> locked for 15 minutes; after that, counting starts again;
+ *   a right password -> back to 0 (done in LoginUserService).
  */
 @Service
 public class LoginAttemptService {

@@ -33,6 +33,10 @@ Last updated: 2026-09-30
 | C1 | Logging and trace ids | ✅ Done — steps 1, 1b, 2, 2b, 3 on 2026-09-30 (step 4, Zipkin/Prometheus, left for later) |
 | LLD re-check | Every LLD file read against the code, 3 doubtful claims tested | ✅ Done — 2026-10-01 (10 new issues, 5 wrong claims corrected) |
 | Outbox (Phase 2) | Events can no longer be lost between "saved" and "sent" | ✅ Done — all 6 steps (module 2026-10-12; 3 services 2026-10-13; proved on the real system and documented 2026-10-14) |
+| SLA notifications (Phase 3, log only) | SLA alerts are saved per person and visible with a GET call - no email | ✅ Done — all 7 steps 2026-10-17 to 2026-10-19 (the step 4 SQL runs at your next start) |
+| Testing guide (2026-10-19) | `notes/testing-in-our-project.md`: why / what / how / is it safe, with the proof re-run on every module | ✅ Written |
+| Option B (2026-10-19) | The 8 auto-generated `contextLoads()` tests no longer touch the real system | ✅ Done - "run all tests" is safe on every service (proof below) |
+| SLA values (Phase 1) | Real SLA times for all 4 priorities, CRITICAL included (issues 19 + 59) | ✅ Done — 2026-10-17, test first. Old rows are NOT recalculated (issue 66) |
 | Lockout fix (Phase 1) | 5 wrong passwords really lock the account, and the lock ends after 15 minutes (issues 55 + 6) | ✅ Done — 2026-10-14, test first (not yet tried by hand on the real system) |
 | Track C (rest) | Not decided yet | ❓ Need to discuss |
 | Track D | Not decided yet | ❓ Need to discuss |
@@ -2178,6 +2182,395 @@ admin "unlock now" button (the time-based unlock needs no person). The gateway's
 **You need to do:** nothing by hand for the column — Flyway runs `V4` at the next start. If you want, try it on the
 real system: 5 wrong logins, then the right one → `ACCOUNT_LOCKED`; then
 `SELECT failed_login_attempts, account_locked, locked_until FROM users WHERE email = '...'`.
+
+---
+
+# SLA values — real times for every priority (Phase 1, 2026-10-17)
+
+**The problem (known issues 19 and 59):** `SLAConfiguration` still held test values from development:
+MEDIUM had to be resolved in **50 seconds**, HIGH assigned in **30 seconds**, MEDIUM assigned in 40 seconds. `CRITICAL` had
+no rule, so its "default" gave a resolution time of **0 seconds**: every CRITICAL incident was breached the moment it was
+created. These numbers feed the breach timers, the SLA events and the engineer ranking.
+
+**The table you approved (2026-10-17):**
+
+| Priority | Must be assigned within | Must be resolved within |
+|---|---|---|
+| CRITICAL | 15 minutes | 4 hours |
+| HIGH | 1 hour | 1 day |
+| MEDIUM | 4 hours | 3 days |
+| LOW | 1 day | 7 days |
+
+**Test first:** `SLAConfigurationTest` (8 tests, plain Java, no database) was run on the old code first. All 8 failed, for
+example "expected 900 but was 3600" and "CRITICAL resolution: expected true but was false" (the 0 seconds).
+
+| File | What changed |
+|---|---|
+| `config/SLAConfiguration.java` | the agreed table, written with `Duration` (`Duration.ofHours(4).toSeconds()`) so the numbers can be read. Same method names and signatures. An unknown or missing priority now **throws** `IllegalArgumentException` instead of getting the old silent "0 seconds / 1 hour" |
+| `src/test/.../config/SLAConfigurationTest.java` | **new**, 8 tests |
+
+**The 8 tests:** the 4 assignment times; the 4 resolution times; more urgent = shorter (both); resolve is longer than assign
+(each priority); nothing is breached at creation (all above 0); every window is at least 1 minute (the risk timer divides by
+whole minutes, so 30 seconds gave NaN); an unknown priority fails clearly; a missing priority fails with the same error.
+
+**Checked that the tests can fail:** HIGH assignment was put back to 30 seconds on purpose → 3 tests failed. Restored, and
+all 23 ReportingService tests pass (15 outbox + 8 SLA). The jar has no test files.
+
+**Side effect, good:** the risk timer's "0 whole minutes → NaN" problem (LLD-ReportingService) cannot happen any more.
+
+**Decision made by me, tell me if you disagree:** an unknown priority throws. In the Kafka listener that means retry, then the
+dead-letter topic, where it can be seen. The other choice (use MEDIUM silently) is exactly the kind of quiet wrong data this
+fix removes. A new priority added in IncidentService must also be added to both SLA methods.
+
+**Not changed on purpose (new known issue 66):** old `incident_report` rows keep deadlines worked out from the old values.
+Old open incidents will be flagged as breached by the timer, and the engineer stats stay computed from the old numbers.
+Recomputing them is a separate decision (see LLD-improvements C5, part 2). The values are still in Java, not in
+`application.properties` (LLD-ReportingService gap 2).
+
+**You need to do:** nothing for the database. Decide what to do about the old rows (issue 66) before the SLA readers are built,
+because those readers would announce the old breaches.
+
+---
+
+# SLA notifications — saved and shown, NO email (Phase 3, started 2026-10-17)
+
+**Goal:** when an incident breaks (or is about to break) its SLA, the right people get a notification. **No real
+email for now** (your decision): each notification is a log line + a row in NotificationService's database, and a
+person can see their own with a GET call.
+
+**Who is notified (your decision, 2026-10-17):**
+- always the **creator** of the incident;
+- the **assigned engineer**, if there is one;
+- the **supervisor** of the assigned engineer - or, if nobody is assigned yet, of the creator;
+- the same person only once; anyone without a supervisor is simply skipped.
+
+**Old rows** (old notifications without a user id, old SLA deadlines) are left as they are (your decision).
+
+| Step | What | Status |
+|---|---|---|
+| 1 | NotificationService trusts the sub-folder of `SlaBreachingRiskEvent` (known issue 65) | ✅ done 2026-10-17 |
+| 2 | The 2 SLA events carry `createdBy` and `assignedTo`; ReportingService fills them in | ✅ done 2026-10-17 |
+| 3 | UserService also returns `supervisorId` for a user | ✅ done 2026-10-17 |
+| 4 | NotificationService Flyway `V2`: `recipient_id` column, the 4 SLA types, a `RECORDED` status, remove the old `CHECK (event_type between 0 and 7)` | ✅ done 2026-10-17 (code + tests; the SQL itself runs at your next start) |
+| 5 | 4 new listeners: find the people, one row + one log line each, skip a repeated message (`X-Event-Id`) | ✅ done 2026-10-17 |
+| 6 | The 3 existing incident listeners also save `recipient_id` (+ honest status and message - your option A) | ✅ done 2026-10-17 |
+| 7 | `GET /notifications/me?page&size` (only your own, newest first, with the total) + gateway route | ✅ done 2026-10-19 |
+
+### Step 1 result — ✅ done 2026-10-17
+
+**The problem (known issue 65):** every Kafka message carries its Java class name. The "trusted packages" setting lists
+the packages a service may build. The comment in 4 services said the check is "starts with", so `com.project.events`
+would also cover `com.project.events.enumsUsedByEvents`. It does not: Spring compares the package name **exactly**.
+`SlaBreachingRiskEvent` lives in that sub-folder, so the SLA "at risk" listeners of step 5 would have rejected every
+message and parked it in the dead-letter topic.
+
+**Test first:** `TrustedPackagesTest` (NotificationService, 5 tests, plain Java - no Kafka, no database, no Spring start)
+reads the **real** setting from `application.properties`, writes each event the way a producer does and reads it back
+the way our listeners do. On the old setting: 4 passed, and the risk event failed with "not in the trusted packages".
+
+| File | What changed |
+|---|---|
+| `NotificationService/.../application.properties` | `trusted.packages=com.project.events,com.project.events.enumsUsedByEvents`, and a correct comment |
+| `UserService`, `ReportingService`, `Ai-Service` `application.properties` | **comment only**: "exact match". Their setting stays the same on purpose - they do not read that event, so they should not trust that folder |
+| `NotificationService/src/test/.../kafka/TrustedPackagesTest.java` | **new**, 5 tests |
+| `ReportingService/src/test/.../ReportingEventsOverKafkaTest.java` | comment only: its old line "this test fails the day that changes" was wrong (it uses its own fixed value) |
+
+**The 5 tests:** the SLA risk event is accepted (the fix); the SLA breached event is accepted; the 3 incident events we
+read today are still accepted; **a class from any other package is still rejected** (the Track B2 safety rule); the setting
+is never `*`.
+
+**Checked:** all 5 pass after the fix; the jar holds the new setting and no test classes; ReportingService's Kafka test
+still passes (4).
+
+**You need to do:** nothing.
+
+### Step 2 result — ✅ done 2026-10-17
+
+**The problem:** the 2 SLA event classes carried only the incident id (plus the breach type, or the risk levels). A
+reader could not know **who** to tell.
+
+```
+BEFORE:  SLA_BreachedEvent { incidentId, SLA_BreachedType }
+AFTER:   SLA_BreachedEvent { incidentId, SLA_BreachedType, createdBy, assignedTo }
+         (the same 2 fields added to SlaBreachingRiskEvent)
+```
+
+**Test first:** 4 new tests in `ReportingOutboxTest`, one per SLA event type. Each runs the REAL timer, then reads the
+saved event's JSON from the outbox table. On the old code all 4 failed ("expected <the creator> but was <>").
+
+| File | What changed |
+|---|---|
+| `shared-events/.../SLA_BreachedEvent.java`, `.../enumsUsedByEvents/SlaBreachingRiskEvent.java` | + `createdBy`, `assignedTo` (UUID) |
+| `ReportingService/.../SLA_BreachedEventProducer.java`, `SLA_BreachingRiskEventProducer.java` | fill both from the report (it already had them) |
+| `ReportingService/src/test/.../ReportingOutboxTest.java` | + 4 tests (now 13) |
+| `ReportingService/src/test/.../ReportingEventsOverKafkaTest.java` | the round-trip events carry the new fields too, so the test proves they survive Kafka |
+
+**The 4 tests:** assignment breach → names the creator, `assignedTo` empty (nobody is assigned - that is why it
+breached); resolution breach → creator + engineer; assignment risk → creator; resolution risk → creator + engineer.
+
+**Checked that the tests can fail:** the `createdBy` line was removed from the resolution-breach producer on purpose →
+exactly that test failed ("expected <the creator> but was <null>"). Restored, rebuilt. ReportingService: 27 tests pass;
+NotificationService: 5 pass against the new `shared-events`.
+
+**Safe for old messages:** fields were only ADDED, nothing renamed. An SLA message already waiting in an outbox table
+(or in Kafka) is read with both new fields as null. Nobody reads these topics yet anyway (issue 18).
+
+**You need to do:** `shared-events` was re-installed into your local Maven cache (`mvn install`). Reload Maven in IntelliJ,
+so it sees the new fields.
+
+### Step 3 result — ✅ done 2026-10-17
+
+**The problem:** to tell the supervisor, NotificationService must know who it is. It asks UserService for people with
+`POST /internal/UserSpecificDetails/batch`, but the answer had only `userid`, `username` and `email`.
+
+```
+BEFORE:  { userid, username, email }
+AFTER:   { userid, username, email, supervisorId }     (supervisorId = null when the user has no supervisor)
+```
+
+**Test first:** `SupervisorInBatchTest` (UserService, 4 tests, H2) runs the REAL `GetBatchOfUsers_Credentials` and turns
+the result into JSON exactly like the HTTP answer - the JSON is what the other service receives. On the old code the 2
+"has a supervisor" tests failed ("expected <the supervisor id> but was <>"); the other 2 already passed (they check
+what must NOT change).
+
+| File | What changed |
+|---|---|
+| `UserService/.../dto/UserCredentialDTO.java` | + `supervisorId` |
+| `UserService/.../service/UserService.java` | `GetBatchOfUsers_Credentials` fills it: `user.getSupervisor() == null ? null : user.getSupervisor().getUserid()` |
+| `UserService/pom.xml` | + `h2` 2.2.224, **test only** (first real test in UserService) |
+| `NotificationService/.../dto/UserCredentialDTO.java` | + `supervisorId` (its copy of the same answer) |
+| `UserService/src/test/.../service/SupervisorInBatchTest.java` | **new**, 4 tests |
+| `NotificationService/src/test/.../dto/UserCredentialDtoTest.java` | **new**, 2 tests: the field is read; an answer WITHOUT it (an older UserService) still works |
+
+**The supervisor link is LAZY.** Asking a lazy link only for its id does not load the supervisor's row. Proved: the test
+calls the method with NO transaction open, where loading the row would crash (`LazyInitializationException`). It did not.
+
+**Checked that the tests can fail:** the line that fills `supervisorId` was removed on purpose → the 2 supervisor tests
+failed ("but was <null>"). Restored (byte-for-byte), rebuilt, 4 pass. The UserService jar has no H2 and no test classes.
+
+**Order of restarts does not matter:** NotificationService reads an answer without `supervisorId` as "no supervisor", and
+nothing reads the new field yet (that is step 5).
+
+**You need to do:** reload Maven in IntelliJ (UserService has a new test dependency).
+
+### Step 4 result — ✅ done 2026-10-17 (the SQL runs on your real database at the next start)
+
+**What changes in the `notification_log` table** (one new Flyway file, `V2__sla_notifications.sql`, ONE statement):
+
+| # | Change | Why |
+|---|---|---|
+| 1 | + column `recipient_id` (binary(16), like the other id columns) | to answer "show MY notifications" - only the email was saved before |
+| 2 | `event_type` list + `SLA_ASSIGNMENT_BREACHED`, `SLA_RESOLUTION_BREACHED`, `SLA_ASSIGNMENT_AT_RISK`, `SLA_RESOLUTION_AT_RISK` | MySQL refuses a word that is not in the list |
+| 3 | `status` list + `RECORDED` | honest status: saved and visible, no email sent |
+| 4 | DROP the old `CHECK (event_type between 0 and 7)` | it would refuse the new types (and maybe already `USER_UPDATED`) |
+| + | index `(recipient_id, created_at)` | "my newest notifications" stays fast |
+
+New words go **at the end** of each list (MySQL stores an enum as its position: the middle would change old rows).
+**One statement** = all or nothing (MySQL cannot roll back a table change). Old rows: unchanged, `recipient_id` = NULL.
+
+**Test first:** `NotificationMigrationV2Test` (6 tests, plain Java) reads the migration FILE and checks its rules,
+because the tests have no real MySQL. Before the file existed, all 6 failed. The rules: the database lists hold
+exactly the Java enum values; the old values keep their exact order (new ones only at the end); the CHECK is
+dropped; `recipient_id` is `binary(16)`; it is one single statement.
+
+**Files changed in step 4:**
+
+| File | New / changed | What |
+|---|---|---|
+| `NotificationService/src/main/resources/db/migration/V2__sla_notifications.sql` | **new** | the table change above |
+| `NotificationService/.../Entity/EventType.java` | changed | + the 4 SLA types |
+| `NotificationService/.../Entity/NotificationStatus.java` | changed | + `RECORDED` |
+| `NotificationService/.../Entity/NotificationLog.java` | changed | + `recipientId`, + the index |
+| `NotificationService/pom.xml` | changed | + `h2` 2.2.224, **test only** |
+| `NotificationService/src/test/.../Entity/NotificationMigrationV2Test.java` | **new** | 6 tests: the migration file's rules |
+| `NotificationService/src/test/.../Entity/NotificationLogStoreTest.java` | **new** | 4 tests (H2): the new types, status and field save and load; an old row without `recipient_id` still works; the duplicate guard (same event + same email) still holds; one event for 2 people = 2 rows |
+| `PROGRESS.md`, `CLAUDE.md`, `BUGS-TO-FIX-LATER.md` (E10), `notes/FLYWAY-NOTES.md`, `notes/LLD/LLD-NotificationService.md` | docs | |
+
+**Checked that the tests can fail:** (1) a new type put in the MIDDLE of the list → the "only at the end" test failed;
+(2) one new type left out of the database list → the "exactly what Java can save" test failed. Both restored. All 17
+NotificationService tests pass. The jar has `V2`, no H2, no test classes.
+
+**NOT proved by any test - only by your next start:** that MySQL accepts the SQL. The rules are checked, but the in-memory
+test database cannot run these MySQL commands the same way.
+
+**You need to do:**
+1. Before you start NotificationService the next time, back up the one table:
+   `mysqldump -u <your user> -p inicident-management-notificationservicedb notification_log > notification_log_backup.sql`
+   (keep the file outside the project).
+2. Check `SELECT VERSION();` is 8.0.16 or newer (DROP CHECK needs it).
+3. Start NotificationService. Flyway runs `V2` once.
+4. Check: `SHOW CREATE TABLE notification_log;` - the new column, the longer lists, `RECORDED`, and no `CHECK` line.
+5. If the start fails on V2: the table is unchanged (one statement). Send me the error. Flyway will have written a
+   "failed" row in `flyway_schema_history` that must be removed before the next try - I will tell you exactly how.
+6. Reload Maven in IntelliJ (new test dependency).
+
+### Step 5 result — ✅ done 2026-10-17
+
+**The 4 SLA topics finally have a reader (known issue 18).**
+
+```
+ReportingService --(outbox)--> Kafka: Sla-...-Topic   { incidentId, createdBy, assignedTo, ... } + header X-Event-Id
+      |
+      v
+SlaEventConsumer (4 listeners)  -> picks the type + the message text + the event id (from X-Event-Id)
+      |
+      v
+SlaNotificationService
+  1. no createdBy (an old message)?  -> warn, record nothing
+  2. UserService: creator + engineer            (no database transaction open while waiting)
+  3. supervisor = of the engineer, or of the creator if nobody is assigned -> UserService once more if needed
+  4. each person once: already recorded for this event? skip : save a RECORDED row + one log line (user id only)
+```
+
+**Test first:** the listener class was written, with the service as an EMPTY skeleton. `SlaNotificationTest` (11 tests,
+real code, H2, fake UserService) then failed 10 of 11 (the 11th - "an old message saves nothing" - correctly passed on an
+empty skeleton). One failure was a mistake in the test itself (how the fake was set up), fixed before writing the code.
+
+| File | New / changed | What |
+|---|---|---|
+| `NotificationService/.../kafka/consumer/SlaEventConsumer.java` | **new** | the 4 `@KafkaListener`s; event id from the `X-Event-Id` header (raw bytes), or a fixed id worked out from the message if the header is missing |
+| `NotificationService/.../service/SlaNotificationService.java` | **new** | who is told, and one `RECORDED` row + log line per person |
+| `NotificationService/pom.xml` | changed | + `spring-kafka-test`, **test only** |
+| `NotificationService/src/test/.../kafka/consumer/SlaNotificationTest.java` | **new** | 11 tests: who is told (3 cases), each person once, no supervisor = skipped, a repeat (with and without the header), two risk levels = two alerts, UserService called with no transaction open, an old message saves nothing, UserService down = nothing saved + the error goes back to Kafka |
+| `NotificationService/src/test/.../kafka/consumer/SlaListenersOverKafkaTest.java` | **new** | 2 tests: the WHOLE service + a real embedded Kafka - a message sent like the outbox sends it reaches the right listener and is recorded (also proves the issue-65 fix and the header) |
+
+**Checked that the tests can fail:** (1) always the creator's supervisor → the "engineer's supervisor" test failed; (2) the
+`X-Event-Id` header ignored → the "id from the header" test failed; (3) the issue-65 setting undone → the Kafka test for
+the "at risk" message failed. All restored byte-for-byte. **All 30 NotificationService tests pass.** The jar has the 2
+new classes, no H2, no test Kafka, no test classes. The SLA log lines hold user ids only (checked: 0 emails), and carry
+the trace id from the Kafka message.
+
+**Not changed on purpose:** the 3 incident listeners (that is step 6); no email (issue 16); no "read / unread".
+
+**You need to do:** reload Maven in IntelliJ (new test dependency). To see it for real later (after step 4's migration
+has run): set one open incident's `assignment_deadline` in ReportingService's `incident_report` to a past time; within
+about 70 s the timer sends the breach event, and NotificationService's log shows "SLA notification ... recorded for user
+..." and `notification_log` gets the rows.
+
+### Step 6 result — ✅ done 2026-10-17 (option A)
+
+**The problem:** the 3 old incident listeners (created, assigned, status changed) saved their rows **without the user id**,
+so step 7's "show MY notifications" would not find them. And the rows were not honest - which matters now that users
+will read them:
+
+| | Before | After |
+|---|---|---|
+| user id (`recipient_id`) | not saved | saved |
+| status | `SUCCESS` (set inside an EMPTY try block - nothing is ever sent, issue 16) | `RECORDED` (saved, no email sent) |
+| `sentAt` | set to "now" | empty - nothing was sent |
+| message | "Email Successfully sent to <email> for **Incident Created** Event with Incident Id: ..." - for EVERY event type | "Incident <id> was created." / "... was assigned." / "Incident <id>: status changed from ASSIGNED to RESOLVED." - no email address |
+| log line | "Email Successfully sent to user ..." | "Notification ... recorded for user ... - no email sent" (user id only) |
+
+**Test first:** `IncidentNotificationTest` (4 tests, real listener + service code, H2, fake UserService). On the old code 3
+failed (no user id); the 4th - the duplicate guard - correctly passed (it checks what must NOT change).
+
+**Files changed in step 6:**
+
+| File | New / changed | What |
+|---|---|---|
+| `NotificationService/.../service/EmailNoticationService.java` | changed | `storeNotificationLog` gets a `message` parameter; saves `recipientId`, status `RECORDED`, no `sentAt`; the fake "send" try/catch removed (a comment marks where real sending will go); honest log line |
+| `NotificationService/.../kafka/consumer/IncidentEventConsumer.java` | changed | each of the 3 listeners passes the right message for its event |
+| `NotificationService/src/test/.../kafka/consumer/IncidentNotificationTest.java` | **new** | 4 tests: created / assigned / status change - right people, user id, `RECORDED`, no `sentAt`, correct text without an email address; the same event twice is saved once |
+| `PROGRESS.md`, `CLAUDE.md` (issue 16 half resolved, tests 230), `notes/LLD/LLD-NotificationService.md` | docs | |
+
+**Checked that the tests can fail:** (1) the user id not saved → 3 tests failed; (2) the status back to `SUCCESS` → 3
+failed; (3) old and new status swapped in the message → the status test failed. (A first try of check 3 changed 0 lines
+because of a wrong search pattern - noticed and redone, so its "pass" was not counted.) All restored byte-for-byte.
+**All 34 NotificationService tests pass.** The jar has no test parts; the log lines hold user ids only (checked: 0 emails).
+
+**Not changed on purpose:** who is told for incident events (the same people as before); old rows (they keep their old
+text and have no user id - your decision); no real email yet.
+
+**You need to do:** nothing extra. (The step 4 migration must have run before this code saves `RECORDED` rows - it runs
+at the next start, as before.)
+
+### Step 7 result — ✅ done 2026-10-19
+
+**`GET /notifications/me?page=0&size=20`** - your own notifications, newest first, with the total.
+
+```
+You (logged in) -> APIGateway: token check, X-User-Id, rate limit -> NEW route /notifications/** -> NotificationService
+   -> SecurityConfig: users only (ENGINEER / SUPERVISOR / ADMIN)
+   -> NotificationController: page 0+, size 1-100 (else a clear 400)
+   -> MyNotificationsService -> rows WHERE recipient_id = your id ORDER BY created_at DESC
+
+answer: { total, page, size, items: [ { id, incidentId, type, status, message, createdAt } ] }
+```
+
+No user id in the URL - it comes from the login, so nobody can ask for someone else's list. No email or name in the
+answer. Old rows without a user id never show (your decision).
+
+**Test first:** `MyNotificationsApiTest` (9 tests) starts the WHOLE NotificationService and sends real HTTP requests with
+the headers the gateway sends. Before the endpoint existed 7 failed (404); the 2 that passed check protections that
+already existed and must stay (no login → 403; wrong secret → 403). `GatewayRoutesTest` (3 tests) reads the gateway's real
+route list: before the new route, 2 failed ("no gateway route for /notifications/**").
+
+**Files changed in step 7:**
+
+| File | New / changed | What |
+|---|---|---|
+| `NotificationService/.../controller/NotificationController.java` | **new** | `GET /notifications/me`, page/size checked at the door |
+| `NotificationService/.../service/MyNotificationsService.java` | **new** | reads one person's page and builds the answer |
+| `NotificationService/.../dto/MyNotificationsResponseDTO.java` | **new** | `total`, `page`, `size`, `items` |
+| `NotificationService/.../dto/NotificationItemDTO.java` | **new** | one notification, without email / name / event id |
+| `NotificationService/.../repository/NotificationLogRepository.java` | changed | + `findByRecipientIdOrderByCreatedAtDesc` (uses the V2 index) |
+| `NotificationService/.../config/SecurityConfig.java` | changed | + `/notifications/**` → users only |
+| `NotificationService/pom.xml` | changed | + `common-web` (the shared error shape, the 400 for a bad page/size, the HTTP trace id) |
+| `APIGateway/src/main/resources/application.properties` | changed | + route 5: `/notifications/**` → `lb://NotificationService` |
+| `NotificationService/src/test/.../controller/MyNotificationsApiTest.java` | **new** | 9 tests |
+| `APIGateway/src/test/.../GatewayRoutesTest.java` | **new** | 3 tests |
+| `PROGRESS.md`, `CLAUDE.md`, `notes/LLD/LLD-NotificationService.md`, `LLD-APIGateway.md`, `LLD-improvements.md` | docs | |
+
+**The 9 endpoint tests:** only my own rows, newest first, with the total (another person's and an old row without a user
+id are left out); paging and total; default page 0 / size 20; an empty list; no email or name in the answer; size 0, size
+101 and page -1 → 400 in the usual error shape (with `traceId`); no login → 403; identity headers with a wrong secret → 403;
+a service-to-service caller → 403.
+
+**Checked that the tests can fail:** (1) the "users only" rule removed → the service-to-service call got a **500** (it tried
+to read the service name as a user id) - caught; (2) everyone's rows instead of only mine → 3 tests failed; (3) the size
+limit raised from 100 to 100000 → the 400 test failed. All restored byte-for-byte. NotificationService: **43 tests pass**;
+APIGateway: **56 pass**. The NotificationService jar has the controller and common-web, and no test parts.
+
+**Not done on purpose:** read / unread, delete, an admin view of someone else's list, filters by type.
+
+**You need to do:**
+1. Reload Maven in IntelliJ (NotificationService has a new dependency).
+2. Restart **APIGateway** too - it only learns the new route at start.
+3. Try it: log in, then `GET http://localhost:8082/notifications/me` with `Authorization: Bearer <token>`.
+
+---
+
+# Option B — the 8 `contextLoads()` tests made safe (2026-10-19)
+
+**The problem:** each service had an auto-generated `contextLoads()` that started the app with the REAL
+`application.properties` - your real MySQL, Kafka, Eureka and secrets. "Run all tests" was therefore unsafe.
+
+**The fix:** each one now starts its service in the test world:
+
+| Service | Test settings |
+|---|---|
+| Eureka | peer address `localhost:1` (it has no database or Kafka anyway) |
+| APIGateway | Eureka off, dummy secrets |
+| Auth, User, Incident, Notification, Reporting | in-memory H2 (MySQL mode), Flyway off, Eureka off, Kafka `localhost:1`, listeners off (where there are any), dummy secrets |
+| Ai-Service | the same, H2 in **Postgres** mode, dummy Gemini key. Checked first: nothing at start-up calls Gemini or Postgres (the two `@PostConstruct` only read prompt files; the vector store has its size set) |
+
+**Files:** the 8 `*ApplicationTests.java`, + `h2` (test only) in `Ai-Service/pom.xml`.
+
+**Proof (all with the real env vars `user`, `password`, `secretkey`, `internalsecret`, `apikey` REMOVED):**
+1. All 8 `contextLoads()` pass.
+2. Their logs show **0** attempts to reach `localhost:3306`, `:5433`, `:9092`, `localhost:8081`; only `jdbc:h2:mem`.
+3. Break check: the dummy `internalsecret` line removed from one test → it fails with "Could not resolve placeholder
+   'internalsecret'" (it does not fall back to anything real). Restored.
+4. **"Run all tests" on every service:** Eureka 1, APIGateway 57, AuthService 25, UserService 5, IncidentService 10,
+   NotificationService 44, ReportingService 28, Ai-Service 1 = **171 tests, 0 failures**, and no real address in any log.
+5. The Ai-Service jar has no H2 and no test classes.
+
+**Same day, comments only:** my long comments in 31 files (steps 1-7, SLA values, lockout, their tests) were made
+short and plain - 138 lines fewer. Proved "comments only": with all comments removed, the code of all 31 files
+is identical before and after; all tests of the 5 touched services pass (158). The 2 migration files (`V2`, `V4`)
+were NOT touched: Flyway checks every byte of an applied migration, comments included.
+
+**Notes:** `notes/sla-notifications.md` (steps 1-7: need, goal, flow charts, how to check on the real system).
 
 ---
 

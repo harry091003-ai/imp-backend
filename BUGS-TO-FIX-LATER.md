@@ -216,6 +216,12 @@ thoughtfully - IncidentService simply never got the same attention.
 
 ### E10. Suspicious CHECK constraint on `notification_log.event_type`
 
+> **notification_log part: FIXED 2026-10-17** (SLA notifications step 4). NotificationService's Flyway
+> `V2__sla_notifications.sql` drops `notification_log_chk_1` - the 4 new SLA types (positions 9-12) would surely have
+> been refused. The native `enum` already limits the allowed words. Not tested whether `USER_UPDATED` really failed
+> before; that no longer matters. **Still open:** the `incident_audit_log.event_type` check in ReportingService
+> (last paragraph below).
+
 The schema dump shows a Hibernate-generated constraint:
 
 ```sql

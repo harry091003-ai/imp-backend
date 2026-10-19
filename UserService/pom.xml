@@ -117,6 +117,15 @@
             <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Tests only (SLA notifications step 3, 2026-10-17): a tiny in-memory database (MySQL mode), so the
+             tests can run the real UserService code without a real MySQL. Version = the one already in the
+             local cache, the same as in Incident/Auth/ReportingService. Never part of the built jar. -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <version>2.2.224</version>
+            <scope>test</scope>
+        </dependency>
 <!--        <dependency>-->
 <!--            <groupId>com.example</groupId>-->
 <!--            <artifactId>AuthService</artifactId>-->

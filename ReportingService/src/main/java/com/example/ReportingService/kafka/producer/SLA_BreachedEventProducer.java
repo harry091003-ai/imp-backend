@@ -21,7 +21,11 @@ public class SLA_BreachedEventProducer {
     public void publishAssignmentBreachedEvent(IncidentReport incident) {
         SLA_BreachedEvent event = SLA_BreachedEvent.builder()
                 .incidentId(incident.getIncidentId())
-                .SLA_BreachedType("ASSIGNMENT_SLA_BREACHED").build();
+                .SLA_BreachedType("ASSIGNMENT_SLA_BREACHED")
+                // SLA notifications step 2: who to tell (assignedTo is null here - nobody is assigned yet)
+                .createdBy(incident.getCreatedBy())
+                .assignedTo(incident.getAssignedTo())
+                .build();
         outboxWriter.save(SLA_AssignmentBreachedTopic, incident.getIncidentId().toString(), event);
         log.info("Saved Assignment SLA breach event to the outbox for {}", incident.getIncidentId());
     }
@@ -30,6 +34,9 @@ public class SLA_BreachedEventProducer {
         SLA_BreachedEvent event=SLA_BreachedEvent.builder()
                 .incidentId(incident.getIncidentId())
                 .SLA_BreachedType("RESOLUTION_SLA_BREACHED")
+                // SLA notifications step 2: who to tell
+                .createdBy(incident.getCreatedBy())
+                .assignedTo(incident.getAssignedTo())
                 .build();
         outboxWriter.save(SLA_ResolutionBreachedTopic,incident.getIncidentId().toString(),event);
         log.info("Saved Resolution SLA breach event to the outbox for {}", incident.getIncidentId());

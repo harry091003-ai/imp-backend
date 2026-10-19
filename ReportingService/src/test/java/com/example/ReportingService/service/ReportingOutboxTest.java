@@ -18,6 +18,8 @@ import com.project.events.IncidentResolutionReportEvent;
 import com.project.events.IncidentStatusUpdatedEvent;
 import com.project.events.SLA_BreachedEvent;
 import com.project.events.enumsUsedByEvents.SlaBreachingRiskEvent;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.project.outbox.OutboxWriter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -313,5 +315,74 @@ class ReportingOutboxTest {
 
         assertEquals(SLA_RiskLevel.NONE, report(nearlyLate.getIncidentId()).getAssignmentRiskLevel(),
                 "level not saved without its event - so the next run will try again");
+    }
+
+    // ------------------------------------------------------------------ SLA events say WHO (notifications step 2)
+    // NotificationService must tell the creator, the assigned engineer and their supervisor. The SLA events used
+    // to carry only the incident id, so nobody downstream could know who to tell. Written BEFORE the fix.
+
+    private static final UUID CREATOR = UUID.fromString("00000000-0000-0000-0000-00000000c0de");
+    private static final UUID ENGINEER = UUID.fromString("00000000-0000-0000-0000-0000000e1e01");
+
+    /** A report with a creator and (maybe) an assigned engineer. */
+    private IncidentReport reportOf(UUID assignedTo, LocalDateTime createdAt,
+                                    LocalDateTime assignmentDeadline, LocalDateTime resolutionDeadline) {
+        return reportRepository.save(IncidentReport.builder().incidentId(UUID.randomUUID()).title("t")
+                .description("d").severity("HIGH").priority("HIGH").status(assignedTo == null ? "OPEN" : "ASSIGNED")
+                .serviceName("PAYMENT_SERVICE").category("DATABASE").createdAt(createdAt).updatedAt(createdAt)
+                .createdBy(CREATOR).assignedTo(assignedTo).assignedAt(assignedTo == null ? null : createdAt.plusMinutes(1))
+                .assignmentDeadline(assignmentDeadline).resolutionDeadline(resolutionDeadline).build());
+    }
+
+    /** The JSON of the only outbox row for this topic. */
+    private JsonNode eventOn(String topic) throws Exception {
+        List<Map<String, Object>> rows = jdbc.queryForList("SELECT payload FROM outbox_event WHERE topic = ?", topic);
+        assertEquals(1, rows.size(), "one event on " + topic);
+        return new ObjectMapper().readTree(rows.get(0).get("PAYLOAD").toString());
+    }
+
+    @Test
+    void anAssignmentBreachEventSaysWhoCreatedItAndThatNobodyIsAssigned() throws Exception {
+        reportOf(null, LocalDateTime.now().minusHours(3), LocalDateTime.now().minusHours(1), LocalDateTime.now().plusDays(1));
+
+        breachedSchedular.checkSlaBreaches();
+
+        JsonNode event = eventOn("Sla-Assignment-Breach-Topic");
+        assertEquals(CREATOR.toString(), event.path("createdBy").asText(), "the event names the creator");
+        assertFalse(event.hasNonNull("assignedTo"), "nobody is assigned yet - that is why it breached");
+    }
+
+    @Test
+    void aResolutionBreachEventSaysWhoCreatedItAndWhoIsAssigned() throws Exception {
+        reportOf(ENGINEER, LocalDateTime.now().minusDays(2), LocalDateTime.now().plusDays(1), LocalDateTime.now().minusHours(1));
+
+        breachedSchedular.checkSlaBreaches();
+
+        JsonNode event = eventOn("Sla-Resolution-Breach-Topic");
+        assertEquals(CREATOR.toString(), event.path("createdBy").asText());
+        assertEquals(ENGINEER.toString(), event.path("assignedTo").asText(), "the event names the assigned engineer");
+    }
+
+    @Test
+    void anAssignmentRiskEventSaysWhoCreatedIt() throws Exception {
+        // 100 of 105 minutes used = CRITICAL risk, not yet breached
+        reportOf(null, LocalDateTime.now().minusMinutes(100), LocalDateTime.now().plusMinutes(5), LocalDateTime.now().plusDays(1));
+
+        riskSchedular.monitorAssignmentRisk();
+
+        JsonNode event = eventOn("Sla-Assignment-BreachingRisk-Topic");
+        assertEquals(CREATOR.toString(), event.path("createdBy").asText());
+        assertFalse(event.hasNonNull("assignedTo"));
+    }
+
+    @Test
+    void aResolutionRiskEventSaysWhoCreatedItAndWhoIsAssigned() throws Exception {
+        reportOf(ENGINEER, LocalDateTime.now().minusMinutes(100), LocalDateTime.now().plusDays(1), LocalDateTime.now().plusMinutes(5));
+
+        riskSchedular.monitorResolutionRisk();
+
+        JsonNode event = eventOn("Sla-Resolution-BreachingRisk-Topic");
+        assertEquals(CREATOR.toString(), event.path("createdBy").asText());
+        assertEquals(ENGINEER.toString(), event.path("assignedTo").asText());
     }
 }

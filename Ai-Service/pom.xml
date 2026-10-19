@@ -77,6 +77,14 @@
     <artifactId>spring-security-test</artifactId>
     <scope>test</scope>
 </dependency>
+<!-- Tests only (option B, 2026-10-19): an in-memory database, so AiServiceApplicationTests can start
+     the app without the real Postgres. Same version as the other services. Never in the jar. -->
+<dependency>
+    <groupId>com.h2database</groupId>
+    <artifactId>h2</artifactId>
+    <version>2.2.224</version>
+    <scope>test</scope>
+</dependency>
 <!--ForEnablingKafka-->
 <dependency>
     <groupId>org.springframework.kafka</groupId>

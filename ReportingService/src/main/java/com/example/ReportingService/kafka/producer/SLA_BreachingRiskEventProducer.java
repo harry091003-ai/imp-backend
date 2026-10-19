@@ -26,6 +26,9 @@ public class SLA_BreachingRiskEventProducer {
                 .currentRiskLevel(NewRiskLevel)
                 .riskScore(Riskscore)
                 .type("ASSIGNMENT_SLA_BREACHING_RISK")
+                // SLA notifications step 2: who to tell (assignedTo is null here - nobody is assigned yet)
+                .createdBy(report.getCreatedBy())
+                .assignedTo(report.getAssignedTo())
                 .build();
 log.info("Saving Assignment SLA Breaching Risk Event to the outbox");
         outboxWriter.save(SLA_AssignmentBreachingRiskTopic,report.getIncidentId().toString(),event);
@@ -38,6 +41,9 @@ log.info("Saving Assignment SLA Breaching Risk Event to the outbox");
                 .currentRiskLevel(NewRiskLevel)
                 .riskScore(Riskscore)
                 .type("RESOLUTION_SLA_BREACHING_RISK")
+                // SLA notifications step 2: who to tell
+                .createdBy(report.getCreatedBy())
+                .assignedTo(report.getAssignedTo())
                 .build();
         log.info("Saving Resolution SLA Breaching Risk Event to the outbox");
         outboxWriter.save(SLA_ResolutionBreachingRiskTopic,report.getIncidentId().toString(),event);

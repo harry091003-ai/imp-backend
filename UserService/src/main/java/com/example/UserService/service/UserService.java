@@ -413,6 +413,9 @@ return users.map(user -> UserSearchResponseDTO.builder()
                         .userid(user.getUserid())
                         .email(user.getEmail())
                         .username(user.getUsername())
+                        // Step 3: the supervisor's id (null = none). Only the id is read, so the lazy
+                        // supervisor is not loaded (SupervisorInBatchTest proves it with no transaction open).
+                        .supervisorId(user.getSupervisor() == null ? null : user.getSupervisor().getUserid())
                         .build()).collect(Collectors.toList());
     }
 

@@ -25,9 +25,8 @@ public interface UserRepository extends JpaRepository<User,UUID>{
     public Boolean existsByEmail(String email);
     Optional<User> findByUsername(String username);
 
-    // Issue 55 fix (2026-10-14): read the user AND lock the row until the transaction ends.
-    // Two wrong passwords sent at the same moment then wait for each other, so both are counted
-    // (without the lock, both could read 3 and both write 4).
+    // Issue 55: read the user AND lock the row until the transaction ends.
+    // So two wrong passwords at the same moment are both counted (else both read 3 and write 4).
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT u FROM User u WHERE u.email = :email")
     Optional<User> findByEmailForUpdate(@Param("email") String email);

@@ -21,4 +21,9 @@ public class SlaBreachingRiskEvent {
 
     private String type; // ASSIGNMENT/RESOLUTION
 
+    // Step 2: who to tell. assignedTo is null while nobody is assigned.
+    // An older message without these fields still reads fine (both null).
+    private UUID createdBy;
+    private UUID assignedTo;
+
 }

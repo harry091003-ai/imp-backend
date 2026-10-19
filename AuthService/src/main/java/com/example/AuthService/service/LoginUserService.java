@@ -64,9 +64,7 @@ public class LoginUserService {
              catch (BadCredentialsException e) {
 //          setting the number of failed login attempts and updating it to the database and
 //          also locked the account if the failed login attempts is greater than or equal to 5 account will set to locked
-            // FIX for known issue 55 (2026-10-14): this used to change the counter HERE and save it, then throw
-            // below. The throw rolled back this method's transaction, so the save was undone every time and
-            // the account never locked. Now the counting runs in its OWN transaction, finished before we throw.
+            // Issue 55: count it in its OWN transaction, so the 401 below cannot undo it.
             loginAttemptService.recordFailedLogin(request.getEmail());
             // Same message whether the email exists or not. Saying "email not registered"
             // would let anyone probe this endpoint to harvest a list of valid accounts.
@@ -126,8 +124,7 @@ public class LoginUserService {
                 // Same generic message as a wrong password - do not reveal which emails exist.
                 throw new UnauthorizedException("INVALID_CREDENTIALS", "Invalid email or password.");
             }
-            // Issue 6 fix (2026-10-14): a lock now ENDS. Locked only while the lock time has not passed yet;
-            // before, a locked account stayed locked forever (nothing ever unlocked it).
+            // Issue 6: a lock now ends (locked only until lockedUntil).
             if(loginAttemptService.isLockedNow(user)){
                 throw new UnauthorizedException("ACCOUNT_LOCKED",
                         "Account is locked due to multiple failed login attempts. Try again later.");

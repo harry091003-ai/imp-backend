@@ -53,7 +53,8 @@ public class IncidentEventConsumer {
         log.info("Incident {}: {} recipient(s), user ids {}", event.getIncidentId(), usersTosendEmail.size(),
                 recipientIds(usersTosendEmail));
       // for storing the logs of Each User to whom we want to send the email in future, we first store in Database.
-        emailNoticationService.storeNotificationLog(event.getIncidentId(),event.getEventId(),event.getPerformedBy(),usersTosendEmail, EventType.INCIDENT_CREATED);
+        emailNoticationService.storeNotificationLog(event.getIncidentId(),event.getEventId(),event.getPerformedBy(),usersTosendEmail, EventType.INCIDENT_CREATED,
+                "Incident " + event.getIncidentId() + " was created.");
 
     }
 
@@ -68,7 +69,8 @@ public class IncidentEventConsumer {
         log.info("Incident {}: {} recipient(s), user ids {}", event.getIncidentId(), usersTosendEmail.size(),
                 recipientIds(usersTosendEmail));
         // for storing the logs of Each User to whom we want to send the email in future, we first store in Database.
-        emailNoticationService.storeNotificationLog(event.getIncidentId(),event.getEventId(),event.getPerformedBy(),usersTosendEmail,EventType.INCIDENT_ASSIGNED);
+        emailNoticationService.storeNotificationLog(event.getIncidentId(),event.getEventId(),event.getPerformedBy(),usersTosendEmail,EventType.INCIDENT_ASSIGNED,
+                "Incident " + event.getIncidentId() + " was assigned.");
 
     }
 
@@ -85,7 +87,9 @@ public class IncidentEventConsumer {
         // Here you can add logic to send notifications based on the incident Updated event in future!!
         log.info("Incident {}: {} recipient(s), user ids {}", event.getIncidentId(), usersTosendEmail.size(),
                 recipientIds(usersTosendEmail));
-       emailNoticationService.storeNotificationLog(event.getIncidentId(),event.getEventId(),event.getPerformedBy(),usersTosendEmail,EventType.INCIDENT_STATUS_UPDATED);
+       emailNoticationService.storeNotificationLog(event.getIncidentId(),event.getEventId(),event.getPerformedBy(),usersTosendEmail,EventType.INCIDENT_STATUS_UPDATED,
+                "Incident " + event.getIncidentId() + ": status changed from " + event.getOldStatus()
+                        + " to " + event.getUpdatedStatus() + ".");
     }
 
     // Just the ids of the recipients - never their emails or usernames.

@@ -74,6 +74,9 @@ public class SecurityConfig {
                 // Authorization rules
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/actuator/**").permitAll()
+                        // SLA notifications step 7 (2026-10-17): "my notifications" is for USERS only. A service-to-service
+                        // call is logged in under its service name (not a user id) and has no list of its own -> 403.
+                        .requestMatchers("/notifications/**").hasAnyRole("ENGINEER", "SUPERVISOR", "ADMIN")
                         .anyRequest().authenticated()//ye line se authentication use karne ya na karne ka koi link nahi hai it check check karte hai ki SecurityContextHolder.getContext().getAuthentication() != null to nahi hai
                 );
 

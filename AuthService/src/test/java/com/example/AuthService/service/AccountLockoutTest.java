@@ -43,14 +43,9 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /**
- * Known issue 55: the account lockout never triggered.
- *
- * The REAL LoginUserService, a real database (H2 in MySQL mode). The password check itself is faked
- * (AuthenticationManager), so each test decides "this password is wrong" or "this password is right".
- *
- * Written BEFORE the fix, so it first showed the bug: 5 wrong passwords left the counter at 0 in the database
- * (the first 2 tests failed with "expected 3 / 5 but was 0"). The other tests were added with the fix: they
- * check the unlock rules (known issue 6 - a lock used to last forever).
+ * Issue 55 and 6: the lockout. Real LoginUserService, in-memory database, faked password check.
+ * Written first: 5 wrong passwords left the counter at 0 ("expected 5 but was 0").
+ * The other tests check the unlock rules.
  */
 @DataJpaTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:auth-lockout;MODE=MySQL;DB_CLOSE_DELAY=-1",

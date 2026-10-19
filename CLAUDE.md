@@ -18,7 +18,7 @@ Root: `E:\dev-spring-boot\IMP` — **not a git repository**, no root `.gitignore
 | `AuthService` | 8083 | signup/login/logout, password, roles, JWT minting, token-version | yes |
 | `UserService` | 8084 | user profiles, engineer/supervisor hierarchy, search | yes |
 | `IncidentService` | 8085 | incident CRUD, assignment, status transitions | yes |
-| `NotificationService` | 8086 | consumes incident events, writes `NotificationLog` | yes |
+| `NotificationService` | 8086 | consumes incident + SLA events, writes `NotificationLog` (no email yet); `GET /notifications/me` (since 2026-10-17) | yes |
 | `ReportingService` | 8087 | incident reports, metrics, audit log, SLA schedulers | yes |
 | `Ai-Service` | 8088 | Gemini classification + pgvector RAG, engineer recommendation | yes |
 | `shared-events` | — | plain JAR: Kafka event DTOs (`com.project.events`) | no |
@@ -92,7 +92,10 @@ self-referencing hierarchy: `supervisor` (`@ManyToOne`) / `engineers` (`@OneToMa
 SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetrics` (**never written** - issue 61),
 `EngineerPerformanceStats`, `EngineerWorkload`, `ProcessedEvent` (idempotency keys - stop a repeat since 2026-10-13, issue 60 fixed).
 
-**NotificationService** — `NotificationLog`, unique constraint on `(eventId, recipientEmail)`.
+**NotificationService** — `NotificationLog`, unique constraint on `(eventId, recipientEmail)`. Since Flyway `V2`
+(2026-10-17, SLA notifications step 4) it also has `recipientId` (the user id; null on older rows), 4 SLA event
+types, the status `RECORDED` (= saved and visible in the app, no email sent) and no more
+`CHECK (event_type between 0 and 7)`.
 
 **Ai-Service** — `AiInsight` (per-incident classification + confidence + conflict flag).
 
@@ -161,7 +164,10 @@ Per-service permitAll rules:
 - ReportingService: `/actuator/**` only; `/internal/**` → `hasRole("INTERNAL_SERVICE")`;
   `/reports/**` → `hasAnyRole(ADMIN, SUPERVISOR)` (engineers deliberately excluded — these
   endpoints expose every engineer's performance numbers).
-- IncidentService / NotificationService / Ai-Service: `/actuator/**` only.
+- IncidentService / Ai-Service: `/actuator/**` only.
+- NotificationService: `/actuator/**` only; `/notifications/**` → `hasAnyRole(ENGINEER, SUPERVISOR, ADMIN)` (since
+  2026-10-17). Users only: a service-to-service caller is logged in under its SERVICE name, which is not a user id -
+  without this rule `GET /notifications/me` crashed with a 500 for it (proved by a break check).
 
 ---
 
@@ -170,7 +176,9 @@ Per-service permitAll rules:
 Events live in `shared-events` (`com.project.events`), JSON-serialized, key = entity UUID.
 Consumers use `spring.json.trusted.packages=com.project.events` (narrowed from `*` in B2). **This is an exact
 package match, not "starts with"** (issue 65): `com.project.events.enumsUsedByEvents.SlaBreachingRiskEvent` is
-rejected by that setting, even though the comment in each `application.properties` says otherwise.
+rejected by that setting. **NotificationService** (the SLA reader) therefore lists the sub-folder by name since
+2026-10-17: `com.project.events,com.project.events.enumsUsedByEvents`. The other 3 readers keep the plain value on
+purpose (they do not read that event), and all 4 comments now say "exact match".
 **As of Track C (2026-09-30) every message also carries an `X-Trace-Id` header**, added by
 `common-kafka`'s `TraceIdProducerInterceptor` on send and restored into the MDC by
 `TraceIdRecordInterceptor` on receive. A message parked in a `-dlt` topic keeps the same header. Any
@@ -188,10 +196,14 @@ service with `common-kafka` on its classpath gets both automatically.
 | `incident.status.updated` | IncidentService | Reporting, Notification |
 | `Incident-Resolved-Report-Topic` | ReportingService | Ai-Service (stores vectors) |
 | `ai.classification.result` | Ai-Service | **none** |
-| `Sla-Assignment-Breach-Topic` | ReportingService | **none** |
-| `Sla-Resolution-Breach-Topic` | ReportingService | **none** |
-| `Sla-Assignment-BreachingRisk-Topic` | ReportingService | **none** |
-| `Sla-Resolution-BreachingRisk-Topic` | ReportingService | **none** |
+| `Sla-Assignment-Breach-Topic` | ReportingService | Notification (since 2026-10-17, saved + logged, no email) |
+| `Sla-Resolution-Breach-Topic` | ReportingService | Notification (since 2026-10-17, saved + logged, no email) |
+| `Sla-Assignment-BreachingRisk-Topic` | ReportingService | Notification (since 2026-10-17, saved + logged, no email) |
+| `Sla-Resolution-BreachingRisk-Topic` | ReportingService | Notification (since 2026-10-17, saved + logged, no email) |
+
+**Since 2026-10-17 (SLA notifications step 2) the 2 SLA event classes also carry `createdBy` and `assignedTo`**
+(`assignedTo` is null while nobody is assigned), filled in by ReportingService from `IncidentReport`, so a reader knows
+who to tell. Added fields only: an older message without them is read with both as null.
 | `incident.resolved` | declared, publisher commented out | none |
 
 **Outbox (Phase 2):** IncidentService's three `incident.*` events no longer use `kafkaTemplate.send`. They are
@@ -246,7 +258,9 @@ in a blocking service was exactly the bug B3 removed.
   broken — see issue 2).
 - NotificationService → UserService (`client/UserClient`, also a `@FeignClient`):
   `/internal/UserSpecificDetails/{userId}` (**unused**, broken endpoint),
-  `POST /internal/UserSpecificDetails/batch` (the one actually used, from a Kafka listener).
+  `POST /internal/UserSpecificDetails/batch` (the one actually used, from a Kafka listener). **Since 2026-10-17
+  (SLA notifications step 3) each answer also has `supervisorId`** (null = no supervisor); both copies of
+  `UserCredentialDTO` (UserService, NotificationService) have the field.
 - Ai-Service → ReportingService: **OpenFeign** `ReportingServiceFeignClient`
   (`/internal/reports/engineer-performance/{engineerId}/{category}/{service}`,
   `/internal/reports/engineer-workload/{engineerId}`).
@@ -430,13 +444,21 @@ folder, gitignored - see PROGRESS.md).
 
 **Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
 `common-web` 19, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
-Kafka + real JPA), `APIGateway` 53, `IncidentService` 9, `AuthService` 24 (16 outbox + 8 `AccountLockoutTest`)
-and `ReportingService` 15 (outbox: H2 + embedded Kafka + a full-start test each) = 180. ReportingService's wiring test uses a test-only
+Kafka + real JPA), `APIGateway` 56 (53 + 3 `GatewayRoutesTest`), `IncidentService` 9, `AuthService` 24 (16 outbox + 8 `AccountLockoutTest`)
+`ReportingService` 27 (19 outbox, incl. 4 "the SLA event says who": H2 + embedded Kafka + a full-start test each, + 8
+`SLAConfigurationTest`, plain Java), `NotificationService` 43 (`TrustedPackagesTest` 5 + `UserCredentialDtoTest` 2 +
+`NotificationMigrationV2Test` 6, plain Java; `NotificationLogStoreTest` 4 + `SlaNotificationTest` 11, H2;
+`SlaListenersOverKafkaTest` 2, whole service + embedded Kafka; `IncidentNotificationTest` 4, H2; `MyNotificationsApiTest` 9,
+whole service + real HTTP requests) and `UserService` 4 (`SupervisorInBatchTest`, H2) = 242, **+ the 8 `contextLoads()`
+(one per service, safe since option B, 2026-10-19) = 250**. ReportingService's wiring test uses a test-only
 `src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
-with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest` - the old `contextLoads()`
-still needs real MySQL/Kafka and would connect to them.
-The other services (and Eureka) still have only the auto-generated
-`contextLoads()` class, which fails without the env vars and running infrastructure. Run one
+with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest`, or ALL of them with
+`./mvnw.cmd -o test`: **since option B (2026-10-19) every `contextLoads()` runs in the test world too** (in-memory
+database, Flyway off, Eureka off, Kafka `localhost:1`, listeners off, dummy secrets; Ai-Service also a dummy Gemini
+key and H2 in Postgres mode). Proved: all 8 services pass ALL their tests with the real env vars removed, and the logs
+show no attempt to reach 3306/5433/9092/8081. **Full guide, and the proof (re-run 2026-10-19 on all modules and jars)
+that our tests are safe and not part of the application: `notes/testing-in-our-project.md`.**
+Eureka and Ai-Service still have only their (now safe) `contextLoads()`. Run one
 module's tests with `./mvnw.cmd -f <module>/pom.xml test` (shared libs have no wrapper - use any
 service's). There are no `target/*.jar` artifacts — the
 project has been run from IntelliJ (`out/production/` exists at root), not via Maven packaging.
@@ -517,14 +539,28 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 ### Unfinished / misleading
 
-16. **`NotificationService` never sends email.** `EmailNoticationService.storeNotificationLog`
+16. **HALF RESOLVED 2026-10-17 (SLA notifications step 6): the rows are honest now, but still no email.** Every
+    notification row (incident + SLA) is saved as `RECORDED` ("saved and visible in the app, no email sent"), with the
+    user id (`recipientId`), no `sentAt`, a correct message per event and no email address in it; the log says "recorded
+    ... no email sent". The fake "sent" block is gone. **Still open:** really sending email (`JavaMailSender`,
+    `spring.mail.*`) - deliberately later. The original entry, kept for the record:
+    **`NotificationService` never sends email.** `EmailNoticationService.storeNotificationLog`
     logs `"Email Successfully sent to ..."` and sets `NotificationStatus.SUCCESS` around an
     **empty try block**. `spring-boot-starter-mail` is a dependency; there is no `JavaMailSender`
     and no `spring.mail.*` config. The `catch` is unreachable.
 17. `Ai-Service` incident classification is **switched off** — `ConsumeIncidentCreatedEvent`'s body
     is commented out, so `ai.classification.result` has no traffic and no consumer.
-18. All four SLA topics are published and **consumed by nobody**.
-19. `SLAConfiguration` holds test values in production code: resolution SLA for `MEDIUM` = **50
+18. **RESOLVED 2026-10-17 (SLA notifications step 5)** - NotificationService's `SlaEventConsumer` reads all 4 SLA topics.
+    `SlaNotificationService` tells the creator, the assigned engineer (if any) and the supervisor of the engineer (or of
+    the creator when nobody is assigned): one `RECORDED` row + one log line (user id only) per person, **no email**
+    (issue 16 still open). A repeat is skipped by the `X-Event-Id` header (outbox row id) + `(eventId, recipientEmail)`.
+    The original entry, kept for the record:
+    All four SLA topics are published and **consumed by nobody**.
+19. **RESOLVED 2026-10-17** (with issue 59), test first: `SLAConfiguration` now holds the agreed table - CRITICAL
+    15 min / 4 h, HIGH 1 h / 1 day, MEDIUM 4 h / 3 days, LOW 1 day / 7 days (assign within / resolve within).
+    `SLAConfigurationTest` (8 tests) failed on the old values. Old rows keep their old deadlines (issue 66).
+    The original entry, kept for the record:
+    `SLAConfiguration` holds test values in production code: resolution SLA for `MEDIUM` = **50
     seconds**, assignment SLA for `HIGH` = **30 seconds** and `MEDIUM` = 40 seconds
     (vs 864000 s / 86400 s for the others).
 20. `common-security/filter/JwtFilter.java` and `common-security/util/JwtUtil.java` are **entirely
@@ -695,7 +731,11 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     incidents they created** (the code returns before the query runs).
 58. **IncidentService: a read returns only 8 fields** (`IncidentResponseDTO`). No endpoint returns the
     description, category, service, environment, location, timestamps, root cause or resolution notes.
-59. **`CRITICAL` priority has no SLA rule.** IncidentService accepts `LOW/MEDIUM/HIGH/CRITICAL`;
+59. **RESOLVED 2026-10-17** (with issue 19): `CRITICAL` has its own rule, and an unknown or missing priority now
+    **throws** `IllegalArgumentException` instead of getting a silent wrong time (in the Kafka listener that means
+    retry, then the dead-letter topic). A new priority added in IncidentService must be added to both SLA methods.
+    The original entry, kept for the record:
+    **`CRITICAL` priority has no SLA rule.** IncidentService accepts `LOW/MEDIUM/HIGH/CRITICAL`;
     `SLAConfiguration` only handles the first three. For `CRITICAL` the `switch` default gives a resolution SLA
     of **0 seconds** (and assignment 3600). Every CRITICAL incident is "breached" at creation.
 60. **RESOLVED 2026-10-13 (outbox step 4)** - `IdempotencyService` now checks `existsById` first. Proved test-first
@@ -727,13 +767,27 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 ### Found during the outbox (2026-10-13)
 
-65. **`spring.json.trusted.packages` is an exact match, not "starts with".** UserService, NotificationService,
+65. **RESOLVED 2026-10-17** (SLA notifications step 1), test first: NotificationService's setting now lists
+    `com.project.events.enumsUsedByEvents` by name. `TrustedPackagesTest` reads the REAL setting from its
+    `application.properties` and failed before the fix ("not in the trusted packages"); it also checks that a
+    class from any other package is still rejected. The wrong comment is corrected in all 4 services. The
+    original entry, kept for the record:
+    **`spring.json.trusted.packages` is an exact match, not "starts with".** UserService, NotificationService,
     ReportingService and Ai-Service all say in `application.properties` that `com.project.events` "also covers
     `com.project.events.enumsUsedByEvents`". It does not. A reader with that setting rejects
     `SlaBreachingRiskEvent` ("not in the trusted packages"). **No harm today** - nobody reads the SLA topics
     (issue 18). The first SLA-risk consumer must add `com.project.events.enumsUsedByEvents` to its setting (or
     the class must move up a package). Proved by `ReportingEventsOverKafkaTest.todaysTrustedSettingRejectsTheRiskEvent`.
     **Not fixed** (the comments in the 4 files are still wrong).
+
+### Found while fixing the SLA values (2026-10-17)
+
+66. **Existing `incident_report` rows keep the deadlines and breach flags worked out from the OLD test values.**
+    Fixing `SLAConfiguration` changes new incidents only. Old open incidents still carry deadlines of 30-50 seconds, so the
+    breach timer will flag them as breached (and send SLA events once), and `engineer_performance_stats` /
+    `slaSuccessRate` / `expertiseScore` (which Ai-Service uses to rank engineers) stay computed from the old numbers.
+    **Not fixed** - needs a decision: recompute the deadlines of still-open incidents, and/or rebuild the stats.
+    See `notes/LLD/LLD-improvements.md` C5, part 2.
 
 ---
 
@@ -758,7 +812,7 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   producer/consumer services will compile.
 - `auth.getName()` is always a **UUID string**, never a username or email.
 - Prefer fixing the section 9 items deliberately, one cluster at a time, with a test alongside —
-  the codebase has almost no safety net (real tests exist only in `common-trace`, `common-web`, `common-kafka`, `common-outbox`, `APIGateway`, and the outbox tests of IncidentService, AuthService and ReportingService).
+  the codebase has almost no safety net (real tests exist only in `common-trace`, `common-web`, `common-kafka`, `common-outbox`, `APIGateway`, the outbox tests of IncidentService, AuthService and ReportingService, plus AuthService's lockout, ReportingService's SLA and NotificationService's trusted-packages and UserService's supervisor tests).
 - **Error handling is centralized now.** Throw one of `common-web`'s five exceptions; never add a
   per-service `@ControllerAdvice`, and never go back to bare `RuntimeException` for a business
   failure. A bare `RuntimeException` now means precisely "this is our bug, return 500" — a few

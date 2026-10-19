@@ -93,6 +93,22 @@
             <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Tests only (SLA notifications step 4, 2026-10-17): a tiny in-memory database (MySQL mode), so the
+             tests can save and read real NotificationLog rows without a real MySQL. Same version as the other
+             services (already in the local cache). Never part of the built jar. -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <version>2.2.224</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Tests only (SLA notifications step 5): a real Kafka broker started inside the test
+             (SlaListenersOverKafkaTest), to prove the 4 SLA listeners really receive messages. -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
 <!--        <dependency>-->
 <!--            <groupId>com.example</groupId>-->
 <!--            <artifactId>AuthService</artifactId>-->
@@ -115,6 +131,14 @@
         <dependency>
             <groupId>com.project.security</groupId>
             <artifactId>common-security</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+        <!-- SLA notifications step 7 (2026-10-17): this service gets its FIRST HTTP endpoint (GET /notifications/me).
+             common-web gives it the same error shape as every other service, turns a bad page/size into a clear 400
+             instead of a 500, and puts the trace id of HTTP requests into the logs. Auto-configures itself. -->
+        <dependency>
+            <groupId>com.project.web</groupId>
+            <artifactId>common-web</artifactId>
             <version>1.0.0</version>
         </dependency>
 

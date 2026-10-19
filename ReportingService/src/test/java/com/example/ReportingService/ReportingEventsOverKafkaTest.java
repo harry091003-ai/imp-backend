@@ -160,7 +160,7 @@ class ReportingEventsOverKafkaTest {
         // SLA_BreachedType starts with capital letters: exactly where a JSON naming surprise would show up.
         UUID incidentId = UUID.randomUUID();
         SLA_BreachedEvent event = SLA_BreachedEvent.builder().incidentId(incidentId)
-                .SLA_BreachedType("ASSIGNMENT_SLA_BREACHED").build();
+                .SLA_BreachedType("ASSIGNMENT_SLA_BREACHED").createdBy(UUID.randomUUID()).build();   // assignedTo stays null
 
         ConsumerRecord<String, Object> record =
                 roundTrip(topic("Sla-Assignment-Breach-Topic"), incidentId.toString(), event);
@@ -172,7 +172,7 @@ class ReportingEventsOverKafkaTest {
     private static SlaBreachingRiskEvent riskEvent(UUID incidentId) {
         return SlaBreachingRiskEvent.builder().incidentId(incidentId)
                 .previousRiskLevel("HIGH").currentRiskLevel("CRITICAL").riskScore(0.95)
-                .type("RESOLUTION_SLA_BREACHING_RISK").build();
+                .type("RESOLUTION_SLA_BREACHING_RISK").createdBy(UUID.randomUUID()).assignedTo(UUID.randomUUID()).build();
     }
 
     @Test
@@ -190,11 +190,8 @@ class ReportingEventsOverKafkaTest {
 
     @Test
     void todaysTrustedSettingRejectsTheRiskEvent() {
-        // FOUND 2026-10-13 (known issue 65): the consumers' application.properties say the trusted-packages
-        // check is "starts with", so com.project.events "also covers" com.project.events.enumsUsedByEvents.
-        // It does NOT - Spring Kafka matches the package exactly. No harm today (nobody reads the SLA topics,
-        // known issue 18), but the first SLA-risk consumer will reject every message until this is fixed.
-        // This test fails the day that changes - then update the comments and delete this test.
+        // Issue 65: Spring checks the package EXACTLY, so the plain "com.project.events" rejects the risk event.
+        // Fixed where it matters: NotificationService lists the sub-folder (its TrustedPackagesTest checks it).
         UUID incidentId = UUID.randomUUID();
 
         assertThatThrownBy(() -> roundTrip(topic("Sla-Resolution-BreachingRisk-Topic"),
