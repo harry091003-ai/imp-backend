@@ -68,4 +68,12 @@ public class Incident {
 
     private String rootCause;
     private String resolutionNotes;
+
+    // Issue 64 (bug 3): optimistic locking. Every save runs "UPDATE ... WHERE id=? AND version=<what I read>"
+    // and adds 1. If someone else saved first, the version no longer matches, nothing is written and Spring
+    // throws OptimisticLockingFailureException (common-web turns it into 409 CONCURRENT_UPDATE).
+    // Hibernate fills it in; never set it by hand. A new incident starts at 0 (Flyway V4).
+    @Version
+    @Column(name = "version", nullable = false)
+    private Long version;
 }

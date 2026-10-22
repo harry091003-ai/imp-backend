@@ -30,4 +30,12 @@ public interface UserRepository extends JpaRepository<User,UUID>{
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT u FROM User u WHERE u.email = :email")
     Optional<User> findByEmailForUpdate(@Param("email") String email);
+
+    // Issue 67: how many users have this role (bootstrap: "is there an admin yet?").
+    @Query("SELECT COUNT(u) FROM User u JOIN u.roles r WHERE r.rolename = :role")
+    long countUsersWithRole(@Param("role") RoleName role);
+
+    // Issue 67: how many OTHER users have this role (guard: "would this leave zero admins?").
+    @Query("SELECT COUNT(u) FROM User u JOIN u.roles r WHERE r.rolename = :role AND u.userid <> :userId")
+    long countOtherUsersWithRole(@Param("role") RoleName role, @Param("userId") UUID userId);
 }

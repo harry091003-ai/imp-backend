@@ -14,6 +14,7 @@ import com.example.AuthService.kafka.producer.UserRegisteredEventProducer;
 import com.example.AuthService.kafka.producer.UserUpdatedEventProducer;
 import com.example.AuthService.repository.RoleRepository;
 import com.example.AuthService.repository.UserRepository;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.project.outbox.OutboxWriter;
 import com.project.web.exception.ConflictException;
 import com.project.web.exception.UnauthorizedException;
@@ -40,6 +41,7 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.sql.DataSource;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -204,6 +206,22 @@ class AuthServiceOutboxTest {
     }
 
     @Test
+    void theSignupEventListsEveryRoleTheUserReallyHas() throws Exception {
+        // Issue 4. Signup adds ROLE_ENGINEER. Give the user a second role first, so a mix-up shows.
+        User user = newUser("kim", "plain-secret-1");
+        user.getRoles().add(roleRepository.findByRolename(RoleName.ROLE_SUPERVISOR).orElseThrow());
+
+        registeringUserService.RegisteringTheUser(user);
+
+        JsonNode roles = JacksonUtils.enhancedObjectMapper()
+                .readTree(outboxRows().get(0).get("PAYLOAD").toString()).get("roles");
+        Set<String> inEvent = new HashSet<>();
+        roles.forEach(role -> inEvent.add(role.asText()));
+        assertEquals(new HashSet<>(roleNamesOf(user)), inEvent, "the event says the same roles as the database");
+        assertEquals(Set.of("ROLE_ENGINEER", "ROLE_SUPERVISOR"), inEvent);
+    }
+
+    @Test
     void ifTheRegisteredEventCannotBeSavedTheUserIsNotSavedEither() {
         User user = newUser("bob", "plain-secret-1");
 
@@ -302,7 +320,7 @@ class AuthServiceOutboxTest {
         int before = tokenVersionOf(user);
 
         updateRoleService.UpdatingUserRoles("ivan",
-                UpdateUserRolesRequestDTO.builder().role(Set.of("ROLE_SUPERVISOR")).build());
+                UpdateUserRolesRequestDTO.builder().role(Set.of("ROLE_SUPERVISOR")).build(), UUID.randomUUID());
 
         User after = userRepository.findById(user.getUserid()).orElseThrow();
         assertEquals(before + 1, after.getTokenVersion(), "tokens are revoked, and the bump was not overwritten");
@@ -321,7 +339,7 @@ class AuthServiceOutboxTest {
 
         whileTheOutboxTableIsMissing(() -> assertThrows(RuntimeException.class, () ->
                 updateRoleService.UpdatingUserRoles("judy",
-                        UpdateUserRolesRequestDTO.builder().role(Set.of("ROLE_ADMIN")).build())));
+                        UpdateUserRolesRequestDTO.builder().role(Set.of("ROLE_ADMIN")).build(), UUID.randomUUID())));
 
         assertEquals(before, tokenVersionOf(user), "the forced logout was rolled back too");
         assertEquals(rolesBefore, roleNamesOf(user), "the new role was not saved");

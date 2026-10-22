@@ -15,6 +15,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpMethod;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
@@ -160,6 +161,16 @@ class GlobalExceptionHandlerTest {
                 .andExpect(jsonPath("$.message").value("This operation conflicts with existing data."));
     }
 
+    @Test
+    @DisplayName("someone else saved the same row first (optimistic lock) -> 409, reload and try again")
+    void optimisticLockMapsTo409() throws Exception {
+        mockMvc.perform(get("/dummy/stale"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("CONCURRENT_UPDATE"))
+                .andExpect(jsonPath("$.message").value(
+                        "Someone else changed this at the same time. Reload it and try again."));
+    }
+
     // -----------------------------------------------------------------------------
     // the security boundary: unexpected failures must not leak anything
     // -----------------------------------------------------------------------------
@@ -286,6 +297,13 @@ class GlobalExceptionHandlerTest {
         @GetMapping("/unauthorized")
         void unauthorized() {
             throw new UnauthorizedException("BAD_CREDENTIALS", "invalid credentials");
+        }
+
+        @GetMapping("/stale")
+        void stale() {
+            // What Spring throws when a @Version check fails (the JPA one is a subclass of this).
+            throw new OptimisticLockingFailureException(
+                    "Row was updated or deleted by another transaction [update incidents set ... where id=? and version=?]");
         }
 
         @GetMapping("/duplicate")

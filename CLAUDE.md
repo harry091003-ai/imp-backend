@@ -75,6 +75,8 @@ to `spring-boot-starter-parent`, so the root pom's `<properties>` are decorative
 `User`: `userid` (UUID, `GenerationType.UUID`), username, email, **password (BCrypt)**,
 `createdAt/updatedAt/lastLoginAt/lastLogoutAt/passwordUpdatedAt`, `failedLoginAttempts`,
 `accountLocked`, `lockedUntil` (when the lock ends, Flyway `V4`, 2026-10-14), `enabled`, **`TokenVersion`** (drives JWT revocation), `Set<Role>` (`@ManyToMany`).
+Since Flyway `V5` (2026-10-21, issue 67) also `RoleChangeAudit` (`role_change_audit`): one row per role change - whose,
+who did it (`changed_by`, null = the system), old roles, new roles, `source` (`ADMIN_REQUEST`/`BOOTSTRAP`), when.
 
 **UserService** (`users`, `roles`, `user_roles`) — profile mirror, populated from Kafka.
 Same `User` shape **minus password**, plus `status` (`ACTIVE/INACTIVE/SUSPENDED`) and a
@@ -86,7 +88,8 @@ self-referencing hierarchy: `supervisor` (`@ManyToOne`) / `engineers` (`@OneToMa
 **IncidentService** (`incidents`) — `Incident`: id (UUID), title, description(2000),
 `Severity`, `IncidentStatus` (OPEN/IN_PROGRESS/ASSIGNED/RESOLVED/CLOSED/REOPENED), `Priority`,
 `createdBy`/`assignedTo`/`assignedBy` (UUIDs, no FK), `ServiceName`, `IncidentCategory`,
-`Environment`, `affectedSource`, `location`, `rootCause`, `resolutionNotes`, timestamps.
+`Environment`, `affectedSource`, `location`, `rootCause`, `resolutionNotes`, timestamps, and since Flyway `V4`
+(2026-10-22, issue 64) `version` (`@Version`, optimistic locking - a save based on an old read is refused).
 
 **ReportingService** — read-model built from events: `IncidentReport` (heavily indexed, with
 SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetrics` (**never written** - issue 61),
@@ -159,6 +162,9 @@ Every downstream `SecurityConfig` is a copy-paste of the same shape: csrf disabl
 
 Per-service permitAll rules:
 - AuthService: `/auth/**`, `/debug/**`, `/actuator/**`; `/roles/**` → `hasAuthority("ROLE_ADMIN")`. **No `@EnableMethodSecurity`.**
+  Since 2026-10-21 (issue 67) `UpdateRoleService` also refuses: removing your own ADMIN role (`403
+  CANNOT_REMOVE_OWN_ADMIN_ROLE`) and removing the last admin (`409 LAST_ADMIN`). The first admin comes from
+  `AdminBootstrap` (setting `auth.bootstrap.admin-email`, env var `adminemail`), not from a hand edit in MySQL.
 - UserService: `/actuator/**` only; `/internal/**` → `hasRole("INTERNAL_SERVICE")`;
   `/users/**` → `hasAnyRole(ENGINEER, SUPERVISOR, ADMIN)`.
 - ReportingService: `/actuator/**` only; `/internal/**` → `hasRole("INTERNAL_SERVICE")`;
@@ -395,8 +401,8 @@ automatically; do **not** write it into the message by hand. Gateway log lines s
 by hand (issue 52).
 
 **Transactions**: `jakarta.transaction.Transactional` (not the Spring one) applied ad hoc —
-present on some services/consumers/producers, absent from most read paths and from
-`ChangePasswordService`.
+present on some services/consumers/producers, absent from most read paths. (`ChangePasswordService` has used a
+`TransactionTemplate` since 2026-10-22, bug 5.)
 
 **Comments**: heavily commented, including long teaching notes and some Hinglish
 (`ye line se... koi link nahi hai`, `hamne abhi ki leye ye band kiya hai`). Large commented-out
@@ -414,6 +420,8 @@ fails to start without them):
 - `user`, `password` — MySQL credentials (`password` is also the PostgreSQL password for Ai-Service)
 - `secretkey` — base64 JWT secret, shared by AuthService / UserService / APIGateway
 - `apikey` — Google Gemini API key (Ai-Service)
+- `adminemail` — **optional** (AuthService, since 2026-10-21). Empty = off. Set it once to an existing account's
+  email to make the FIRST admin at start-up (works only while no admin exists), then remove it. Never a password.
 
 **Build order** (`shared-events` and `common-security` must be installed first —
 `shared-events` is currently **absent from the local `~/.m2`**, `common-security:1.0.0` is present):
@@ -443,14 +451,14 @@ See `notes/FLYWAY-NOTES.md` for the full explanation and per-migration log (pers
 folder, gitignored - see PROGRESS.md).
 
 **Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
-`common-web` 19, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
-Kafka + real JPA), `APIGateway` 56 (53 + 3 `GatewayRoutesTest`), `IncidentService` 9, `AuthService` 24 (16 outbox + 8 `AccountLockoutTest`)
+`common-web` 20, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
+Kafka + real JPA), `APIGateway` 56 (53 + 3 `GatewayRoutesTest`), `IncidentService` 26 (9 + 17 `IncidentRulesTest`), `AuthService` 43 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 6 `ChangePasswordTest`)
 `ReportingService` 27 (19 outbox, incl. 4 "the SLA event says who": H2 + embedded Kafka + a full-start test each, + 8
 `SLAConfigurationTest`, plain Java), `NotificationService` 43 (`TrustedPackagesTest` 5 + `UserCredentialDtoTest` 2 +
 `NotificationMigrationV2Test` 6, plain Java; `NotificationLogStoreTest` 4 + `SlaNotificationTest` 11, H2;
 `SlaListenersOverKafkaTest` 2, whole service + embedded Kafka; `IncidentNotificationTest` 4, H2; `MyNotificationsApiTest` 9,
-whole service + real HTTP requests) and `UserService` 4 (`SupervisorInBatchTest`, H2) = 242, **+ the 8 `contextLoads()`
-(one per service, safe since option B, 2026-10-19) = 250**. ReportingService's wiring test uses a test-only
+whole service + real HTTP requests) and `UserService` 4 (`SupervisorInBatchTest`, H2) = 279, **+ the 8 `contextLoads()`
+(one per service, safe since option B, 2026-10-19) = 287**. ReportingService's wiring test uses a test-only
 `src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
 with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest`, or ALL of them with
 `./mvnw.cmd -o test`: **since option B (2026-10-19) every `contextLoads()` runs in the test world too** (in-memory
@@ -469,7 +477,14 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 ### Correctness bugs
 
-1. `ChangePasswordService.changePassword` — sets the new password on a `User` with no
+1. **RESOLVED 2026-10-22** (small bug 5), test first (`ChangePasswordTest`, 6 tests; on the old code the new password
+   was really LOST without open-session-in-view, and `passwordUpdatedAt` was not set). Now ONE `TransactionTemplate`:
+   load, check the old password (401), refuse a new password equal to the old one (`400 NEW_PASSWORD_SAME_AS_OLD`,
+   checked only after the old one is right), set the new hash + `passwordUpdatedAt`, save, log out (joins the same
+   transaction). Break checks: without the transaction the password changed even when the logout failed; without the
+   `save` line all tests still pass (Hibernate saves a managed entity at commit - the line is kept for readers).
+   The original entry, kept for the record:
+   `ChangePasswordService.changePassword` — sets the new password on a `User` with no
    `@Transactional` and no `save`, then delegates to `LogoutUserService.LogoutUser()`, which re-loads
    the user and saves it. **CORRECTED 2026-10-01: the password IS saved today — but only by luck.**
    Spring Boot's default *open-session-in-view* keeps one database session for the whole request, so
@@ -484,10 +499,17 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 2. `InternalUserController.getOwnSpecificDetails` — `@GetMapping("/UserSpecificDetails/{userId}")`
    but the parameter is `@PathVariable UUID userid`. Name mismatch, so the mapping cannot resolve.
    Both `IncidentService` and `NotificationService` `UserClient`s call this endpoint.
-3. `IncidentService.updateIncidentStatusBasedOnRole` — sets `rootCause` and `resolutionNotes`
+3. **RESOLVED 2026-10-21** (small bug 1), test first (`IncidentRulesTest`, 6 tests). A missing or blank text now keeps
+   the saved one; RESOLVED needs a root cause AND resolution notes (sent now or saved before), else
+   `400 ROOT_CAUSE_REQUIRED`; REOPENED keeps the old texts. A history table of every root cause was left for later.
+   The original entry, kept for the record:
+   `IncidentService.updateIncidentStatusBasedOnRole` — sets `rootCause` and `resolutionNotes`
    unconditionally from the request, so any non-RESOLVED status update **nulls out** a
    previously-recorded root cause.
-4. `RegisteringUserService` — `.roles(user.getRoles().stream().map(role1 -> role.getRolename()...))`
+4. **RESOLVED 2026-10-19**, test first (`AuthServiceOutboxTest.theSignupEventListsEveryRoleTheUserReallyHas`, failed
+   before: database `[ENGINEER, SUPERVISOR]`, event `[ENGINEER]`). Harmless until then, since signup gives one role.
+   The original entry, kept for the record:
+   `RegisteringUserService` — `.roles(user.getRoles().stream().map(role1 -> role.getRolename()...))`
    maps every element to the captured outer `role`, ignoring `role1`.
 5. `LogoutController.LogoutOfOwn` uses a bare `@RequestMapping("/user")` (accepts **every** HTTP
    verb, including GET); `LogoutController.LogoutAnyUser(User)` has **no mapping at all** and is
@@ -721,12 +743,18 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 ### Found while re-reading the LLD notes against the code (2026-10-01) - none fixed
 
-56. **IncidentService: the assign endpoint has no ownership check.** `AssignIncident` checks that the caller
+56. **RESOLVED 2026-10-21** (small bug 2), test first (`IncidentRulesTest`, 9 tests). Admin: any incident, any active
+    engineer. Supervisor: only an incident `supervisorMayTouch` allows (the same rule as change-status), and only to an
+    engineer of their team (`403 INCIDENT_NOT_IN_YOUR_TEAM` / `ENGINEER_NOT_IN_YOUR_TEAM`). Everyone: RESOLVED/CLOSED →
+    `409 INCIDENT_ALREADY_CLOSED`, same engineer again → `409 ALREADY_ASSIGNED_TO_THIS_ENGINEER`. The original entry:
+    **IncidentService: the assign endpoint has no ownership check.** `AssignIncident` checks that the caller
     is ACTIVE, the incident exists, and the target is an ACTIVE engineer - never that the target is in
     this supervisor's team, or that the incident is the supervisor's. Any supervisor can assign any incident
     to any engineer, and can re-assign a `RESOLVED` incident. (Read, update-details and change-status do
     have data-level checks.)
-57. **IncidentService: the "what may a supervisor touch" rule is typed four times and the copies disagree**
+57. **PARTLY 2026-10-21:** assign and change-status now share one method, `supervisorMayTouch`. List, read-one and
+    update-details still have their own copies. The original entry:
+    **IncidentService: the "what may a supervisor touch" rule is typed four times and the copies disagree**
     (list, read-one, update, status), and a supervisor with no engineers gets an **empty list even for the
     incidents they created** (the code returns before the query runs).
 58. **IncidentService: a read returns only 8 fields** (`IncidentResponseDTO`). No endpoint returns the
@@ -760,7 +788,14 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     `accountLocked` and `failedLoginAttempts`, but nothing writes those columns after registration, so
     every user shows `enabled=false`, `accountLocked=false`, `failedLoginAttempts=0` - even though
     AuthService has `enabled=true`.
-64. **No entity in any service has `@Version`**, so two people changing the same row at the same moment
+64. **RESOLVED FOR `Incident` 2026-10-22** (small bug 3), test first. `Incident.version` (`@Version`, Flyway `V4`,
+    `DEFAULT 0` for old rows): a save based on an old read is refused, nothing is written, its outbox event is rolled
+    back with it, and `common-web`'s `GlobalExceptionHandler` turns Spring's `OptimisticLockingFailureException` into
+    **`409 CONCURRENT_UPDATE`** ("reload and try again") for every service. `IncidentRulesTest` forces the overlap (B reads,
+    A saves, B saves): before the fix B said OK and overwrote A. **Still without `@Version`:** every other entity. Also
+    not covered: a user editing an old SCREEN for minutes - the service re-reads the incident at the start of each
+    request, so that needs the client to send back the version it saw (later). The original entry:
+    **No entity in any service has `@Version`**, so two people changing the same row at the same moment
     silently overwrite each other (last save wins). Most visible on `Incident` (two supervisors assigning
     the same incident). Fix: add a `version` column + `@Version`, map the optimistic-lock failure to a 409
     `ConflictException`, and write a test that proves the second save fails.
@@ -788,6 +823,28 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     `slaSuccessRate` / `expertiseScore` (which Ai-Service uses to rank engineers) stay computed from the old numbers.
     **Not fixed** - needs a decision: recompute the deadlines of still-open incidents, and/or rebuild the stats.
     See `notes/LLD/LLD-improvements.md` C5, part 2.
+
+### Found while fixing the small bugs (2026-10-21)
+
+67. **RESOLVED 2026-10-21**, test first (`RoleManagementTest`, 12 tests; 7 failed on the old code, incl. two admins
+    removing each other at the same moment → `[OK, OK]` = zero admins). (a) `AdminBootstrap` makes the first admin from
+    the setting, through `UpdateRoleService` (so `roles.update` is sent), only while no admin exists; (b) 403 for your
+    own ADMIN role, 409 `LAST_ADMIN`, with the ADMIN role row locked (`findByRolenameForUpdate`) so every role change
+    runs one after the other; (c) one `role_change_audit` row per change, same transaction (Flyway `V5`, not yet run).
+    No API to READ the audit yet (SQL only). The original entry, kept for the record:
+    **The first admin is made by editing the AuthService database by hand, and roles have no guard rails.**
+    Signup always gives `ROLE_ENGINEER` (correct). Roles change only through `PUT /roles/{username}/update` (admin only;
+    replaces the whole set, logs the user out, sends `roles.update`). Gaps: (a) a hand edit sends **no** `roles.update`,
+    so UserService's copy still says ENGINEER for that admin; (b) nothing stops removing the **last** admin (then nobody
+    can change roles any more); (c) no record of who changed whose roles, only a debug log line. **Not fixed** - a
+    proposal (bootstrap admin from a setting, last-admin guard, audit row) is in PROGRESS.md "Small bugs".
+
+### Found while fixing the password change (2026-10-22)
+
+68. **A wrong OLD password on `POST /password/update` is not counted by the account lockout.** Only `/auth/login`
+    calls `LoginAttemptService.recordFailedLogin`. Someone holding a stolen (still valid) token could keep guessing
+    the old password there. The gateway's per-user limit (20/sec, 300/min) slows it, nothing stops it. **Not fixed** -
+    needs a decision: count it in the same counter (and lock the account), or a separate small limit.
 
 ---
 
@@ -899,5 +956,11 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   `RuntimeException` (all of `common-web`'s exceptions are one) rolls back everything saved in that transaction.
   Use `@Transactional(TxType.REQUIRES_NEW)` on a method of a separate bean, like `LoginAttemptService`. Calling
   such a method from the same class does nothing: Spring only applies `@Transactional` to calls from outside.
+- **Roles change only through `UpdateRoleService` (issue 67)** - never by a hand edit in MySQL: a hand edit sends no
+  `roles.update` (UserService keeps the old roles) and leaves no audit row. Its transaction locks the ADMIN role row
+  first; keep that line, or two admins removing each other at once can leave zero admins (proved by a test).
+- **`Incident` has `@Version` (issue 64).** Never set `version` by hand and never build an `Incident` with an existing
+  id to save it (Spring Data would treat a null version as a NEW row). Load it, change it, save it. A conflict is
+  `409 CONCURRENT_UPDATE` from `common-web` - do not catch `OptimisticLockingFailureException` in a service.
 - **A `FAILED` outbox row is never retried by itself.** It means the message could not be built or sent (for
   example the event class was renamed or removed). Do not rename or move an event class while rows for it exist.

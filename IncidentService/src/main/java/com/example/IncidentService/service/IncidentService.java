@@ -9,6 +9,7 @@ import com.example.IncidentService.repository.IncidentRepository;
 import com.project.events.IncidentAssignedEvent;
 import com.project.events.IncidentCreatedEvent;
 import com.project.events.IncidentStatusUpdatedEvent;
+import com.project.web.exception.ConflictException;
 import com.project.web.exception.ForbiddenException;
 import com.project.web.exception.NotFoundException;
 import com.project.web.exception.ValidationException;
@@ -24,6 +25,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 
 import java.time.Duration;
@@ -132,6 +134,17 @@ private final TransactionTemplate transactionTemplate;
        return isActive;
     }
 
+    // May this supervisor touch this incident? Used by assign and by change-status, so both follow one rule.
+    // Yes if they created or assigned it, or if it was created by / assigned to an engineer of their team.
+    // (List and read-one still have their own copies - issue 57.)
+    private static boolean supervisorMayTouch(Incident incident, UUID supervisorId, List<UUID> teamEngineerIds) {
+        boolean isOwnIncident = supervisorId.equals(incident.getCreatedBy())
+                || supervisorId.equals(incident.getAssignedBy());
+        boolean isTeamIncident = (incident.getCreatedBy() != null && teamEngineerIds.contains(incident.getCreatedBy()))
+                || (incident.getAssignedTo() != null && teamEngineerIds.contains(incident.getAssignedTo()));
+        return isOwnIncident || isTeamIncident;
+    }
+
 public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedToUserId, Authentication auth) {
 //1.firstly we are checking is the User who try to Assign the incident is Active or not
     UUID AssignerId=UUID.fromString(auth.getName());
@@ -145,6 +158,26 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
 
     Incident incident = incidentRepository.findById(IncidentId).orElseThrow(
             () -> new NotFoundException("INCIDENT_NOT_FOUND", "Incident not found: " + IncidentId));
+
+    // Issue 56 (bug 2): an admin may assign anything. A supervisor only their own or their team's incident,
+    // the same rule as changing the status (supervisorMayTouch).
+    boolean isAdmin = auth.getAuthorities().stream().anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN"));
+    List<UUID> teamEngineerIds = isAdmin ? List.of() : userClient.getEngineersUnderSupervisor(AssignerId);
+    if (!isAdmin && !supervisorMayTouch(incident, AssignerId, teamEngineerIds)) {
+        log.warn("User {} tried to assign incident {} outside their team.", AssignerId, IncidentId);
+        throw new ForbiddenException("INCIDENT_NOT_IN_YOUR_TEAM",
+                "You can only assign incidents of your own team.");
+    }
+    // A finished incident is not quietly reopened by an assign. Reopen it first (status REOPENED).
+    if (incident.getIncidentStatus() == IncidentStatus.RESOLVED || incident.getIncidentStatus() == IncidentStatus.CLOSED) {
+        throw new ConflictException("INCIDENT_ALREADY_CLOSED",
+                "This incident is " + incident.getIncidentStatus() + ". Reopen it first.");
+    }
+    // Same engineer again: would send a second "assigned" event and count +1 workload again.
+    if (assignedToUserId.equals(incident.getAssignedTo())) {
+        throw new ConflictException("ALREADY_ASSIGNED_TO_THIS_ENGINEER",
+                "This incident is already assigned to this engineer.");
+    }
 
     //2.Is the Engineer to whom we want to assign exist and  2. is he is active and 3.has the role of Engineer or not
     UserValidationDTO engineer = userClient.getUser(assignedToUserId);
@@ -163,7 +196,12 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
         throw new ValidationException("TARGET_USER_NOT_ENGINEER",
                 "Incidents can only be assigned to a user with the ENGINEER role.");
     }
-
+    // A supervisor may only pick an engineer of their own team.
+    if (!isAdmin && !teamEngineerIds.contains(assignedToUserId)) {
+        log.warn("User {} tried to assign incident {} to engineer {} outside their team.", AssignerId, IncidentId, assignedToUserId);
+        throw new ForbiddenException("ENGINEER_NOT_IN_YOUR_TEAM",
+                "You can only assign incidents to engineers of your own team.");
+    }
 
     UUID SupervisorOrAdminId = UUID.fromString(auth.getName());
     // if all above condition is true then we can assign the incident to that engineer
@@ -489,14 +527,7 @@ return incident;
 
             List<UUID> teamEngineerIds = userClient.getEngineersUnderSupervisor(userId);
 
-            boolean isOwnIncident =
-                    incident.getCreatedBy().equals(userId) ||
-                            (incident.getAssignedBy() != null && incident.getAssignedBy().equals(userId));
-
-            boolean isTeamIncident =
-                    (incident.getAssignedTo() != null && teamEngineerIds.contains(incident.getAssignedTo())) || (teamEngineerIds.contains(incident.getCreatedBy()) );
-
-            allowed = isOwnIncident || isTeamIncident;
+            allowed = supervisorMayTouch(incident, userId, teamEngineerIds);
         }
 
         // ENGINEER
@@ -513,13 +544,22 @@ return incident;
                     "You are not allowed to update the status of this incident.");
         }
 
+        // Issue 3 (bug 1): a missing or blank text keeps the saved one (REOPENED no longer erases it).
+        String rootCause = StringUtils.hasText(request.getRootCause()) ? request.getRootCause() : incident.getRootCause();
+        String resolutionNotes = StringUtils.hasText(request.getResolutionNotes()) ? request.getResolutionNotes() : incident.getResolutionNotes();
+        // RESOLVED needs both texts, sent now or saved before. Ai-Service learns from them.
+        if (request.getStatus() == IncidentStatus.RESOLVED
+                && (!StringUtils.hasText(rootCause) || !StringUtils.hasText(resolutionNotes))) {
+            throw new ValidationException("ROOT_CAUSE_REQUIRED",
+                    "To resolve an incident, give a root cause and resolution notes.");
+        }
+
         // Update status
         String oldIncidentStatus=incident.getIncidentStatus().name();
         incident.setIncidentStatus(request.getStatus());
         incident.setUpdatedAt(LocalDateTime.now());
-        // If the status is updated to RESOLVED then we need to set the root cause and resolutionNotes as well
-        incident.setRootCause(request.getRootCause());
-        incident.setResolutionNotes(request.getResolutionNotes());
+        incident.setRootCause(rootCause);
+        incident.setResolutionNotes(resolutionNotes);
 
         // Outbox step 2: the UserService calls (IsUserActive, team list) are done above, outside any
         // transaction. Now ONE short transaction: save the change AND its event row together.

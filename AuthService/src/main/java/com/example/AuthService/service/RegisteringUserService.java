@@ -80,7 +80,8 @@ public RegisteringUserService(PasswordEncoder password_encoder, RoleRepository r
                 .userid(user.getUserid())
                 .username(user.getUsername())
                 .email(user.getEmail())
-                .roles(user.getRoles().stream().map(role1 ->role.getRolename().name()).collect(Collectors.toSet()))
+                // Issue 4: was role.getRolename() (the outer variable), so every role came out as ENGINEER.
+                .roles(user.getRoles().stream().map(userRole -> userRole.getRolename().name()).collect(Collectors.toSet()))
                 .createdAt(user.getCreatedAt())
                 .updatedAt(user.getUpdatedAt())
                 .lastLoginAt(user.getLastLoginAt())

@@ -12,6 +12,8 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.UUID;
+
 @RestController
 @RequestMapping("/roles")
 public class RoleController {
@@ -34,7 +36,8 @@ private final UpdateRoleService service;
         // Trimmed: no username (personal data), no authorities (the /roles/** rule already
         // guarantees ROLE_ADMIN). Kept: who asked (their id) and what they asked for.
         log.debug("Role update requested by user {}: roles {}", auth.getName(), requestDTO.getRole());
-        return   service.UpdatingUserRoles( username,requestDTO);
+        // Issue 67: pass who asked (the admin's user id), for the guards and the audit row.
+        return   service.UpdatingUserRoles( username,requestDTO, UUID.fromString(auth.getName()));
 
     }
 

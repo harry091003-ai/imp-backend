@@ -36,6 +36,8 @@ Last updated: 2026-09-30
 | SLA notifications (Phase 3, log only) | SLA alerts are saved per person and visible with a GET call - no email | ✅ Done — all 7 steps 2026-10-17 to 2026-10-19 (the step 4 SQL runs at your next start) |
 | Testing guide (2026-10-19) | `notes/testing-in-our-project.md`: why / what / how / is it safe, with the proof re-run on every module | ✅ Written |
 | Option B (2026-10-19) | The 8 auto-generated `contextLoads()` tests no longer touch the real system | ✅ Done - "run all tests" is safe on every service (proof below) |
+| Small bugs (2026-10-19) | Issues 4, 3, 56, 64, 1 - one at a time, test first | ✅ All 5 done (bug 5 on 2026-10-22) |
+| Role management (2026-10-21) | Issue 67: first admin from a setting, last-admin guard, audit row | ✅ Done (Flyway `V5` not yet run on your DB) |
 | SLA values (Phase 1) | Real SLA times for all 4 priorities, CRITICAL included (issues 19 + 59) | ✅ Done — 2026-10-17, test first. Old rows are NOT recalculated (issue 66) |
 | Lockout fix (Phase 1) | 5 wrong passwords really lock the account, and the lock ends after 15 minutes (issues 55 + 6) | ✅ Done — 2026-10-14, test first (not yet tried by hand on the real system) |
 | Track C (rest) | Not decided yet | ❓ Need to discuss |
@@ -2571,6 +2573,189 @@ is identical before and after; all tests of the 5 touched services pass (158). T
 were NOT touched: Flyway checks every byte of an applied migration, comments included.
 
 **Notes:** `notes/sla-notifications.md` (steps 1-7: need, goal, flow charts, how to check on the real system).
+
+---
+
+# Small bugs — one at a time, test first (started 2026-10-19)
+
+Order agreed: issue 4 → 3 → 56 → 64 → 1.
+
+| # | Issue | What was wrong | Status |
+|---|---|---|---|
+| Bug 4 | 4 | Signup event listed every role as the one outer `role` (`role1` ignored) | ✅ Done 2026-10-19 |
+| Bug 1 | 3 | Any status change overwrites `rootCause` / `resolutionNotes`, even with nothing | ✅ Done 2026-10-21 |
+| Bug 2 | 56 | Assign has no ownership check; a RESOLVED incident can be re-assigned | ✅ Done 2026-10-21 |
+| Bug 3 | 64 | No `@Version`: two people at once, last save wins | ✅ Done 2026-10-22 (Flyway `V4` not yet run on your DB) |
+| Bug 5 | 1 | Password change saved only by luck (open-session-in-view); `passwordUpdatedAt` never set | ✅ Done 2026-10-22 (+ new rule: new ≠ old) |
+
+## Bug 4 (issue 4) — the signup event lists the real roles ✅ 2026-10-19
+
+**Problem:** `RegisteringUserService` built the event's role list with `map(role1 -> role.getRolename())`. It used
+the outer `role` (always ROLE_ENGINEER) instead of each element. Harmless today (a new user has one role), wrong the
+day a user starts with two.
+
+**Test first:** `AuthServiceOutboxTest.theSignupEventListsEveryRoleTheUserReallyHas` gives the user ROLE_SUPERVISOR
+before signup, then compares the event's roles with the database. Old code: **failed** (database
+`[ROLE_ENGINEER, ROLE_SUPERVISOR]`, event `[ROLE_ENGINEER]`) - that run is also the break check.
+
+**Fix:** `map(userRole -> userRole.getRolename().name())`.
+
+**Proof:** all 26 AuthService tests pass (`./mvnw.cmd -o test`), 0 real addresses in the log.
+
+**Files:** `AuthService/.../service/RegisteringUserService.java` (1 line + 1 comment line),
+`AuthService/src/test/.../service/AuthServiceOutboxTest.java` (1 new test). No database change.
+
+## Bug 1 (issue 3) — a status change no longer erases the root cause ✅ 2026-10-21
+
+**Problem:** `updateIncidentStatusBasedOnRole` always copied `rootCause` and `resolutionNotes` from the request. A
+REOPENED with no texts erased the saved ones. RESOLVED with no texts was accepted.
+
+**Rules agreed:**
+1. A missing or blank text never erases a saved one. A real text replaces it.
+2. RESOLVED needs a root cause AND resolution notes (sent now, or saved before). Else `400 ROOT_CAUSE_REQUIRED`.
+3. REOPENED keeps the old texts; the next RESOLVED may replace them.
+
+**Behaviour change to know:** a client that resolves without texts now gets a 400. On purpose: Ai-Service learns
+from resolved incidents.
+
+## Bug 2 (issue 56) — assign has an ownership check ✅ 2026-10-21
+
+| Who | Which incident | To which engineer |
+|---|---|---|
+| Admin | any | any active engineer |
+| Supervisor | only one `supervisorMayTouch` allows: created or assigned by them, or created by / assigned to their team | only an engineer of their team |
+
+For everyone: RESOLVED or CLOSED → `409 INCIDENT_ALREADY_CLOSED` ("reopen it first"; before, it quietly became
+ASSIGNED). The same engineer again → `409 ALREADY_ASSIGNED_TO_THIS_ENGINEER` (before, a second event, +1 workload).
+New errors: `403 INCIDENT_NOT_IN_YOUR_TEAM`, `403 ENGINEER_NOT_IN_YOUR_TEAM`. The team list is fetched before the
+transaction (outbox rule). Change-status now uses the same `supervisorMayTouch` (same logic, moved, not changed);
+list / read-one / update-details keep their own copies (issue 57, not touched).
+
+## Proof for bugs 1 and 2
+
+- **Test first:** new `IncidentRulesTest` (15 tests). On the old code **11 failed**, each one a bug; the 4 that
+  passed are the "allowed" cases, which guard against blocking too much.
+- **After the fix:** all 24 IncidentService tests pass (`./mvnw.cmd -o test`), 0 real addresses in the log.
+- **Break checks on the new code** (restored afterwards, byte-identical): the team rule without "team incidents" →
+  5 tests fail; blank text erasing again → `blankTextsDoNotEraseEither` fails.
+- `IncidentServiceOutboxTest`'s assign test now gives the supervisor a team with that engineer (the new rule).
+
+**Files:** `IncidentService/.../service/IncidentService.java` (status texts, assign checks, new `supervisorMayTouch`),
+`IncidentService/src/test/.../service/IncidentRulesTest.java` (new), `IncidentServiceOutboxTest.java` (1 line).
+No database change.
+
+## Bug 5 (issue 1) — the password change no longer depends on luck ✅ 2026-10-22
+
+**Problem:** `changePassword` set the new password on the user object but never saved it and had no transaction. It
+was saved only because Spring's open-session-in-view kept the object "managed" and the logout's save carried it. If
+that setting were ever switched off, the user would see "Password changed successfully", keep the OLD password, and
+be logged out everywhere. `passwordUpdatedAt` was never set.
+
+**Fix (one file, `ChangePasswordService`), ONE `TransactionTemplate`:**
+1. load the user; 2. old password wrong → `401 INVALID_OLD_PASSWORD`; 3. **new rule (your request):** new password
+equal to the current one → `400 NEW_PASSWORD_SAME_AS_OLD` (checked only after the old password is right); 4. set the
+new hash and `passwordUpdatedAt = now`; 5. `save` (explicit); 6. `LogoutUser()` - revokes every old login and saves the
+logged-out event; it joins this transaction. All saved, or none.
+
+**Proof:**
+- New `ChangePasswordTest` (6). Its setup has no open-session-in-view, so the hidden luck is gone. On the old code
+  **3 failed**: the new password was LOST (the old one still worked), the date was not set, same-as-old was accepted.
+  (First version of the date test passed wrongly - signup had just set the date. Fixed by setting an old date first.)
+- After: all 44 AuthService tests pass, 0 real addresses in the log.
+- Break 1 - transaction removed, `save` kept: "both or neither" fails (new password saved although the logout failed).
+- Break 2 - `save` removed, transaction kept: all pass. Inside a transaction Hibernate writes a changed (managed) object
+  by itself at commit ("dirty checking") - the same reason the old code worked by luck. The line stays for readers.
+- No database change.
+
+**Found, not fixed (issue 68):** a wrong old password here is not counted by the account lockout.
+
+**Files:** `AuthService/.../service/ChangePasswordService.java`, `AuthService/src/test/.../ChangePasswordTest.java` (new).
+**Notes:** `notes/password-change-and-transactions.md`.
+
+## Bug 3 (issue 64) — two people saving the same incident at once ✅ 2026-10-22
+
+**Problem:** each request reads the incident, does its checks (and slow UserService calls), then saves. Two
+requests that overlap both read the same old incident; the second save silently overwrites the first ("lost
+update"), and BOTH "assigned" events are sent (Reporting counts +1 workload for both engineers).
+
+**Fix - optimistic locking:**
+1. `Incident.version` with `@Version` (Flyway `V4`: `bigint NOT NULL DEFAULT 0`, so old rows start at 0).
+2. Hibernate now saves with `UPDATE ... SET version = N+1 WHERE id = ? AND version = N`. If someone saved first, 0 rows
+   match, nothing is written, and Spring throws `OptimisticLockingFailureException`. The transaction rolls back, so the
+   loser's outbox event is not saved either.
+3. `common-web`'s `GlobalExceptionHandler` maps that exception to **409 `CONCURRENT_UPDATE`** ("Someone else changed
+   this at the same time. Reload it and try again."). Before, it would have been a 500. Central, so any entity that
+   gets `@Version` later is covered too.
+
+**Proof:**
+- Test first. `GlobalExceptionHandlerTest.optimisticLockMapsTo409` failed (got 500). In `IncidentRulesTest`,
+  `twoAssignsAtTheSameMomentTheSecondIsRefusedNotSilentlyOverwritten` forces the overlap with two latches (B reads,
+  A saves, B saves its old copy): on the old code B said **OK** and overwrote A. `everySavedChangeRaisesTheVersionByOne`
+  failed (no column).
+- After: common-web 20/20, IncidentService 27/27 (all tests), race test 3 more runs green; the other 5 services that use
+  common-web still start (`contextLoads`). 0 real addresses in any log.
+- Break check: `@Version` removed → both new tests fail. Restored, byte-identical.
+- **Not proved by tests:** the `V4` SQL itself (H2 tables come from Hibernate). Checked on the first real start
+  (Flyway, then `ddl-auto=validate`).
+
+**Limits (on purpose):** only `Incident` has a version. And the service re-reads the incident at the start of each
+request, so this protects overlapping *requests*; a person looking at an old screen for minutes is protected only if
+the client sends back the version it saw (an `If-Match`-style check) - a later idea.
+
+**Files:** `IncidentService/.../entity/Incident.java` (`version` field), `IncidentService/.../db/migration/V4__add_incident_version.sql`
+(new), `common-web/.../handler/GlobalExceptionHandler.java` (409 mapping; **re-installed** into `~/.m2`), tests:
+`IncidentRulesTest.java` (2 new), `GlobalExceptionHandlerTest.java` (1 new). **Notes:** `notes/optimistic-locking.md`.
+
+## Role management (issue 67) — first admin, guard rails, audit ✅ 2026-10-21
+
+**Problems:** (1) the first admin was made by a hand edit in MySQL, which sends no `roles.update`, so UserService
+kept saying ENGINEER; (2) nothing stopped removing the last admin; (3) no record of who changed whose roles.
+
+**What changed:**
+1. `AdminBootstrap` (new, `config/`): at start-up, if `auth.bootstrap.admin-email` (env var `adminemail`) is set AND no
+   admin exists, that account becomes `ROLE_ADMIN` through `UpdateRoleService.MakeFirstAdmin` - the normal path, so
+   `roles.update` is sent, the user is logged out, an audit row is saved. Admin exists / empty / unknown email → nothing
+   (a warning for the unknown email; the service still starts). The email is never logged.
+2. Guards in `UpdateRoleService` (only when a change takes ADMIN away): your own ADMIN role → `403
+   CANNOT_REMOVE_OWN_ADMIN_ROLE`; the last admin → `409 LAST_ADMIN`. The transaction first locks the ADMIN row of the
+   `roles` table (`SELECT ... FOR UPDATE`), so role changes run one after the other.
+3. Audit: new table `role_change_audit` (Flyway `V5`), one row per change (whose, who, old, new, source, when), saved
+   in the same transaction as the change.
+4. `RoleController` passes the admin's id; `UpdatingUserRoles` and the bootstrap share one private `changeRoles`.
+
+**Proof:**
+- New `RoleManagementTest` (12). On the old code **7 failed** - including the race: two admins removing each other
+  at the same moment both succeeded (`[OK, OK]`), leaving **zero** admins. The 5 that passed are the "allowed" cases.
+- After the fix all 38 AuthService tests pass, 0 real addresses in the log; the race test passed 3 more runs in a row.
+- Break checks (restored, byte-identical): no lock → the race test fails; no own-role guard → its test fails;
+  bootstrap without "admin exists" → its test fails.
+- **Not proved by tests:** the `V5` SQL itself (tests use H2 with tables made by Hibernate). It is checked on the first
+  real start: Flyway runs it, then `ddl-auto=validate` compares it with `RoleChangeAudit` and stops the service if they
+  differ. Column types copy ones already validated (`binary(16)` like `users.userid`, `datetime(6)` like `locked_until`).
+
+**How to make the first admin (once):** sign up → set env var `adminemail` to that email → start AuthService → log
+says "user <id> is now ADMIN" → remove `adminemail` → log in again (the old token was revoked).
+
+**Files:** `AuthService/.../config/AdminBootstrap.java` (new), `entity/RoleChangeAudit.java` (new),
+`repository/RoleChangeAuditRepository.java` (new), `db/migration/V5__role_change_audit.sql` (new),
+`service/UpdateRoleService.java`, `repository/UserRepository.java` (2 count queries), `repository/RoleRepository.java`
+(locking read), `controller/RoleController.java` (passes the admin's id), `application.properties` (setting),
+tests: `RoleManagementTest.java` (new), `AuthServiceOutboxTest.java` (2 calls pass an admin id).
+**Notes:** `notes/assign-rules-and-role-management.md`.
+
+## Later ideas (not started, kept so they are not lost)
+
+1. **History of every root cause** - a table with one row per resolve (who, when, root cause, notes), so a REOPENED
+   incident keeps every earlier attempt, not just the last one. Bigger than the bug fix; nobody needs it yet.
+   Also in `notes/LLD/LLD-improvements.md` E7.
+2. ~~**Role management (issue 67)**~~ **Done 2026-10-21** (section above). Still open from it: an API to READ the audit
+   rows (today SQL only). The original proposal:
+   - keep signup = ENGINEER only (never let a user choose their role);
+   - first admin: a one-time start-up step that promotes an EXISTING account named in a setting
+     (`auth.bootstrap.admin-email`), only while no admin exists, through `UpdateRoleService` so `roles.update` is sent
+     and UserService learns it. No password in any setting. Then remove the setting;
+   - guard: never remove the last admin (`409`); an admin may not take away their own ADMIN role;
+   - audit: one row per role change (who, whose, old roles, new roles, when).
 
 ---
 

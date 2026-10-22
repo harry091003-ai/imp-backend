@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
@@ -214,6 +215,20 @@ public class GlobalExceptionHandler {
                 request.getMethod(), request.getRequestURI(), message);
 
         return build(HttpStatus.BAD_REQUEST, "MISSING_PARAMETER", message, request, null);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // 6b. Optimistic lock (issue 64): the row has a @Version and someone else saved it after we read it.
+    //     Nothing was written. The caller should reload and try again. Covers the JPA subclass
+    //     ObjectOptimisticLockingFailureException too. The raw message holds SQL: never forwarded.
+    // ---------------------------------------------------------------------------------
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    public ResponseEntity<ErrorResponse> handleOptimisticLock(OptimisticLockingFailureException ex,
+                                                              HttpServletRequest request) {
+        log.warn("{} {} -> 409 CONCURRENT_UPDATE: {}",
+                request.getMethod(), request.getRequestURI(), ex.getClass().getSimpleName());
+        return build(HttpStatus.CONFLICT, "CONCURRENT_UPDATE",
+                "Someone else changed this at the same time. Reload it and try again.", request, null);
     }
 
     // ---------------------------------------------------------------------------------

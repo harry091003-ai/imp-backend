@@ -184,6 +184,7 @@ class IncidentServiceOutboxTest {
         userServiceKnows(Map.of(
                 supervisor, user(supervisor, "ACTIVE", "ROLE_SUPERVISOR"),
                 engineer, user(engineer, "ACTIVE", "ROLE_ENGINEER")));
+        when(userClient.getEngineersUnderSupervisor(supervisor)).thenReturn(List.of(engineer));   // bug 2: own team only
 
         incidentService.AssignIncident(incident.getId(), engineer, loggedIn(supervisor, "ROLE_SUPERVISOR"));
 
