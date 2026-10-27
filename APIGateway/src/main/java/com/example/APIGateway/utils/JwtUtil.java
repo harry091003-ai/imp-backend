@@ -2,118 +2,71 @@ package com.example.APIGateway.utils;
 
 
 import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jws;
+import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.io.Decoders;
-import io.jsonwebtoken.security.Keys;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
-import javax.crypto.SecretKey;
-import java.util.Date;
+import java.security.PublicKey;
 import java.util.List;
-import java.util.Map;
 
 
 // we have only 1 JwtUtil Files in this project now
 //  this file  is used by the apigateway (JWTGatewayfilter ) for authetication only
+//
+// Auth v2 step 2 (2026-10-23): the gateway only CHECKS tokens, with AuthService's PUBLIC RSA key.
+// A public key cannot sign, so the gateway can no longer create a token (the old shared secret could).
+// The old generateToken, the secret and jwt.expirationMs are gone.
 
 @Component
 public class JwtUtil {
 
-    @Value("${jwt.secret}")
-    private String jwtSecret;
-    @Value("${jwt.expirationMs}")
-    private long jwtExpirationMs;
+    private final PublicKey publicKey;
 
-
-//------below is used for token generation in our Authservice----
-
-
-    //    this method convert a raw byte array into a secure SecretKey object
-    private SecretKey getSigningKey() {
-        byte[] keyBytes = Decoders.BASE64.decode(jwtSecret);
-        return Keys.hmacShaKeyFor(keyBytes);
+    public JwtUtil(@Value("${jwt.public-key}") String publicKey) {
+        // Read once, at start-up: a missing or broken key stops the gateway right away.
+        this.publicKey = RsaKeys.publicKeyFrom(publicKey);
     }
 
-    // the good approach is to pass the entire  UserDetails Object instead of user email
-    public String generateToken(String userid , Map<String,Object> claims) {
-        Date now= new Date();
-        Date ExpiryDate=new Date(now.getTime()+jwtExpirationMs);
-        return Jwts.builder()
-                .subject(userid)//username is basically an email in our case
-                .claims(claims)//here claims is a map which contains the user roles and token version information
-                .issuedAt(now)
-                .expiration(ExpiryDate)
-                .signWith(getSigningKey())
-                .compact();
+    // Checks the stamp with the public key, then reads the body. Throws for anything not genuine:
+    // a wrong or edited stamp, an expired token, an unsigned token, or garbage.
+    private Claims claims(String token) {
+        Jws<Claims> jws = Jwts.parser()
+                .verifyWith(publicKey)
+                .build()
+                .parseSignedClaims(token);
+        // Only RS256. Stops the "algorithm trick": an HS256 token signed with our public key used as a secret.
+        if (!"RS256".equals(jws.getHeader().getAlgorithm())) {
+            throw new JwtException("Only RS256 tokens are accepted");
+        }
+        return jws.getPayload();
     }
 
-// ---below part is used for Authentication in all the services---------
 // userid
     public String getSubjectFromToken(String token) {
-        return Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload()
-                .getSubject();
+        return claims(token).getSubject();
     }
 
     public List<String> getRolesFromToken(String token) {
-        Claims claims = Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-
-        return claims.get("roles", List.class);
+        return claims(token).get("roles", List.class);
     }
+
     public String getEmailFromToken(String token) {
-        Claims claims = Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-
-        return claims.get("email", String.class);
+        return claims(token).get("email", String.class);
     }
-
 
     public Integer getTokenVersion(String token) {
-        Claims claims = Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-        return claims.get("tokenVersion", Integer.class);
+        return claims(token).get("tokenVersion", Integer.class);
     }
+
+    // true only for a genuine RS256 token from AuthService that has not expired (the parser checks expiry).
     public boolean validateToken(String token) {
         try {
-            Jwts.parser()
-                    .verifyWith(getSigningKey())
-                    .build()
-                    .parseSignedClaims(token);
-
-            return !isTokenExpired(token);
-
+            claims(token);
+            return true;
         } catch (Exception e) {
             return false;
         }
-    }
-//    public boolean validateTokenWithVersion(String token) {
-//
-//    }
-
-    public Date extractExpiration(String token) {
-        return Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload()
-                .getExpiration();
-    }
-
-    public boolean isTokenExpired(String token) {
-        return extractExpiration(token).before(new Date());
     }
 }

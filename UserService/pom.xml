@@ -31,28 +31,8 @@
         <spring-cloud.version>2025.0.1</spring-cloud.version>
     </properties>
     <dependencies>
-        <!-- Core JWT API that Defines the core interfaces and classes for JWT creation and parsing.-->
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-api</artifactId>
-            <version>0.13.0</version>
-        </dependency>
-
-        <!-- Implementation of the API : Contains the actual logic for token signing, parsing, and validation.-->
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-impl</artifactId>
-            <version>0.13.0</version>
-            <scope>runtime</scope>
-        </dependency>
-
-        <!-- JSON serialization/deserialization using Jackson -->
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-jackson</artifactId>
-            <version>0.13.0</version>
-            <scope>runtime</scope>
-        </dependency>
+        <!-- Auth v2 step 3 (2026-10-24): the 3 jjwt (JWT) libraries were removed. UserService never checks or
+             makes tokens (its JwtUtil was fully commented out), so it does not need them. -->
 
 
         <dependency>

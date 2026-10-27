@@ -2,6 +2,8 @@ package com.example.AuthService;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 
 /**
  * Does AuthService start? Safe to run any time (option B, 2026-10-19).
@@ -18,10 +20,15 @@ import org.springframework.boot.test.context.SpringBootTest;
         "spring.sql.init.schema-locations=classpath:outbox/outbox_event_mysql.sql",
         "eureka.client.enabled=false",
         "internalsecret=dummy-test-only",
-        "secretkey=dummy-test-only",
         "spring.kafka.bootstrap-servers=localhost:1"
 })
 class AuthServiceApplicationTests {
+
+    // Auth v2: a throwaway RSA private key made in memory (TestKeys), instead of the old dummy secret.
+    @DynamicPropertySource
+    static void testSigningKey(DynamicPropertyRegistry registry) {
+        registry.add("jwtprivatekey", TestKeys::privateKeyText);
+    }
 
     @Test
     void contextLoads() {

@@ -13,7 +13,7 @@ Other files that go with this one:
 - `notes/` — personal learning notes (not tracked by git - see below). Includes
   `FLYWAY-NOTES.md`, `ERROR_HANDLING_FLOW.md`, and topic notes on things learned along the way.
 
-Last updated: 2026-09-30
+Last updated: 2026-10-24
 
 ---
 
@@ -37,6 +37,8 @@ Last updated: 2026-09-30
 | Testing guide (2026-10-19) | `notes/testing-in-our-project.md`: why / what / how / is it safe, with the proof re-run on every module | ✅ Written |
 | Option B (2026-10-19) | The 8 auto-generated `contextLoads()` tests no longer touch the real system | ✅ Done - "run all tests" is safe on every service (proof below) |
 | Small bugs (2026-10-19) | Issues 4, 3, 56, 64, 1 - one at a time, test first | ✅ All 5 done (bug 5 on 2026-10-22) |
+| Auth v2 - RSA keys (2026-10-23) | Only AuthService can create tokens; the gateway can only check them | ✅ Done - all 6 steps. Step 5 (real keys + hand test through the gateway) passed 2026-10-26 |
+| Auth v2 part B - refresh tokens (2026-10-27) | Access token 15 min + refresh token 7 days, used once, cancelled on logout | ✅ Code + tests done (AuthService 65, gateway 69). **Not yet tried by hand on the real system** (Flyway `V6` runs at the next AuthService start) - see "Auth v2 part B" below |
 | Role management (2026-10-21) | Issue 67: first admin from a setting, last-admin guard, audit row | ✅ Done (Flyway `V5` not yet run on your DB) |
 | SLA values (Phase 1) | Real SLA times for all 4 priorities, CRITICAL included (issues 19 + 59) | ✅ Done — 2026-10-17, test first. Old rows are NOT recalculated (issue 66) |
 | Lockout fix (Phase 1) | 5 wrong passwords really lock the account, and the lock ends after 15 minutes (issues 55 + 6) | ✅ Done — 2026-10-14, test first (not yet tried by hand on the real system) |
@@ -44,6 +46,92 @@ Last updated: 2026-09-30
 | Track D | Not decided yet | ❓ Need to discuss |
 
 **Track A and Track B are finished. Track C has started: C1 is done. The rest of Track C and Track D are not decided yet.**
+
+---
+
+## What is left (pending tasks) - written 2026-10-24
+
+Tick a line and move it to the table above when it is done. Issue numbers are the ones in `CLAUDE.md` section 9.
+
+### 1. Finish what is already built (owner's side)
+
+| # | Task | Status |
+|---|---|---|
+| 1.1 | **Auth v2 step 5**: make the real RSA key pair, set `jwtprivatekey` (AuthService) and `jwtpublickey` (gateway), restart, test by hand | ✅ Done 2026-10-26 - keys made outside the project, set in IntelliJ; signup, login, token use (200), edited token (401), logout, token after logout (401) all passed through the gateway |
+| 1.2 | **Commit** the Auth v2 (RSA) work | ⏳ commit message not given yet - ask for it |
+| 1.3 | **Real-system check of earlier work** (do it together with 1.1, the services restart anyway). Back up the databases first | ⏳ never run on the real system: migrations Auth `V4` + `V5`, Incident `V4`, Notification `V2`; the lockout; first admin + role guards; assign rules; the 409 when two people save at once; the password change; SLA timers (test D); `GET /notifications/me`. Guide: `notes/sla-notifications.md` section 8 |
+
+### 2. ~~Next big piece: Auth v2 part B - refresh tokens~~ ✅ built 2026-10-27 (hand test still to do - section "Auth v2 part B" below)
+
+- A short login token (about 15 minutes) + a long refresh token kept **hashed** in the database. RSA only controls who can
+  CREATE tokens; refresh tokens are what limit a STOLEN token.
+- Needs: a new table (Auth Flyway `V6`), `RefreshTokenService`, `POST /auth/refresh`, login returns two tokens, logout and
+  password change cancel refresh tokens, a gateway rate-limit rule for `/auth/refresh`, a lock against two refreshes with the
+  same token at once. Each refresh token is used ONCE (rotation); reuse of a used one cancels the whole chain.
+- Whatever calls the API must handle "401 -> refresh -> retry".
+- Size: about 3-4 days with tests. Plan first, then your "go". Decisions to make: access life (suggest 15 min), refresh life
+  (suggest 7 days), how the client receives it (JSON body now; `HttpOnly` cookie for a browser front end later).
+
+### 3. Small decisions waiting for the owner
+
+| Issue | Question |
+|---|---|
+| 68 | A wrong OLD password on change-password is not counted by the lockout. Count it in the same lockout, or give it its own small limit? |
+| 66 | Old `incident_report` rows keep the old test-value SLA deadlines. Recalculate them, or leave them? |
+
+### 4. Known gaps (not started), roughly by importance
+
+**Correctness**
+
+| Issue | What is wrong |
+|---|---|
+| 62 | ReportingService: the active-incident count drifts (reassign does not subtract; resolve subtracts from whoever pressed the button) |
+| 61 | ReportingService: `daily_metrics` is never written; `/reports/metrics` returns all-time totals |
+| 63 | UserService returns `enabled`, `accountLocked`, `failedLoginAttempts` that nothing updates |
+| 57 | The supervisor rule is still copied in list, read-one and update-details (assign and change-status share one) |
+| 58 | Reading an incident returns only 8 fields |
+| 38 | `AssignIncident` calls UserService twice for the same engineer |
+
+**Security and safety**
+
+| Issue | What is wrong |
+|---|---|
+| 49 | The gateway has no time limit on routed calls, so its 504 never fires |
+| 14 | Signup activates the account at once, no email check |
+| 11, 10 | `/auth/token-version/{id}` is public; AuthService has no `@EnableMethodSecurity` |
+| 5, 7, 2 | A logout endpoint accepts every HTTP verb; AI endpoints use GET with a body; one internal endpoint is broken |
+| - | HTTPS between the client and the gateway is not covered by anything yet |
+| 51 | Services' `TraceIdFilter` reuses an incoming trace id without the safety check |
+
+**Features not built**
+
+| Item | Note |
+|---|---|
+| Real email sending (issue 16) | deliberately later; for now logs + database rows |
+| AI classification (issue 17) | switched off; issue 50 (Ai-Service `KafkaTemplate`) to close when Ai-Service is seen starting |
+| History of every root cause | `notes/LLD/LLD-improvements.md` E7 |
+| An API to READ the role audit rows | today SQL only (issue 67) |
+| The client sends back the incident `version` (`If-Match`) | covers a screen left open for minutes (issue 64) |
+| Key rotation / a JWKS endpoint | only if keys must change without logging everyone out |
+
+**Ops and tidy-up**
+
+| Item | Note |
+|---|---|
+| No CI, no Dockerfiles, no profiles (issue 42) | |
+| Micrometer tracing / Zipkin (issue 53) | deliberately left for later |
+| The trace-id rules exist twice (issue 54) | gateway has its own copy |
+| Gateway log lines write the trace id by hand (issue 52) | |
+| Dead commented-out JWT files (issues 20, 28) | `AuthService/util/JwtUtil.java`, common-security `JwtUtil`/`JwtFilter` - harmless |
+| Shorten the long comments in older work (outbox, earlier tracks) | offered, not started |
+| Track C (rest) and Track D | not decided yet |
+
+### Suggested order
+
+1. Step 5 + the real-system check together (1.1 + 1.3), then commit (1.2).
+2. Decide issue 68 (small and quick).
+3. Refresh tokens (section 2) - the biggest security gain left.
+4. The correctness items (62, 61, 63, 57, 58), then email last.
 
 ---
 
@@ -2759,6 +2847,146 @@ tests: `RoleManagementTest.java` (new), `AuthServiceOutboxTest.java` (2 calls pa
 
 ---
 
+# Auth v2 — RSA keys (started 2026-10-23)
+
+**Why:** tokens were signed with ONE shared HMAC secret held by AuthService, the gateway and UserService. Whoever can
+check a token with it can also CREATE one, so a leak from any of the three lets an attacker forge an ADMIN token.
+**Idea:** RS256 key pair. AuthService signs with the PRIVATE key (only it has it); the gateway checks with the PUBLIC key,
+which cannot sign.
+
+| Step | What | Status |
+|---|---|---|
+| 1 | AuthService signs with the private key (RS256 + `kid`) | ✅ 2026-10-23 |
+| 2 | Gateway checks with the public key, only RS256; its `generateToken` + expiry removed | ✅ 2026-10-23 |
+| 3 | UserService drops the unused secret + jjwt; `.gitignore` gets `*.pem`/`*.key` | ✅ 2026-10-24 |
+| 4 | Full proof run (all services, start-up tests without real env vars) | ✅ 2026-10-24 |
+| 5 | Real-system check (you: generate keys, set env vars, restart Auth + gateway) | ✅ Done 2026-10-26 (owner ran it by hand, Postman) |
+| 6 | Docs + concept note + commit message | ✅ docs + note `notes/rsa-keys-and-token-signing.md` 2026-10-24. Commit message: give it when asked. |
+
+## Steps 1-2 (2026-10-23)
+
+**Code:**
+- AuthService `security/RsaKeys` (new): reads `jwtprivatekey` (PKCS#8, PEM or one-line base64), refuses empty, garbage,
+  a public key, or < 2048 bits - at start-up, with a message naming the setting and never the key text.
+- AuthService `config/SecurityConfig`: the key is read once in the constructor; `generateToken` signs with
+  `Jwts.SIG.RS256` and writes `kid` (`jwt.key-id=key-1`). `jwt.secret` removed from its settings.
+- Gateway `utils/RsaKeys` (new): reads `jwtpublickey` (X.509); refuses a private key, garbage, < 2048 bits.
+- Gateway `utils/JwtUtil`: rewritten to check with the public key and accept only RS256; same 5 methods for
+  `JwtGatewayFilter` (unchanged). Removed: `generateToken`, the secret, `jwt.expirationMs` (issue 39).
+- The 3 start-up tests get a throwaway key from `TestKeys` (`@DynamicPropertySource`) instead of `secretkey=dummy`.
+
+**Tests:** `TokenSigningTest` (AuthService, 8) and `JwtUtilTest` (gateway, 10). Before, NO test checked real signing:
+the filter test mocks `JwtUtil` and the login tests mock `generateToken`. On the old code the new tests could not even
+compile (no way to pass a key) - a weak "red", so the break checks carry the proof.
+
+**Proof:** AuthService 52/52 and gateway 67/67 (all tests), 0 real addresses. Break checks (restored, byte-identical):
+1. gateway checks with HMAC made from the public key, pin kept → real tokens refused (caught); the trick still refused by the pin.
+2. only the RS256 pin removed → all pass: the library itself refuses HS256 with a public key. The pin is a 2nd layer.
+3. AuthService signs HS256 again → caught. 4. the 2048-bit minimum removed → caught.
+5. the full classic bug (HMAC check + no pin) → the attacker's ADMIN token was **accepted** → caught by
+   `theAlgorithmTrickIsRefused`.
+(A first break-check run reported all exit=1 but the tests had never run - `mvnw.cmd` was not found from Python.
+Spotted because break 2 "failed" when it should pass; re-run with the full path.)
+
+**Important until step 5:** AuthService needs `jwtprivatekey` and the gateway needs `jwtpublickey` to START. The old
+`secretkey` is no longer enough for them (and since step 3 nothing needs it at all). Old tokens stop working after the switch: everyone logs in once.
+
+**Files:** AuthService `config/SecurityConfig.java`, `security/RsaKeys.java` (new), `application.properties`,
+tests `TestKeys.java` (new), `security/TokenSigningTest.java` (new), `AuthServiceApplicationTests.java`,
+`OutboxWiringTest.java`. Gateway `utils/JwtUtil.java`, `utils/RsaKeys.java` (new), `application.properties`, tests
+`TestKeys.java` (new), `utils/JwtUtilTest.java` (new), `ApiGatewayApplicationTests.java`.
+
+## Steps 3-4 (2026-10-24)
+
+**Step 3 - cleanup:**
+- UserService: `jwt.secret` + `jwt.expirationMs` removed from `application.properties`; the 3 jjwt dependencies removed
+  from `pom.xml`; the dead `util/JwtUtil.java` (69 lines, all commented out, nothing referred to it) deleted, and its
+  empty folder. Its start-up test no longer carries `secretkey=dummy`.
+- `.gitignore`: `*.pem` and `*.key` added (checked with `git check-ignore`).
+- Result: **no service reads `secretkey` any more.** A search of code, settings and tests finds it only in comments.
+
+**Found while checking:** `.idea/workspace.xml` (IntelliJ's run configurations) holds the REAL old `secretkey` value -
+and `user`, `password`, `internalsecret` - in plain text, 7 times. Checked: `.idea/` is git-ignored, not tracked, never
+committed. Not touched (your IDE's file). That is also where `jwtprivatekey` / `jwtpublickey` will go in step 5.
+
+**Step 4 - full proof, with the real env vars REMOVED** (`user`, `password`, `secretkey`, `internalsecret`, `apikey`,
+`jwtprivatekey`, `jwtpublickey`, `adminemail`):
+- ALL tests: AuthService 52/52, APIGateway 67/67, UserService 5/5 (it builds and starts without jjwt and without any key).
+- Start-up test of the other 5: Eureka, IncidentService, NotificationService, ReportingService, Ai-Service - all pass.
+- 0 attempts to reach 3306 / 5433 / 9092 / 8081 in any log.
+- Scan of all 610 pending added lines: no key text, no long base64 blob, not the old secret value, no file over 300 KB.
+
+**Step 3 files:** `UserService/pom.xml`, `UserService/src/main/resources/application.properties`,
+`UserService/src/test/.../UserServiceApplicationTests.java`, `UserService/.../util/JwtUtil.java` (deleted), `.gitignore`.
+
+## Auth v2 - Step 5 (pending)
+
+**Status: ✅ DONE 2026-10-26** - tests 2-6 passed by hand through the gateway (test 1 skipped: no old token; databases were empty, so a new user was signed up first). The plan below is kept for the next machine. **Before that date:** Until then **AuthService and
+APIGateway do not start on the real system** (they need the two keys). Nothing else is affected: UserService and the
+other services need no key. The code and every test are finished.
+
+**What it is:** create the real RSA key pair, give each service its half, restart, and try it by hand.
+
+```
+ A. make the key pair (outside the project)
+ B. PRIVATE key -> AuthService, PUBLIC key -> gateway  (IntelliJ run configurations)
+ C. restart the services
+ D. test by hand through the gateway (login, API call, edited token, logout)
+ E. tell Claude the results -> commit message
+```
+
+### A. Make the key pair, outside the project
+Pick a folder OUTSIDE `E:\dev-spring-boot\IMP` (suggestion: `~/jwt-keys` in Git Bash = a folder in your user home).
+`openssl` is in Git Bash. Run, in that folder:
+```bash
+mkdir -p ~/jwt-keys && cd ~/jwt-keys
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private.pem
+openssl pkey -in private.pem -pubout -out public.pem
+head -1 private.pem public.pem     # must show BEGIN PRIVATE KEY / BEGIN PUBLIC KEY
+```
+Never copy these files into the project (`*.pem`/`*.key` are git-ignored, but do not rely on it). Keep a private
+backup of `private.pem`; if it is lost, make a new pair and everyone logs in again.
+
+### B. Give each service its key (IntelliJ run configurations)
+Use IntelliJ, NOT Windows `setx`: `setx` silently cuts values at 1024 characters; the private key is ~1,600.
+1. Copy the private key as ONE line, straight to the clipboard (nothing is shown on screen):
+   `grep -v -- '-----' ~/jwt-keys/private.pem | tr -d '\r\n' | clip`
+   IntelliJ -> Run -> Edit Configurations -> **AuthServiceApplication** -> Environment variables -> add `jwtprivatekey` = paste.
+2. Same for the public key: `grep -v -- '-----' ~/jwt-keys/public.pem | tr -d '\r\n' | clip`
+   -> **APIGateway** run configuration -> add `jwtpublickey` = paste.
+3. Optional tidy-up: delete `secretkey` from all run configurations (nothing uses it any more).
+Never swap them: AuthService gets the PRIVATE key only, the gateway the PUBLIC key only (a wrong one stops the service
+at start-up with a clear message). No other service gets a key.
+
+### C. Restart
+1. If the services were not started since the last commit, **back up the databases first** - older migrations run on
+   this start too: Auth `V4`+`V5`, Incident `V4`, Notification `V2`.
+2. Start in the usual order: Kafka + MySQL -> Eureka -> AuthService -> the others -> Gateway last.
+3. Good: both start. Key problem: a message naming `jwtprivatekey` / `jwtpublickey` (it never prints the key).
+
+### D. Test by hand, through the gateway (`http://localhost:8082`, e.g. Postman)
+| # | Do | Expect | Proves |
+|---|---|---|---|
+| 1 | `GET /notifications/me` with an OLD token (from before the switch), if you saved one | 401 | old shared-secret tokens are dead |
+| 2 | `POST /auth/login` with `{"username":"...","email":"...","password":"..."}` | 200 + a new `JWTtoken` | AuthService signs with the private key |
+| 3 | `GET /notifications/me` with `Authorization: Bearer <new token>` | 200 | the gateway checks with the public key |
+| 4 | change ONE character in the middle part of the token (between the two dots), repeat #3 | 401 | an edited token is refused |
+| 5 | `POST /logout/user` with the token | success | logout still works |
+| 6 | repeat #3 with the same token, right away and again after ~30 s | may work for up to ~30 s, then 401 | the gateway's logout cache (`gateway.tokenversion.fresh-ms=30000`) |
+| 7 | optional: decode ONLY the first part of the token locally: `echo '<first part>' \| base64 -d` | `"alg":"RS256"`, `"kid":"key-1"` | it really is RSA |
+
+Do NOT paste real tokens into websites such as jwt.io - a token is a live login. A "padding" warning from `base64 -d` is harmless.
+
+**If something goes wrong:** service will not start + message names `jwtprivatekey`/`jwtpublickey` = the variable is missing,
+cut off or swapped -> redo B. Login works but EVERY call is 401 = the gateway's public key is not the pair of AuthService's
+private key -> make the public key again from the SAME `private.pem`, set it, restart the gateway. Login gives 500 = look at
+the AuthService log and send Claude the message only, never the key.
+
+### E. After it works
+Tell Claude the result of tests 1-7. Then: the commit message for the whole RSA work (not given yet), and tick step 5 here.
+
+---
+
 # Track C (rest) and Track D — not decided yet
 
 You mentioned these but we never discussed what is in them. **Do not guess.** Ask first.
@@ -2769,6 +2997,76 @@ You mentioned these but we never discussed what is in them. **Do not guess.** As
 # Change log — every file we changed
 
 This is your review record. Each entry says the file and what changed.
+
+---
+
+## Auth v2 part B - refresh tokens (2026-10-27)
+
+**Status: code + tests done. Not yet tried by hand on the real system.** Decisions taken with the suggested values:
+access token 15 minutes, refresh token 7 days, sent in the JSON body (an `HttpOnly` cookie can come with a browser
+front end later).
+
+### The flow
+```
+ POST /auth/login            -> JWTtoken (15 min) + refreshToken (7 days)      [new family, hash saved]
+ any call with JWTtoken      -> works while the 15 min last
+ ... 401 (token expired)
+ POST /auth/refresh {refreshToken}  -> NEW JWTtoken + NEW refreshToken         [old one marked used]
+ POST /auth/refresh with an OLD (used) one -> 401 REFRESH_TOKEN_REUSED, whole family cancelled
+ logout / password change / role change / credentials change -> all the user's refresh tokens cancelled
+```
+The client must do: "401 -> call /auth/refresh -> retry the call with the new JWTtoken; refresh refused -> log in".
+
+### Rules (each one has a test in `RefreshTokenTest`)
+| Rule | Why |
+|---|---|
+| Only the SHA-256 hash is stored | Reading the table gives nobody a usable token |
+| Each refresh token works ONCE (rotation) | A copy is noticed the moment both copies are used |
+| A used token sent again cancels the whole family (that login only, not other devices) | We cannot tell the real user from the copier, so both must log in again |
+| The 401 for reuse is thrown AFTER the transaction commits | A throw inside would roll back the cancel (the issue 55 trap). Break check: thrown inside -> 2 tests fail |
+| Row lock (`SELECT ... FOR UPDATE`) on the token | Two refreshes at once: one wins, the other counts as reuse. Break check: no lock -> both won (`[null, null]`) |
+| Logout cancels all refresh tokens, in the logout's own transaction | `LogoutUserService` is also used by password, role and credentials changes, so they all cancel too |
+| A locked account cannot refresh; its token is NOT used up | Works again when the lock ends |
+| Expired (7 days) / unknown / cancelled -> 401 | Unknown and cancelled get the same code (`INVALID_REFRESH_TOKEN`), so nothing is learned about which tokens exist |
+
+### Files
+| File | Change |
+|---|---|
+| `AuthService/.../db/migration/V6__refresh_token.sql` | NEW - table `refresh_token` |
+| `AuthService/.../entity/RefreshToken.java` | NEW |
+| `AuthService/.../repository/RefreshTokenRepository.java` | NEW - locked read, cancel all of a user, cancel a family |
+| `AuthService/.../service/RefreshTokenService.java` | NEW - make, swap, all the rules above |
+| `AuthService/.../service/AccessTokenIssuer.java` | NEW - the JWT claims, moved out of `LoginUserService` so login and refresh share them |
+| `AuthService/.../controller/RefreshController.java` | NEW - `POST /auth/refresh` |
+| `AuthService/.../dto/RefreshRequestDTO.java`, `RefreshResponseDTO.java` | NEW |
+| `AuthService/.../dto/LoginResponseDTO.java` | + `refreshToken` |
+| `AuthService/.../service/LoginUserService.java` | uses `AccessTokenIssuer`, also returns a refresh token (no `SecurityConfig` any more) |
+| `AuthService/.../service/LogoutUserService.java` | both logout methods cancel the user's refresh tokens |
+| `AuthService/.../application.properties` | `jwt.expirationMs` 7200000 -> **900000** (15 min); new `auth.refresh-token.lifetime-days=7` |
+| `AuthService/src/test/.../RefreshTokenTest.java` | NEW - 13 tests |
+| `AuthService/src/test/.../AccountLockoutTest.java`, `AuthServiceOutboxTest.java` | `@Import` gets the 2 new services |
+| `APIGateway/.../filter/RateLimitFilter.java` | new rule `refresh`: `POST /auth/refresh` per IP (before `default`) |
+| `APIGateway/.../application.properties` | `gateway.ratelimit.refresh.per-minute=30`, `per-hour=300` |
+| `APIGateway/src/test/.../RateLimitFilterTest.java` | + 2 tests |
+
+Nothing else changed: the gateway already skips the token check for `/auth/**` and already routes `/auth/**` to
+AuthService, so `/auth/refresh` works through it without a new route.
+
+### Hand test (owner, real system) - to do
+Restart AuthService (Flyway `V6` makes the table) and the gateway. Then, through `http://localhost:8082`:
+1. `POST /auth/login` -> 200, the answer now also has `refreshToken`
+2. `POST /auth/refresh` with `{"refreshToken": "<it>"}` -> 200, a new `JWTtoken` + a new `refreshToken`
+3. the new `JWTtoken` on `GET /notifications/me` -> 200
+4. `POST /auth/refresh` with the FIRST (now used) refresh token -> 401 `REFRESH_TOKEN_REUSED`
+5. `POST /auth/refresh` with the token from step 2 -> 401 `INVALID_REFRESH_TOKEN` (step 4 cancelled the login)
+6. log in again, `POST /logout/user`, then refresh with that login's token -> 401 `INVALID_REFRESH_TOKEN`
+7. optional: wait 15 minutes, the old `JWTtoken` -> 401; refresh -> works
+
+### Known limits (not fixed, written down)
+- Old rows are never deleted. Fine for now; later a small scheduled clean-up of rows past `expires_at`.
+- A client that sends the same refresh token twice by accident (double click, retry after a lost answer) is
+  treated as reuse and must log in again. That is the strict, safe choice.
+- Tokens issued before this change have no refresh token: those users simply log in again.
 
 ---
 

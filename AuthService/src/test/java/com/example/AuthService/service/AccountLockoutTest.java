@@ -57,7 +57,8 @@ import static org.mockito.Mockito.verify;
         "spring.sql.init.schema-locations=classpath:outbox/outbox_event_mysql.sql"
 })
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import({LoginUserService.class, LoginAttemptService.class, RegisteringUserService.class,
+@Import({LoginUserService.class, LoginAttemptService.class, AccessTokenIssuer.class, RefreshTokenService.class,
+        RegisteringUserService.class,
         UserLoggedInEventProducer.class, UserRegisteredEventProducer.class, AccountLockoutTest.Setup.class})
 @Transactional(propagation = Propagation.NOT_SUPPORTED)   // no test-wide transaction: we test the real ones
 class AccountLockoutTest {

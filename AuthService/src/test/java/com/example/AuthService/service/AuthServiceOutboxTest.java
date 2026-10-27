@@ -71,7 +71,7 @@ import static org.mockito.Mockito.doThrow;
 })
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Import({RegisteringUserService.class, LoginUserService.class, LoginAttemptService.class, LogoutUserService.class,
-        UpdateCredentialsService.class, UpdateRoleService.class,
+        AccessTokenIssuer.class, RefreshTokenService.class, UpdateCredentialsService.class, UpdateRoleService.class,
         UserRegisteredEventProducer.class, UserLoggedInEventProducer.class, UserLoggedOutEventProducer.class,
         UserUpdatedEventProducer.class, RoleUpdatedEventProducer.class,
         AuthServiceOutboxTest.OutboxSetup.class})

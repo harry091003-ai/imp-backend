@@ -81,3 +81,8 @@ scratch/
 # a personal study folder. Kept off git on purpose, same as the reasoning behind
 # imp-git-local-only: this is personal, not project state.
 notes/
+
+# Auth v2 (2026-10-24): RSA key files must never be committed. Keep real keys OUTSIDE the project;
+# these lines are only a safety net if one lands here by mistake.
+*.pem
+*.key

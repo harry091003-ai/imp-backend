@@ -1,6 +1,5 @@
 package com.example.AuthService.service;
 
-import com.example.AuthService.config.SecurityConfig;
 import com.example.AuthService.dto.LoginFromDTO;
 import com.example.AuthService.dto.LoginResponseDTO;
 import com.example.AuthService.entity.User;
@@ -21,28 +20,30 @@ import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.Map;
 
 @Transactional
 @Service
 public class LoginUserService {
     private final AuthenticationManager authenticationManager;
     private final UserDetailsService userDetailsService;
-    private final SecurityConfig securityConfig;
     private final UserRepository userRepository;
     private final UserLoggedInEventProducer userLoggedInEventProducer;
     // Issue 55 fix: counts a wrong password in its OWN transaction (see LoginAttemptService for why).
     private final LoginAttemptService loginAttemptService;
+    // Auth v2 part B: the access token (was made here with SecurityConfig) and the new refresh token.
+    private final AccessTokenIssuer accessTokenIssuer;
+    private final RefreshTokenService refreshTokenService;
     public LoginUserService(AuthenticationManager authentication_manager,
-                            UserDetailsService TheuserDetailsService,UserRepository userRepository,SecurityConfig securityConfig,UserLoggedInEventProducer userLoggedInEventProducer,
-                            LoginAttemptService loginAttemptService){
+                            UserDetailsService TheuserDetailsService,UserRepository userRepository,UserLoggedInEventProducer userLoggedInEventProducer,
+                            LoginAttemptService loginAttemptService, AccessTokenIssuer accessTokenIssuer,
+                            RefreshTokenService refreshTokenService){
         authenticationManager=authentication_manager;
         userDetailsService=TheuserDetailsService;
-    this.securityConfig=securityConfig;
         this.userRepository=userRepository;
         this.userLoggedInEventProducer= userLoggedInEventProducer;
         this.loginAttemptService = loginAttemptService;
+        this.accessTokenIssuer = accessTokenIssuer;
+        this.refreshTokenService = refreshTokenService;
     }
 
     public ResponseEntity<LoginResponseDTO> LoginUser(LoginFromDTO request) {
@@ -75,15 +76,10 @@ public class LoginUserService {
 
         User user = userRepository.findByEmail(request.getEmail());
 
-        Map<String, Object> claims = new HashMap<>();
-        claims.put("roles", user.getRoles()
-                .stream()
-                .map(role -> role.getRolename().name())
-                .toList());
-
-        claims.put("tokenVersion", user.getTokenVersion());
-        claims.put("email",user.getEmail());
-        String token = securityConfig.generateToken(user.getUserid().toString(), claims);
+        // Auth v2 part B: the claims are built in AccessTokenIssuer now, shared with POST /auth/refresh.
+        String token = accessTokenIssuer.issueFor(user);
+        // ...and a refresh token (7 days), saved in THIS transaction: a failed login stores none.
+        String refreshToken = refreshTokenService.issueForLogin(user.getUserid());
 
      User OurUser=   userRepository.findByEmail(request.getEmail());
         // updating the lastLoginAt field
@@ -111,6 +107,7 @@ public class LoginUserService {
                 .status(200)
                 .message("Login Successfully")
                 .JWTtoken(token)
+                .refreshToken(refreshToken)
                 .build());
 
         }

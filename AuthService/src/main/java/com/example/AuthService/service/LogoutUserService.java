@@ -2,6 +2,7 @@ package com.example.AuthService.service;
 
 import com.example.AuthService.entity.User;
 import com.example.AuthService.kafka.producer.UserLoggedOutEventProducer;
+import com.example.AuthService.repository.RefreshTokenRepository;
 import com.example.AuthService.repository.UserRepository;
 import com.project.events.UserLoggedInEvent;
 import com.project.events.UserLoggedOutAtEvent;
@@ -26,11 +27,15 @@ private final UserLoggedOutEventProducer userLoggedOutEventProducer;
 // REQUIRED (the default) means: if the caller already has a transaction (UpdateCredentialsService,
 // UpdateRoleService), JOIN it; if not (LogoutController, ChangePasswordService), start a short one.
 private final TransactionTemplate transactionTemplate;
+// Auth v2 part B: a logout also cancels every refresh token of the user, in the SAME transaction.
+// Password change, role change and credentials change all log out through here, so they cancel them too.
+private final RefreshTokenRepository refreshTokenRepository;
     public LogoutUserService(UserRepository userRepository,UserLoggedOutEventProducer userLoggedOutEventProducer,
-                             TransactionTemplate transactionTemplate) {
+                             TransactionTemplate transactionTemplate, RefreshTokenRepository refreshTokenRepository) {
         this.userRepository = userRepository;
         this.userLoggedOutEventProducer=userLoggedOutEventProducer;
         this.transactionTemplate = transactionTemplate;
+        this.refreshTokenRepository = refreshTokenRepository;
     }
 // this method we use when we want to logout the current user
     public void LogoutUser(){
@@ -45,6 +50,7 @@ private final TransactionTemplate transactionTemplate;
         // update the LastLogout time
         user.setLastLogoutAt(LocalDateTime.now());
        User saved= userRepository.save(user);
+        refreshTokenRepository.revokeAllOfUser(saved.getUserid(), saved.getLastLogoutAt());
         //Outbox step 3: save the Logged-out event in the outbox, in the SAME transaction, so UserService
         //(through Kafka, a moment later) updates its copy of the user. Both saved, or neither.
          UserLoggedOutAtEvent event=UserLoggedOutAtEvent.builder()
@@ -67,6 +73,7 @@ private final TransactionTemplate transactionTemplate;
         // update the LastLogout time
         user.setLastLogoutAt(LocalDateTime.now());
       User saved=  userRepository.save(user);
+        refreshTokenRepository.revokeAllOfUser(saved.getUserid(), saved.getLastLogoutAt());
         //Outbox step 3: the Logged-out event goes into the outbox, in the SAME transaction.
         UserLoggedOutAtEvent event=UserLoggedOutAtEvent.builder()
                 .userid(saved.getUserid())

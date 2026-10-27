@@ -40,7 +40,11 @@ import java.util.logging.Logger;
 // Rule "signup" (step 2) - POST /auth/signup, counted per IP address.
 //   Stops one machine creating accounts in bulk. A real person signs up once.
 //
-// Why IP and not user id for login/signup: there is no token yet, so no user id.
+// Rule "refresh" (Auth v2 part B) - POST /auth/refresh, counted per IP address.
+//   A refresh token is 32 random bytes, so guessing one is hopeless - this limit just stops one
+//   machine from hammering AuthService's database with made-up tokens.
+//
+// Why IP and not user id for login/signup/refresh: there is no (valid) access token, so no user id.
 //
 // Rule "default" (step 3) - EVERY other routed path, counted per USER.
 //   A safety floor, not a targeted fix. Generous enough that a person never notices it.
@@ -79,6 +83,8 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                            @Value("${gateway.ratelimit.login.per-hour}") long loginPerHour,
                            @Value("${gateway.ratelimit.signup.per-hour}") long signupPerHour,
                            @Value("${gateway.ratelimit.signup.per-day}") long signupPerDay,
+                           @Value("${gateway.ratelimit.refresh.per-minute}") long refreshPerMinute,
+                           @Value("${gateway.ratelimit.refresh.per-hour}") long refreshPerHour,
                            @Value("${gateway.ratelimit.default.per-second}") long defaultPerSecond,
                            @Value("${gateway.ratelimit.default.per-minute}") long defaultPerMinute,
                            @Value("${gateway.ratelimit.max-tracked-keys}") long maxTrackedKeys,
@@ -92,6 +98,9 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                 new KeyedRateLimiter(List.of(new Limit(signupPerHour, Duration.ofHours(1)),
                                              new Limit(signupPerDay, Duration.ofDays(1))),
                         maxTrackedKeys, TimeMeter.SYSTEM_NANOTIME),
+                new KeyedRateLimiter(List.of(new Limit(refreshPerMinute, Duration.ofMinutes(1)),
+                                             new Limit(refreshPerHour, Duration.ofHours(1))),
+                        maxTrackedKeys, TimeMeter.SYSTEM_NANOTIME),
                 new KeyedRateLimiter(List.of(new Limit(defaultPerSecond, Duration.ofSeconds(1)),
                                              new Limit(defaultPerMinute, Duration.ofMinutes(1))),
                         maxTrackedKeys, TimeMeter.SYSTEM_NANOTIME),
@@ -102,6 +111,7 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
     RateLimitFilter(KeyedRateLimiter aiLimiter,
                     KeyedRateLimiter loginLimiter,
                     KeyedRateLimiter signupLimiter,
+                    KeyedRateLimiter refreshLimiter,
                     KeyedRateLimiter defaultLimiter,
                     MeterRegistry meterRegistry) {
         this.rules = List.of(
@@ -111,6 +121,8 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                         loginLimiter, rejectedCounter(meterRegistry, "login"), "login attempts"),
                 new Rule("signup", path -> isExactPath(path, "/auth/signup"), false,
                         signupLimiter, rejectedCounter(meterRegistry, "signup"), "sign-up attempts"),
+                new Rule("refresh", path -> isExactPath(path, "/auth/refresh"), false,
+                        refreshLimiter, rejectedCounter(meterRegistry, "refresh"), "token refreshes"),
                 // Must stay LAST: it covers every path, so any rule after it would never be reached.
                 // Counted by user. The only paths here with no user id are the other public
                 // /auth/** ones (token-version) - those fall back to IP, like the "ai" rule does.

@@ -2,10 +2,9 @@ package com.example.AuthService.config;
 
 import com.example.AuthService.service.CustomUserDetailsService;
 //import org.springframework.cloud.client.loadbalancer.LoadBalanced;
+import com.example.AuthService.security.RsaKeys;
 import com.project.security.filter.HeaderAuthFilter;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.io.Decoders;
-import io.jsonwebtoken.security.Keys;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -22,7 +21,7 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.web.client.RestTemplate;
 
-import javax.crypto.SecretKey;
+import java.security.PrivateKey;
 import java.util.Date;
 import java.util.Map;
 import java.util.logging.Logger;
@@ -31,22 +30,26 @@ import java.util.logging.Logger;
 @Configuration
 @EnableWebSecurity // enables Spring Security for the entire application.
 public class SecurityConfig {
-    @Value("${jwt.secret}")
-    private String jwtSecret;
-    @Value("${jwt.expirationMs}")
-    private long jwtExpirationMs;
+    // Auth v2 step 1: tokens are signed with AuthService's PRIVATE RSA key (RS256), no longer with the
+    // shared secret. Only AuthService has this key, so only AuthService can create a token. The gateway
+    // checks tokens with the matching PUBLIC key, which cannot create any.
+    private final PrivateKey signingKey;
+    private final String keyId;              // written into each token's header as "kid"
+    private final long jwtExpirationMs;
 
     private final CustomUserDetailsService userDetailsService;
     private final HeaderAuthFilter headerAuthFilter;
 
-    public SecurityConfig(CustomUserDetailsService userDetailsService,HeaderAuthFilter headerAuthFilter) {
+    public SecurityConfig(CustomUserDetailsService userDetailsService,HeaderAuthFilter headerAuthFilter,
+                          @Value("${jwt.private-key}") String privateKey,
+                          @Value("${jwt.key-id}") String keyId,
+                          @Value("${jwt.expirationMs}") long jwtExpirationMs) {
         this.userDetailsService = userDetailsService;
         this.headerAuthFilter=headerAuthFilter;
-    }
-
-    private SecretKey getSigningKey() {
-        byte[] keyBytes = Decoders.BASE64.decode(jwtSecret);
-        return Keys.hmacShaKeyFor(keyBytes);
+        // Read once, at start-up: a missing or broken key stops the service right away, not at the first login.
+        this.signingKey = RsaKeys.privateKeyFrom(privateKey);
+        this.keyId = keyId;
+        this.jwtExpirationMs = jwtExpirationMs;
     }
 
     // for generating token
@@ -54,11 +57,12 @@ public class SecurityConfig {
         Date now= new Date();
         Date ExpiryDate=new Date(now.getTime()+jwtExpirationMs);
         return Jwts.builder()
+                .header().keyId(keyId).and()
                 .subject(userid)//username is primary subject
                 .claims(claims)//here claims is a map which contains the user roles and token version information
                 .issuedAt(now)
                 .expiration(ExpiryDate)
-                .signWith(getSigningKey())
+                .signWith(signingKey, Jwts.SIG.RS256)
                 .compact();
     }
 

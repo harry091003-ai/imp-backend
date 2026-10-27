@@ -17,7 +17,6 @@ import org.springframework.boot.test.context.SpringBootTest;
         "spring.jpa.hibernate.ddl-auto=create-drop",
         "eureka.client.enabled=false",
         "internalsecret=dummy-test-only",
-        "secretkey=dummy-test-only",
         "spring.kafka.bootstrap-servers=localhost:1",
         "spring.kafka.listener.auto-startup=false"
 })

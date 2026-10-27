@@ -53,7 +53,9 @@ to `spring-boot-starter-parent`, so the root pom's `<properties>` are decorative
   table `resolved_incidents_vectors`, 3072 dims, cosine distance, `initializeSchema(false)`
   (schema created by hand).
 - **Kafka** (Confluent 7.4.0 + Zookeeper) via `kafka-docker/docker-compose.yml`, `localhost:9092`.
-- **JJWT 0.13.0** (`jjwt-api/impl/jackson`), HMAC-SHA, base64 secret.
+- **JJWT 0.13.0** (`jjwt-api/impl/jackson`). **Since 2026-10-23 (Auth v2 steps 1-2): RS256** - AuthService signs with an
+  RSA PRIVATE key, the gateway checks with the PUBLIC key (it can no longer create tokens). Since step 3 (2026-10-24)
+  no service uses the old HMAC `secretkey`, and jjwt is only in AuthService, APIGateway (and the dead common-security).
 - **Spring AI 1.1.0** (`spring-ai-starter-model-google-genai`, embedding, `pgvector-store`, `rag`,
   `pdf-document-reader`). Chat model `gemini-2.5-flash-lite`, embeddings `gemini-embedding-001`.
   Prompt templates live in `Ai-Service/src/main/resources/prompts/**/*.st`.
@@ -107,7 +109,15 @@ types, the status `RECORDED` (= saved and visible in the app, no email sent) and
 ## 4. Auth & security architecture
 
 1. `POST /auth/login` → AuthService mints a JWT with claims `roles`, `tokenVersion`, `email`;
-   subject = **userid (UUID string)**.
+   subject = **userid (UUID string)**. Signed **RS256** with AuthService's private key (`config/SecurityConfig`,
+   header `kid`=`jwt.key-id`); the gateway's `utils/JwtUtil` checks it with the public key and accepts **only RS256**
+   (stops the HS256 "algorithm trick"). Keys are read once at start-up by `RsaKeys`; a missing/broken/short key stops
+   the service. Since 2026-10-23.
+   **Since 2026-10-27 (Auth v2 part B) the access token lives 15 min** (`jwt.expirationMs=900000`) and login also returns
+   a `refreshToken` (7 days). `POST /auth/refresh` swaps it for a new pair (`RefreshTokenService`); each refresh token
+   works once, a reused one cancels its whole family (one login), only its SHA-256 hash is stored (`refresh_token`,
+   Flyway `V6`), and `LogoutUserService` cancels all of a user's refresh tokens - so logout, password, role and
+   credentials changes do too. The JWT claims are built in ONE place, `AccessTokenIssuer`, for login and refresh.
 2. Every request hits **APIGateway** → `JwtGatewayFilter` (`GlobalFilter`, order `-1`):
    skips paths starting with `/auth`, validates signature + expiry, then checks the token version
    against AuthService and rejects on mismatch. This is the logout / password-change revocation
@@ -418,7 +428,17 @@ No Docker images for the services, no CI, no `.env`, no Spring profiles
 **Required environment variables** (referenced as `${...}` with **no defaults**; every service
 fails to start without them):
 - `user`, `password` — MySQL credentials (`password` is also the PostgreSQL password for Ai-Service)
-- `secretkey` — base64 JWT secret, shared by AuthService / UserService / APIGateway
+- `jwtprivatekey` — **AuthService only** (since 2026-10-23): the RSA private key that signs tokens (PKCS#8, PEM text or one
+  line of base64, at least 2048 bits). Kept outside the project, never committed.
+- `jwtpublickey` — **APIGateway only** (since 2026-10-23): the matching RSA public key (X.509, PEM text or one line of
+  base64). Not secret, but comes from settings the same way. A private key here is refused.
+- ~~`secretkey`~~ — **no longer used by any service** (Auth v2 step 3, 2026-10-24). It can be deleted from your env vars
+  and from IntelliJ's run configurations (`.idea/workspace.xml`, git-ignored, never committed - it holds the old value).
+- **Auth v2 step 5 DONE 2026-10-26:** the real key pair lives outside the project (`~/jwt-keys`), set in IntelliJ's
+  AuthService / APIGateway run configurations; the hand test through the gateway passed. On a new machine, follow
+  `PROGRESS.md` "Auth v2 - Step 5" again (a new pair = everyone logs in again).
+  IntelliJ keeps run-configuration env vars (these keys, `user`, `password`, `internalsecret`) in `.idea/workspace.xml`
+  in plain text; `.idea/` is git-ignored and was never committed.
 - `apikey` — Google Gemini API key (Ai-Service)
 - `adminemail` — **optional** (AuthService, since 2026-10-21). Empty = off. Set it once to an existing account's
   email to make the FIRST admin at start-up (works only while no admin exists), then remove it. Never a password.
@@ -452,13 +472,13 @@ folder, gitignored - see PROGRESS.md).
 
 **Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
 `common-web` 20, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
-Kafka + real JPA), `APIGateway` 56 (53 + 3 `GatewayRoutesTest`), `IncidentService` 26 (9 + 17 `IncidentRulesTest`), `AuthService` 43 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 6 `ChangePasswordTest`)
+Kafka + real JPA), `APIGateway` 68 (53 + 3 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit), `IncidentService` 26 (9 + 17 `IncidentRulesTest`), `AuthService` 64 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 6 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest`)
 `ReportingService` 27 (19 outbox, incl. 4 "the SLA event says who": H2 + embedded Kafka + a full-start test each, + 8
 `SLAConfigurationTest`, plain Java), `NotificationService` 43 (`TrustedPackagesTest` 5 + `UserCredentialDtoTest` 2 +
 `NotificationMigrationV2Test` 6, plain Java; `NotificationLogStoreTest` 4 + `SlaNotificationTest` 11, H2;
 `SlaListenersOverKafkaTest` 2, whole service + embedded Kafka; `IncidentNotificationTest` 4, H2; `MyNotificationsApiTest` 9,
-whole service + real HTTP requests) and `UserService` 4 (`SupervisorInBatchTest`, H2) = 279, **+ the 8 `contextLoads()`
-(one per service, safe since option B, 2026-10-19) = 287**. ReportingService's wiring test uses a test-only
+whole service + real HTTP requests) and `UserService` 4 (`SupervisorInBatchTest`, H2) = 312, **+ the 8 `contextLoads()`
+(one per service, safe since option B, 2026-10-19) = 320**. ReportingService's wiring test uses a test-only
 `src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
 with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest`, or ALL of them with
 `./mvnw.cmd -o test`: **since option B (2026-10-19) every `contextLoads()` runs in the test world too** (in-memory
@@ -528,9 +548,10 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
    verbatim and are reachable directly on ports 8083–8088.~~ **LARGELY FIXED 2026-09-02**
    (Track B1 steps 1-2): all services now bind to `127.0.0.1` only, and `HeaderAuthFilter`
    requires a shared `X-Internal-Secret` before trusting any identity header. `/internal/**`
-   was closed in step 3 (2026-09-02). Remaining: the JWT still uses one shared HMAC secret,
-   so any service that can verify a token could also mint one - asymmetric keys are the proper
-   fix, deliberately deferred. Anyone who can reach a service port
+   was closed in step 3 (2026-09-02). ~~Remaining: the JWT still uses one shared HMAC secret,
+   so any service that can verify a token could also mint one.~~ **Fixed 2026-10-23 (Auth v2 steps 1-2):** RS256 -
+   only AuthService (private key) can create tokens; the gateway (public key) can only check them. Since step 3
+   (2026-10-24) no service holds a shared JWT secret. Anyone who can reach a service port
    can forge an admin identity. Nothing strips inbound `X-*` headers, and `/auth/**` bypasses the
    gateway filter entirely.
 9. ~~`ReportingService` `permitAll`s **`/reports/**`** and `/internal/**` ... `UserService`
@@ -614,7 +635,9 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     and tooling assumptions.
 28. `JwtUtil` exists **four times** (APIGateway active; AuthService, UserService and common-security
     all commented out - UserService's `jwt.secret` setting and `jjwt` dependencies are therefore unused too), and `generateToken` is duplicated in `APIGateway/utils/JwtUtil` (unused there) and
-    inside `AuthService/config/SecurityConfig`.
+    inside `AuthService/config/SecurityConfig`. **Update 2026-10-24 (Auth v2 steps 2-3):** the gateway's `generateToken`
+    is deleted; UserService's dead `util/JwtUtil.java`, its `jwt.secret` setting and its 3 jjwt dependencies are removed.
+    Still left (commented out, harmless): `AuthService/util/JwtUtil.java` and common-security's `JwtUtil`/`JwtFilter`.
 29. **`AuthService.SecurityConfig` (a `@Configuration`) contains `generateToken` and is injected
     into `LoginUserService`** as a collaborator.
 30. `ReportingController` (`/reports/...`) **duplicates** the two endpoints of
@@ -649,8 +672,9 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     per-invocation `build()` remain in either service. See §6.
 38. `IncidentService.AssignIncident` calls UserService twice per assignment — `IsUserActive`
     re-fetches what `getUser` already returned.
-39. Gateway JWT expiry is configured at 3600000 ms but AuthService mints 7200000 ms tokens (the
-    gateway's value is only read by its unused `generateToken`).
+39. ~~Gateway JWT expiry is configured at 3600000 ms but AuthService mints 7200000 ms tokens (the
+    gateway's value is only read by its unused `generateToken`).~~ **RESOLVED 2026-10-23** (Auth v2 step 2): the
+    gateway's `generateToken` and `jwt.expirationMs` are deleted. Only AuthService's 7200000 ms exists.
 
 ### Ops
 
@@ -865,6 +889,9 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   rename; a blanket rename touches callers across services.
 - Anything touching JWT claims, `tokenVersion`, or the `X-User-*` headers spans
   APIGateway + common-security + AuthService — change all three together.
+- **Token keys (Auth v2, 2026-10-23/24):** only AuthService gets the PRIVATE key (`jwtprivatekey`); the gateway gets
+  only the PUBLIC key (`jwtpublickey`) and must keep accepting **only RS256**. Never put a real key in the project
+  (`*.pem`/`*.key` are git-ignored as a safety net). Tests make throwaway keys in memory (`TestKeys`) - never use a real one.
 - Adding a Kafka event means editing `shared-events` and `mvn install`ing it before the
   producer/consumer services will compile.
 - `auth.getName()` is always a **UUID string**, never a username or email.
@@ -956,6 +983,10 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   `RuntimeException` (all of `common-web`'s exceptions are one) rolls back everything saved in that transaction.
   Use `@Transactional(TxType.REQUIRES_NEW)` on a method of a separate bean, like `LoginAttemptService`. Calling
   such a method from the same class does nothing: Spring only applies `@Transactional` to calls from outside.
+- **Refresh tokens (Auth v2 part B):** a refusal that must SAVE something (cancelling a family on reuse) is returned out
+  of the transaction and thrown after it commits - never throw it inside (break-checked). Keep the row lock on
+  `findByTokenHashForUpdate` (two refreshes at once). Anything new that should end a user's sessions must go through
+  `LogoutUserService`, so refresh tokens are cancelled too. Never store or log a refresh token itself - only its hash.
 - **Roles change only through `UpdateRoleService` (issue 67)** - never by a hand edit in MySQL: a hand edit sends no
   `roles.update` (UserService keeps the old roles) and leaves no audit row. Its transaction locks the ADMIN role row
   first; keep that line, or two admins removing each other at once can leave zero admins (proved by a test).

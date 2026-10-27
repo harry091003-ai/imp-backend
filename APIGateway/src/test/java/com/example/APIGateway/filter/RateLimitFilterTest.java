@@ -50,6 +50,7 @@ class RateLimitFilterTest {
                 limiter(aiPerMinute, Duration.ofMinutes(1), aiPerDay, Duration.ofDays(1)),
                 limiter(10, Duration.ofMinutes(1), 100, Duration.ofHours(1)),   // login
                 limiter(5, Duration.ofHours(1), 20, Duration.ofDays(1)),        // signup
+                limiter(30, Duration.ofMinutes(1), 300, Duration.ofHours(1)),   // refresh
                 limiter(20, Duration.ofSeconds(1), 300, Duration.ofMinutes(1)), // default
                 registry);
     }
@@ -275,6 +276,32 @@ class RateLimitFilterTest {
         RateLimitFilter filter = defaultFilter();
         for (int i = 0; i < 6; i++) run(filter, post("/auth/signup", "10.0.0.1"));
         assertTrue(run(filter, post("/auth/login", "10.0.0.1")));
+    }
+
+    // ---------------- Auth v2 part B: refresh per IP ----------------
+
+    // 30 refreshes a minute from one IP pass, the 31st is refused.
+    @Test
+    void refreshAllowsThirtyPerMinuteFromOneIpThenRefuses() {
+        RateLimitFilter filter = defaultFilter();
+        for (int i = 1; i <= 30; i++) {
+            assertTrue(run(filter, post("/auth/refresh", "10.0.0.1")), "refresh " + i + " should pass");
+        }
+        MockServerWebExchange next = post("/auth/refresh", "10.0.0.1");
+        assertFalse(run(filter, next));
+        assertEquals(HttpStatus.TOO_MANY_REQUESTS, next.getResponse().getStatusCode());
+        assertTrue(next.getResponse().getBodyAsString().block().contains("Too many token refreshes"));
+        assertTrue(run(filter, post("/auth/refresh", "10.0.0.2")), "another IP has its own count");
+    }
+
+    // Its own bucket: many refreshes must not block logging in (and they do not spend default coins).
+    @Test
+    void refreshHasItsOwnBucket() {
+        RateLimitFilter filter = defaultFilter();
+        for (int i = 0; i < 31; i++) run(filter, post("/auth/refresh", "10.0.0.1"));
+        assertTrue(run(filter, post("/auth/login", "10.0.0.1")));
+        assertEquals(1.0, registry.get("gateway.ratelimit.rejected").tag("rule", "refresh").counter().count());
+        assertEquals(0.0, registry.get("gateway.ratelimit.rejected").tag("rule", "default").counter().count());
     }
 
     // ---------------- Step 3: the default rule, everything else ----------------

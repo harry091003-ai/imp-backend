@@ -17,4 +17,6 @@ public class LoginResponseDTO {
     private Integer status;
     private String message;
     private String JWTtoken;
+    // Auth v2 part B: lives 7 days. Send it to POST /auth/refresh when JWTtoken (15 min) runs out.
+    private String refreshToken;
 }

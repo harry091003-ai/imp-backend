@@ -7,6 +7,8 @@ import com.project.outbox.OutboxWriter;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.context.ApplicationContext;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -29,10 +31,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "spring.sql.init.schema-locations=classpath:outbox/outbox_event_mysql.sql",
         "eureka.client.enabled=false",
         "internalsecret=dummy-test-only",
-        "secretkey=dummy-test-only",
         "spring.kafka.bootstrap-servers=localhost:1"
 })
 class OutboxWiringTest {
+
+    // Auth v2: a throwaway RSA private key made in memory (TestKeys), instead of the old dummy secret.
+    @DynamicPropertySource
+    static void testSigningKey(DynamicPropertyRegistry registry) {
+        registry.add("jwtprivatekey", TestKeys::privateKeyText);
+    }
 
     @Autowired
     ApplicationContext context;
