@@ -144,8 +144,12 @@ IncidentAuditLog incidentAuditLog=IncidentAuditLog.builder()
     incidentAuditLogRepository.save(incidentAuditLog);
     log.info("incidentAuditLog is saved to Db for IncidentAssignedEvent");
 
-    //now we also updating (Increasing) the Workload on that engineer by using the EngineerWorkloadService
-    engineerWorkloadService.IncrementActiveIncidentCount(incidentReport,event.getAssignedTo());
+    //now we also updating the Workload on that engineer by using the EngineerWorkloadService
+    engineerWorkloadService.refreshAfterAssignment(incidentReport,event.getAssignedTo());
+    // Issue 62: on a reassign the old engineer no longer has this incident.
+    if (assignedTo != null && !assignedTo.equals(event.getAssignedTo())) {
+        engineerWorkloadService.refreshActiveIncidentCount(assignedTo);
+    }
 
 
 }
@@ -190,12 +194,15 @@ IncidentAuditLog incidentAuditLog=IncidentAuditLog.builder()
             //Outbox step 4: this now SAVES the event in the outbox, inside this listener's transaction (the
             //@Transactional on this class). If anything below fails, the event row rolls back with the report.
             incidentResolvedReportEventProducer.publishIncidentResolvedReportAsEvent(incidentReport,event);
-
-            // as the Incident is resolved so we need to update (decrease) the Active incident count for that engineer in EngineerWorkloadService
-            engineerWorkloadService.DecrementActiveIncidentCount(incidentReport,incidentReport.getResolvedBy());
         }
         incidentReportRepository.save(incidentReport);
         log.info("incidentReport is saved to Db for IncidentAssignedEvent");
+
+        // Issue 62: any status change can change the engineer's count (RESOLVED, CLOSED, REOPENED), and it is the
+        // ASSIGNED engineer's count, not the count of whoever pressed the button.
+        if (incidentReport.getAssignedTo() != null) {
+            engineerWorkloadService.refreshActiveIncidentCount(incidentReport.getAssignedTo());
+        }
 
 
 // now also saving the IncidentAuditLog

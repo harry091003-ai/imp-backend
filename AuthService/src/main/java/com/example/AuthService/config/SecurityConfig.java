@@ -11,6 +11,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.dao.DaoAuthenticationProvider;
 import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -29,6 +30,8 @@ import java.util.logging.Logger;
 
 @Configuration
 @EnableWebSecurity // enables Spring Security for the entire application.
+// Issue 10 (2026-10-28): without this, @PreAuthorize (RoleController) was silently ignored. Every other service has it.
+@EnableMethodSecurity
 public class SecurityConfig {
     // Auth v2 step 1: tokens are signed with AuthService's PRIVATE RSA key (RS256), no longer with the
     // shared secret. Only AuthService has this key, so only AuthService can create a token. The gateway
@@ -116,6 +119,10 @@ public class SecurityConfig {
 
                 // Authorization rules
                 .authorizeHttpRequests(auth -> auth
+                        // Issue 11 (2026-10-28): only the gateway reads token versions. It must come BEFORE the
+                        // /auth/** line: the first matching rule wins. ROLE_INTERNAL_SERVICE needs the internal secret
+                        // AND X-Internal-Service, which the gateway wipes off every outside request.
+                        .requestMatchers("/auth/token-version/**").hasRole("INTERNAL_SERVICE")
                         .requestMatchers("/auth/**", "/debug/**","/actuator/**").permitAll()
                         .requestMatchers("/roles/**").hasAuthority("ROLE_ADMIN") // ✅ ADD THIS
                         .anyRequest().authenticated()//ye line se authentication use karne ya na karne ka koi link nahi hai it check check karte hai ki SecurityContextHolder.getContext().getAuthentication() != null to nahi hai

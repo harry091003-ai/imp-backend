@@ -145,6 +145,32 @@ public interface IncidentReportRepository extends JpaRepository<IncidentReport, 
             @Param("engineerId") UUID engineerId
     );
 
+    // Issue 61: one row: total, still open, high severity, assignment breaches, resolution breaches.
+    @Query("""
+       SELECT COUNT(ir),
+              COALESCE(SUM(CASE WHEN ir.status NOT IN ('RESOLVED', 'CLOSED') THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN ir.severity IN ('HIGH', 'CRITICAL') THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN ir.assignmentSlaBreached = true THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN ir.resolutionSlaBreached = true THEN 1 ELSE 0 END), 0)
+       FROM IncidentReport ir
+       WHERE ir.createdAt >= :from AND ir.createdAt < :to
+       """)
+    List<Object[]> countsForIncidentsCreatedBetween(
+            @Param("from") LocalDateTime from,
+            @Param("to") LocalDateTime to
+    );
+
+    // Issue 61: one row: how many, and their average resolution time (null if none).
+    @Query("""
+       SELECT COUNT(ir), AVG(ir.resolutionTimeSeconds)
+       FROM IncidentReport ir
+       WHERE ir.resolvedAt >= :from AND ir.resolvedAt < :to
+       """)
+    List<Object[]> countsForIncidentsResolvedBetween(
+            @Param("from") LocalDateTime from,
+            @Param("to") LocalDateTime to
+    );
+
 
 
 

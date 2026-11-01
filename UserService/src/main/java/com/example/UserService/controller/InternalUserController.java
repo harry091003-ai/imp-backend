@@ -34,6 +34,13 @@ public class InternalUserController {
         return ResponseEntity.ok(userValidationDTO);
     }
 
+    // AI plan phase 1: Ai-Service checks all its candidate engineers in one call. An unknown id is simply not in the answer.
+    @PostMapping("/validation/batch")
+    public ResponseEntity<List<UserValidationDTO>> LimitedUsersInfo(
+            @RequestBody @Size(max = 50, message = "At most 50 user ids per request") List<@NotNull UUID> userIds) {
+        return ResponseEntity.ok(service.LimitedUsersInfoForValidation(userIds));
+    }
+
     @GetMapping("/EngineersUnderSupervisor/{SupervisorId}")
     public ResponseEntity<List<UUID>> getEngineersUnderSupervisor(@PathVariable UUID SupervisorId) {
         List<UserResponseDTO> engineers = service.getEngineersUnderSupervisor(SupervisorId);
@@ -41,8 +48,10 @@ public class InternalUserController {
     }
 
     // for getting the UserCredential(mainly Email: used by Notification service for sending email)using Synchronous Interservice Communication
+    // Issue 2 (2026-10-28): the URL says {userId} but the parameter is called userid, so Spring could never fill it
+    // (always a 500). Naming the URL part fixes it without renaming the parameter.
     @GetMapping("/UserSpecificDetails/{userId}")
-    public ResponseEntity<UserCredentialDTO>getOwnSpecificDetails(@PathVariable UUID userid){
+    public ResponseEntity<UserCredentialDTO>getOwnSpecificDetails(@PathVariable("userId") UUID userid){
 
         UserCredentialDTO userCredentialDTO=service.GetUserCredentials(userid);
 

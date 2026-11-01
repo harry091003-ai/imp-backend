@@ -1,6 +1,8 @@
 package com.example.IncidentService.service;
 
 import com.example.IncidentService.client.UserClient;
+import com.example.IncidentService.dto.IncidentResponseDTO;
+import com.example.IncidentService.dto.UpdateIncidentMetadate_RequestDTO;
 import com.example.IncidentService.dto.UpdateIncidentStatus_RequestDTO;
 import com.example.IncidentService.dto.UserValidationDTO;
 import com.example.IncidentService.entity.Environment;
@@ -27,6 +29,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.support.JacksonUtils;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -51,6 +54,8 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -65,6 +70,11 @@ import static org.mockito.Mockito.when;
  *   - admin: any incident, any active engineer
  *   - supervisor: only an incident of theirs or their team, only to an engineer of their team
  *   - nobody: a RESOLVED / CLOSED incident, or the same engineer again
+ *
+ * Issue 57 (2026-11-01) - one rule for what a supervisor may touch: list, read, update, status and assign agree.
+ *   A supervisor with no team still sees the incidents they created.
+ * Issue 58 (2026-11-01) - reading an incident returns all its details.
+ * Issue 38 (2026-11-01) - an assign asks UserService about the engineer only once.
  */
 @DataJpaTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:incident-rules;MODE=MySQL;DB_CLOSE_DELAY=-1",
@@ -391,5 +401,132 @@ class IncidentRulesTest {
         } catch (OptimisticLockingFailureException e) {
             return "CONCURRENT_UPDATE";   // what common-web turns into a 409
         }
+    }
+
+    // ================================================================== issue 57: one rule for a supervisor
+
+    private List<UUID> listFor(UUID who, String role) {
+        return incidentService.getIncidentsBasedOnRoles(who, loggedIn(who, role), PageRequest.of(0, 20), null)
+                .map(IncidentResponseDTO::getId).getContent();
+    }
+
+    private void mayRead(Incident incident, UUID who) {
+        assertEquals(incident.getId(),
+                incidentService.getIncidentByIdBasedOnRole(incident.getId(), loggedIn(who, "ROLE_SUPERVISOR")).getId());
+    }
+
+    private void updateTitle(Incident incident, UUID who) {
+        incidentService.updateIncidentBasedOnRole(incident.getId(),
+                UpdateIncidentMetadate_RequestDTO.builder().title("New title").build(), loggedIn(who, "ROLE_SUPERVISOR"));
+    }
+
+    @Test
+    void aSupervisorWithNoTeamStillSeesTheIncidentsTheyCreated() {
+        UUID lonely = UUID.randomUUID();
+        when(userClient.getEngineersUnderSupervisor(lonely)).thenReturn(List.of());
+        Incident own = incident(lonely, IncidentStatus.OPEN, null, null, null);
+        incident(engineerB, IncidentStatus.OPEN, null, null, null);
+
+        assertEquals(List.of(own.getId()), listFor(lonely, "ROLE_SUPERVISOR"));
+    }
+
+    @Test
+    void aSupervisorListsEveryIncidentTheyMayTouch() {
+        Incident createdByMe = incident(supervisorA, IncidentStatus.OPEN, null, null, null);
+        Incident createdByMyEngineer = incident(engineerA, IncidentStatus.OPEN, null, null, null);
+        Incident assignedToMyEngineer = incident(engineerB, IncidentStatus.ASSIGNED, engineerA, null, null);
+        Incident assignedByMe = incident(engineerB, IncidentStatus.ASSIGNED, engineerB, null, null);
+        assignedByMe.setAssignedBy(supervisorA);
+        incidentRepository.save(assignedByMe);
+        Incident otherTeam = incident(engineerB, IncidentStatus.ASSIGNED, engineerB, null, null);
+
+        List<UUID> seen = listFor(supervisorA, "ROLE_SUPERVISOR");
+
+        assertTrue(seen.containsAll(List.of(createdByMe.getId(), createdByMyEngineer.getId(),
+                assignedToMyEngineer.getId(), assignedByMe.getId())), seen.toString());
+        assertFalse(seen.contains(otherTeam.getId()), "another team's incident stays hidden");
+    }
+
+    @Test
+    void whatASupervisorMayChangeTheyMayAlsoRead() {
+        // Created by an engineer of the team, nobody assigned: read-one used to refuse this (403), update allowed it.
+        Incident incident = incident(engineerA, IncidentStatus.OPEN, null, null, null);
+
+        mayRead(incident, supervisorA);
+        updateTitle(incident, supervisorA);
+
+        assertEquals("New title", reload(incident).getTitle());
+    }
+
+    @Test
+    void aSupervisorCannotReadOrChangeAnotherTeamsIncident() {
+        Incident incident = incident(engineerB, IncidentStatus.ASSIGNED, engineerB, null, null);
+
+        assertEquals("INCIDENT_ACCESS_DENIED", assertThrows(ForbiddenException.class, () -> mayRead(incident, supervisorA)).getErrorCode());
+        assertEquals("INCIDENT_UPDATE_DENIED", assertThrows(ForbiddenException.class, () -> updateTitle(incident, supervisorA)).getErrorCode());
+    }
+
+    // ================================================================== issue 58: all the details
+
+    private void assertAllDetails(IncidentResponseDTO answer, Incident saved) {
+        assertEquals("Login takes 20 seconds", answer.getDescription());
+        assertEquals(ServiceName.AUTH_SERVICE, answer.getServiceName());
+        assertEquals(IncidentCategory.API, answer.getCategory());
+        assertEquals(Environment.PRODUCTION, answer.getEnvironment());
+        assertEquals("pool too small", answer.getRootCause());
+        assertEquals("raised pool to 50", answer.getResolutionNotes());
+        assertNotNull(answer.getCreatedAt());
+        assertNotNull(answer.getUpdatedAt());
+        assertEquals(saved.getLocation(), answer.getLocation());
+        assertEquals(saved.getAffectedSource(), answer.getAffectedSource());
+    }
+
+    @Test
+    void readingOneIncidentReturnsAllItsDetails() {
+        Incident saved = incident(engineerA, IncidentStatus.RESOLVED, engineerA, "pool too small", "raised pool to 50");
+
+        assertAllDetails(incidentService.getIncidentByIdBasedOnRole(saved.getId(), loggedIn(admin, "ROLE_ADMIN")), saved);
+    }
+
+    @Test
+    void theListReturnsAllTheDetailsToo() {
+        Incident saved = incident(engineerA, IncidentStatus.RESOLVED, engineerA, "pool too small", "raised pool to 50");
+
+        assertAllDetails(incidentService.getIncidentsBasedOnRoles(admin, loggedIn(admin, "ROLE_ADMIN"), PageRequest.of(0, 20), null)
+                .getContent().get(0), saved);
+    }
+
+    // ================================================================== issue 38: one call, not two
+
+    @Test
+    void anAssignAsksAboutTheEngineerOnlyOnce() {
+        Incident incident = incident(supervisorA, IncidentStatus.OPEN, null, null, null);
+
+        assign(incident, supervisorA, "ROLE_SUPERVISOR", engineerA);
+
+        verify(userClient, times(1)).getUser(engineerA);
+        assertEquals(engineerA, reload(incident).getAssignedTo());
+    }
+
+    @Test
+    void anInactiveEngineerIsStillRefused() {
+        Incident incident = incident(supervisorA, IncidentStatus.OPEN, null, null, null);
+        UUID inactive = UUID.randomUUID();
+        when(userClient.getUser(inactive)).thenReturn(
+                UserValidationDTO.builder().userid(inactive).status("SUSPENDED").roles(Set.of("ROLE_ENGINEER")).build());
+
+        refused(ValidationException.class, "ENGINEER_NOT_ACTIVE", () -> assign(incident, admin, "ROLE_ADMIN", inactive));
+    }
+
+    // ================================================================== AI plan phase 2
+
+    @Test
+    void theStatusEventSaysWhichEnvironment() {
+        Incident incident = incident(engineerA, IncidentStatus.ASSIGNED, engineerA, null, null);
+
+        changeStatus(incident, engineerA, "ROLE_ENGINEER", IncidentStatus.RESOLVED, "pool too small", "raised pool to 50");
+
+        String payload = jdbc.queryForObject("SELECT payload FROM outbox_event", String.class);
+        assertTrue(payload.contains("\"environment\":\"PRODUCTION\""), payload);
     }
 }

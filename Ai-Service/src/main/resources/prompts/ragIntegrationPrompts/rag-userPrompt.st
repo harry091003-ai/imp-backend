@@ -5,6 +5,9 @@ Provide:
 2. Step-by-step resolution
 
 Be precise and practical.
+Similar past incidents:
+{context}
+
 New Incident:
         Incident:
         Title:{title}

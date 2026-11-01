@@ -94,7 +94,7 @@ self-referencing hierarchy: `supervisor` (`@ManyToOne`) / `engineers` (`@OneToMa
 (2026-10-22, issue 64) `version` (`@Version`, optimistic locking - a save based on an old read is refused).
 
 **ReportingService** — read-model built from events: `IncidentReport` (heavily indexed, with
-SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetrics` (**never written** - issue 61),
+SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetrics` (written since 2026-11-01 by `DailyMetricsSchedular`, issue 61),
 `EngineerPerformanceStats`, `EngineerWorkload`, `ProcessedEvent` (idempotency keys - stop a repeat since 2026-10-13, issue 60 fixed).
 
 **NotificationService** — `NotificationLog`, unique constraint on `(eventId, recipientEmail)`. Since Flyway `V2`
@@ -102,7 +102,8 @@ SLA deadline / breach / event-published flags), `IncidentAuditLog`, `DailyMetric
 types, the status `RECORDED` (= saved and visible in the app, no email sent) and no more
 `CHECK (event_type between 0 and 7)`.
 
-**Ai-Service** — `AiInsight` (per-incident classification + confidence + conflict flag).
+**Ai-Service** — `AiInsight` (what the AI suggested for an incident + confidence + `conflict` = the user chose differently), and since Flyway
+`V3` (2026-11-01) `ClassificationSuggestion` (a suggestion waiting for its incident, key = hash of the text).
 
 ---
 
@@ -171,7 +172,10 @@ Every downstream `SecurityConfig` is a copy-paste of the same shape: csrf disabl
 `@EnableMethodSecurity` + `@EnableWebSecurity`.
 
 Per-service permitAll rules:
-- AuthService: `/auth/**`, `/debug/**`, `/actuator/**`; `/roles/**` → `hasAuthority("ROLE_ADMIN")`. **No `@EnableMethodSecurity`.**
+- AuthService: `/auth/**`, `/debug/**`, `/actuator/**`; `/roles/**` → `hasAuthority("ROLE_ADMIN")`. **Since 2026-10-28:**
+  `/auth/token-version/**` → `hasRole("INTERNAL_SERVICE")` (listed BEFORE `/auth/**`; issue 11 - the gateway's
+  `TokenVersionService` sends `X-Internal-Secret` + `X-Internal-Service: APIGATEWAY`), and `@EnableMethodSecurity` is on
+  (issue 10), so `@PreAuthorize` on `RoleController` really runs. `/logout/user` is POST only (issue 5).
   Since 2026-10-21 (issue 67) `UpdateRoleService` also refuses: removing your own ADMIN role (`403
   CANNOT_REMOVE_OWN_ADMIN_ROLE`) and removing the last admin (`409 LAST_ADMIN`). The first admin comes from
   `AdminBootstrap` (setting `auth.bootstrap.admin-email`, env var `adminemail`), not from a hand edit in MySQL.
@@ -180,7 +184,8 @@ Per-service permitAll rules:
 - ReportingService: `/actuator/**` only; `/internal/**` → `hasRole("INTERNAL_SERVICE")`;
   `/reports/**` → `hasAnyRole(ADMIN, SUPERVISOR)` (engineers deliberately excluded — these
   endpoints expose every engineer's performance numbers).
-- IncidentService / Ai-Service: `/actuator/**` only.
+- IncidentService / Ai-Service: `/actuator/**` only. **Since 2026-11-01** Ai-Service's
+  `/ai/EngineersSuggestion-ForIncidentAssignment` → `hasAnyRole(ADMIN, SUPERVISOR)` (it shows engineers' SLA and workload).
 - NotificationService: `/actuator/**` only; `/notifications/**` → `hasAnyRole(ENGINEER, SUPERVISOR, ADMIN)` (since
   2026-10-17). Users only: a service-to-service caller is logged in under its SERVICE name, which is not a user id -
   without this rule `GET /notifications/me` crashed with a 500 for it (proved by a break check).
@@ -207,11 +212,10 @@ service with `common-kafka` on its classpath gets both automatically.
 | `user.logged-in` | AuthService | UserService |
 | `user.logged-out` | AuthService | UserService |
 | `roles.update` | AuthService | UserService |
-| `incident.created` | IncidentService | Reporting, Notification, Ai (**Ai handler commented out**) |
+| `incident.created` | IncidentService | Reporting, Notification, Ai (since 2026-11-01: compares the suggestion with what the user chose, no Gemini call) |
 | `incident.assigned` | IncidentService | Reporting, Notification |
-| `incident.status.updated` | IncidentService | Reporting, Notification |
+| `incident.status.updated` | IncidentService | Reporting, Notification, Ai (since 2026-11-01: REOPENED removes the solution from the AI memory) |
 | `Incident-Resolved-Report-Topic` | ReportingService | Ai-Service (stores vectors) |
-| `ai.classification.result` | Ai-Service | **none** |
 | `Sla-Assignment-Breach-Topic` | ReportingService | Notification (since 2026-10-17, saved + logged, no email) |
 | `Sla-Resolution-Breach-Topic` | ReportingService | Notification (since 2026-10-17, saved + logged, no email) |
 | `Sla-Assignment-BreachingRisk-Topic` | ReportingService | Notification (since 2026-10-17, saved + logged, no email) |
@@ -229,8 +233,7 @@ AuthService's five events (`user.*`, `roles.update`) went through the outbox in 
 and `roles.update` now have a Kafka key = the user id). ReportingService's five events (resolved report + 4 SLA
 topics) went through the outbox in step 4 (Flyway `V2`): the listener's event joins its `@Transactional`, and each
 SLA scheduler page saves its event rows and its flags in one `TransactionTemplate` transaction (issue 22 closed).
-**No service calls `kafkaTemplate.send` for a business event any more** (Ai-Service's `ai.classification.result`
-producer is switched off with the classifier, issue 17).
+**No service calls `kafkaTemplate.send` for a business event any more** (Ai-Service's old `ai.classification.result` producer was deleted 2026-11-01, issue 17).
 **Proved on the real system (step 5, 2026-10-14, run by hand):** normal case, Kafka stopped (the request still
 succeeds, the row waits as `NEW`, and is sent after `docker start kafka`), and a service restart while Kafka is
 down (the waiting row survives). **Not run by hand:** the SLA timers (test D) and the inbox on the real system.
@@ -270,16 +273,17 @@ in a blocking service was exactly the bug B3 removed.
   `stale_cache` and `unavailable` stay at 0.
 - IncidentService → UserService (`client/UserClient`, **`@FeignClient(name = "USERSERVICE")`**):
   `/internal/validation/{userId}`, `/internal/EngineersUnderSupervisor/{SupervisorId}`,
-  `/internal/UserSpecificDetails/{userId}` (this last one is **unused** and its endpoint is
-  broken — see issue 2).
+  `/internal/UserSpecificDetails/{userId}` (this last one is **unused**; its endpoint was broken until
+  2026-10-28 - issue 2, fixed).
 - NotificationService → UserService (`client/UserClient`, also a `@FeignClient`):
-  `/internal/UserSpecificDetails/{userId}` (**unused**, broken endpoint),
+  `/internal/UserSpecificDetails/{userId}` (**unused**; works since 2026-10-28, issue 2),
   `POST /internal/UserSpecificDetails/batch` (the one actually used, from a Kafka listener). **Since 2026-10-17
   (SLA notifications step 3) each answer also has `supervisorId`** (null = no supervisor); both copies of
   `UserCredentialDTO` (UserService, NotificationService) have the field.
-- Ai-Service → ReportingService: **OpenFeign** `ReportingServiceFeignClient`
-  (`/internal/reports/engineer-performance/{engineerId}/{category}/{service}`,
-  `/internal/reports/engineer-workload/{engineerId}`).
+- Ai-Service → ReportingService: **OpenFeign** `ReportingServiceFeignClient`, since 2026-11-01 ONE call for all candidates:
+  `POST /internal/reports/engineer-summaries` (a failure gives neutral numbers and `statsAvailable=false`, not an error).
+- Ai-Service → UserService: **OpenFeign** `UserServiceFeignClient` (since 2026-11-01): `/internal/EngineersUnderSupervisor/{id}`,
+  `POST /internal/validation/batch` (a failure is a 503: we cannot tell who may be recommended).
 
 **Headers.** Every internal call carries `X-Internal-Secret` + `X-Internal-Service` (Track B1
 step 3). All three Feign services attach them with a `RequestInterceptor` bean in
@@ -303,6 +307,12 @@ a 503. **Still open** - B3 step 4 only covered the gateway.
 Service ids used in `lb://` / URIs are inconsistently cased vs `spring.application.name`
 (e.g. `lb://IncidentService` vs `INCIDENTSERVICE`) — verify before touching discovery.
 `@FeignClient(name = ...)` must match `spring.application.name` exactly.
+
+**Routed-call time limits (issue 49, 2026-10-28).** `spring.cloud.gateway.server.webflux.httpclient.connect-timeout=2000`
+and `response-timeout=10s` cover every route; the AI route has its own `metadata.response-timeout=60000` (Gemini is
+slow). Too slow → `504` "The service took too long to answer" from `GatewayExceptionHandler`. Proved by
+`GatewayRouteTimeoutTest` (the whole gateway in front of a deliberately slow local server); the real values are checked
+by `GatewayRoutesTest`. A new route gets the 10 s default unless it sets its own.
 
 **Request size (Track B4 step 6).** The gateway's `filter/RequestSizeFilter.java` (a
 `GlobalFilter`, order `-2` — runs before `JwtGatewayFilter`'s `-1`) refuses any request body over
@@ -471,14 +481,16 @@ See `notes/FLYWAY-NOTES.md` for the full explanation and per-migration log (pers
 folder, gitignored - see PROGRESS.md).
 
 **Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
-`common-web` 20, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
-Kafka + real JPA), `APIGateway` 68 (53 + 3 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit), `IncidentService` 26 (9 + 17 `IncidentRulesTest`), `AuthService` 64 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 6 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest`)
-`ReportingService` 27 (19 outbox, incl. 4 "the SLA event says who": H2 + embedded Kafka + a full-start test each, + 8
-`SLAConfigurationTest`, plain Java), `NotificationService` 43 (`TrustedPackagesTest` 5 + `UserCredentialDtoTest` 2 +
+`common-web` 25, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
+Kafka + real JPA), `APIGateway` 75 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit + 3 `GatewayRouteTimeoutTest` + 1 `TokenVersionServiceHeadersTest`), `IncidentService` 35 (9 + 26 `IncidentRulesTest`), `AuthService` 79 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 11 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest` + 7 `AuthEndpointSecurityTest` + 3 `LogoutControllerTest`)
+`ReportingService` 52 (19 outbox, incl. 4 "the SLA event says who": H2 + embedded Kafka + a full-start test each, + 8
+`SLAConfigurationTest`, plain Java, + 11 `EngineerWorkloadTest` + 11 `DailyMetricsTest` + 3 `EngineerSummariesEndpointTest`), `NotificationService` 43 (`TrustedPackagesTest` 5 + `UserCredentialDtoTest` 2 +
 `NotificationMigrationV2Test` 6, plain Java; `NotificationLogStoreTest` 4 + `SlaNotificationTest` 11, H2;
 `SlaListenersOverKafkaTest` 2, whole service + embedded Kafka; `IncidentNotificationTest` 4, H2; `MyNotificationsApiTest` 9,
-whole service + real HTTP requests) and `UserService` 4 (`SupervisorInBatchTest`, H2) = 312, **+ the 8 `contextLoads()`
-(one per service, safe since option B, 2026-10-19) = 320**. ReportingService's wiring test uses a test-only
+whole service + real HTTP requests) `UserService` 10 (`SupervisorInBatchTest` 4, H2; `InternalUserControllerTest` 2; `UserResponseDtoTest` 2; `ValidationBatchTest` 2) and
+`Ai-Service` 91 (`RagControllerTest` 3, `AiEndpointSecurityTest` 12, `ClassificationTest` 20, `RagSuggestionTest` 9, `EngineerRecommendationTest` 18,
+`EngineerRankingTest` 7, `AiCallGuardTest` 5, `ResolvedIncidentMemoryTest` 11, `ReopenedIncidentTest` 6: no Gemini, no Postgres,
+`SimpleVectorStore` + `FakeEmbeddingModel`) = 470, **+ the 8 `contextLoads()` (one per service, safe since option B, 2026-10-19) = 478**. ReportingService's wiring test uses a test-only
 `src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
 with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest`, or ALL of them with
 `./mvnw.cmd -o test`: **since option B (2026-10-19) every `contextLoads()` runs in the test world too** (in-memory
@@ -486,7 +498,7 @@ database, Flyway off, Eureka off, Kafka `localhost:1`, listeners off, dummy secr
 key and H2 in Postgres mode). Proved: all 8 services pass ALL their tests with the real env vars removed, and the logs
 show no attempt to reach 3306/5433/9092/8081. **Full guide, and the proof (re-run 2026-10-19 on all modules and jars)
 that our tests are safe and not part of the application: `notes/testing-in-our-project.md`.**
-Eureka and Ai-Service still have only their (now safe) `contextLoads()`. Run one
+Eureka still has only its (now safe) `contextLoads()`. Run one
 module's tests with `./mvnw.cmd -f <module>/pom.xml test` (shared libs have no wrapper - use any
 service's). There are no `target/*.jar` artifacts — the
 project has been run from IntelliJ (`out/production/` exists at root), not via Maven packaging.
@@ -516,7 +528,9 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
    (it saved a user loaded before the forced logout, which would overwrite the token-version bump); fixed
    2026-10-13 in outbox step 3 by loading the user inside the transaction. (This entry used to say "never persisted" — that was
    reasoned from reading the code and was not tested.)
-2. `InternalUserController.getOwnSpecificDetails` — `@GetMapping("/UserSpecificDetails/{userId}")`
+2. **RESOLVED 2026-10-28**, test first (`InternalUserControllerTest`: 500 before, now 200, and 400 for a non-UUID):
+   `@PathVariable("userId") UUID userid`. The original entry:
+   `InternalUserController.getOwnSpecificDetails` — `@GetMapping("/UserSpecificDetails/{userId}")`
    but the parameter is `@PathVariable UUID userid`. Name mismatch, so the mapping cannot resolve.
    Both `IncidentService` and `NotificationService` `UserClient`s call this endpoint.
 3. **RESOLVED 2026-10-21** (small bug 1), test first (`IncidentRulesTest`, 6 tests). A missing or blank text now keeps
@@ -531,14 +545,20 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
    The original entry, kept for the record:
    `RegisteringUserService` — `.roles(user.getRoles().stream().map(role1 -> role.getRolename()...))`
    maps every element to the captured outer `role`, ignoring `role1`.
-5. `LogoutController.LogoutOfOwn` uses a bare `@RequestMapping("/user")` (accepts **every** HTTP
+5. **RESOLVED 2026-10-28**, test first (`LogoutControllerTest`: GET/PUT/DELETE answered 200 before, 405 now):
+   `@PostMapping("/user")`; the unreachable `LogoutAnyUser(User)` is deleted (an admin logs a user out through a role
+   change). **Clients must use POST /logout/user.** The original entry:
+   `LogoutController.LogoutOfOwn` uses a bare `@RequestMapping("/user")` (accepts **every** HTTP
    verb, including GET); `LogoutController.LogoutAnyUser(User)` has **no mapping at all** and is
    unreachable.
 6. ~~Account lockout has **no unlock path**: 5 failures set `accountLocked=true`; the pre-check
    rejects before authentication, and the reset to `false` only runs after a successful login.~~
    **RESOLVED 2026-10-14** (with issue 55): a lock now ends after `auth.lockout.lock-minutes` (15), stored in
    the new `users.locked_until` column. An old lock with no end time is treated as finished. No admin button.
-7. `RagController` uses `@GetMapping` with `@RequestBody` on both endpoints — GET-with-body is
+7. **RESOLVED 2026-10-28**, test first (`RagControllerTest`): both `RagController` endpoints are `@PostMapping`
+   (GET → 405, no AI call). **Clients must use POST** for `/ai/rag/suggestion` and
+   `/ai/EngineersSuggestion-ForIncidentAssignment`. The original entry:
+   `RagController` uses `@GetMapping` with `@RequestBody` on both endpoints — GET-with-body is
    dropped by many clients and by gateways. **Still true as of Track B4 step 4** — both bodies are
    now validated (`@Valid`, `@NotBlank`/`@Size`), but the HTTP method itself is unchanged.
 
@@ -559,9 +579,16 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
    (Track B1 step 3). `/internal/**` in both services now requires `ROLE_INTERNAL_SERVICE`,
    granted only to a caller sending both the shared secret and `X-Internal-Service` (which the
    gateway strips from inbound requests). `/reports/**` now requires ADMIN or SUPERVISOR.
-10. `AuthService` has **no `@EnableMethodSecurity`**, so `@PreAuthorize("hasRole('ADMIN')")` on
+10. **RESOLVED 2026-10-28**, test first (`AuthEndpointSecurityTest.preAuthorizeOnRoleControllerReallyRuns`: an
+    ENGINEER calling `RoleController` directly got through before, `AccessDeniedException` now). `@EnableMethodSecurity`
+    on AuthService's `SecurityConfig`. The original entry:
+    `AuthService` has **no `@EnableMethodSecurity`**, so `@PreAuthorize("hasRole('ADMIN')")` on
     `RoleController` is inert (the URL rule `/roles/** -> ROLE_ADMIN` is what actually protects it).
-11. `/auth/token-version/{userid}` is `permitAll` — a public per-user counter. **As of Track B4
+11. **RESOLVED 2026-10-28**, test first (`AuthEndpointSecurityTest`, 6 tests: anyone reached it before, 403 now unless
+    secret + `X-Internal-Service`; login/signup/refresh still open). Gateway side: `TokenVersionService` sends both headers
+    (`TokenVersionServiceHeadersTest`). **Restart AuthService and the gateway together**: an old gateway against the new
+    AuthService gets 403 on every token check and falls back to the tiers. The original entry:
+    `/auth/token-version/{userid}` is `permitAll` — a public per-user counter. **As of Track B4
     step 5, `userid` is a typed `UUID` path variable**, so a non-UUID value now gets a clean 400
     from Spring itself instead of a raw crash inside `UUID.fromString(...)`. It still throws
     `NotFoundException` (a proper 404, not a raw `RuntimeException`) for a well-formed but unknown
@@ -591,7 +618,10 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     logs `"Email Successfully sent to ..."` and sets `NotificationStatus.SUCCESS` around an
     **empty try block**. `spring-boot-starter-mail` is a dependency; there is no `JavaMailSender`
     and no `spring.mail.*` config. The `catch` is unreachable.
-17. `Ai-Service` incident classification is **switched off** — `ConsumeIncidentCreatedEvent`'s body
+17. **RESOLVED 2026-11-01** (AI plan phase 3, `notes/ai-service-phase-3.md`, `ClassificationTest`). Replaced by `POST /ai/classify`: a suggestion while the
+    user fills the form; `incident.created` then compares it with what they chose (one `ai_insight` row, no Gemini call). The old classifier, its producer and
+    `AiProcessedEvent` are deleted. The original entry:
+    `Ai-Service` incident classification is **switched off** — `ConsumeIncidentCreatedEvent`'s body
     is commented out, so `ai.classification.result` has no traffic and no consumer.
 18. **RESOLVED 2026-10-17 (SLA notifications step 5)** - NotificationService's `SlaEventConsumer` reads all 4 SLA topics.
     `SlaNotificationService` tells the creator, the assigned engineer (if any) and the supervisor of the engineer (or of
@@ -670,7 +700,9 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     Ai-Service. Feign was chosen over RestClient deliberately: consistency with the service that
     already used it was judged worth more than the smaller diff. No `.block()` and no
     per-invocation `build()` remain in either service. See §6.
-38. `IncidentService.AssignIncident` calls UserService twice per assignment — `IsUserActive`
+38. **RESOLVED 2026-11-01**, test first (`IncidentRulesTest.anAssignAsksAboutTheEngineerOnlyOnce`): the one `getUser`
+    answer is used. The original entry:
+    `IncidentService.AssignIncident` calls UserService twice per assignment — `IsUserActive`
     re-fetches what `getUser` already returned.
 39. ~~Gateway JWT expiry is configured at 3600000 ms but AuthService mints 7200000 ms tokens (the
     gateway's value is only read by its unused `generateToken`).~~ **RESOLVED 2026-10-23** (Auth v2 step 2): the
@@ -712,7 +744,10 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     "Auth service call failed" 35 times in one test run — both blaming AuthService for an
     IncidentService outage. Fixed with `.materialize()` (catches only the lookup's own errors) and
     a new `handler/GatewayExceptionHandler.java` for everything else. See §4 points 7-8, §6.
-49. **504 GATEWAY_TIMEOUT is wired up in `GatewayExceptionHandler` but never actually fires.**
+49. **RESOLVED 2026-10-28**, test first (`GatewayRoutesTest` failed on the real settings; `GatewayRouteTimeoutTest`
+    proves a 4 s service gets 504 after ~1 s; break check: without a route's own limit the patient route got 504).
+    10 s for every route, 60 s for the AI route, 2 s to connect - see §6. The original entry:
+    **504 GATEWAY_TIMEOUT is wired up in `GatewayExceptionHandler` but never actually fires.**
     Only the gateway's call to AuthService has a response timeout configured
     (`gateway.httpclient.response-timeout-ms`). Nothing limits how long a *routed* call to
     Incident, User, Reporting or Ai-Service is allowed to take — a slow (not down) service just
@@ -729,9 +764,11 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     `KafkaTraceIdAutoConfigTest`. **Not confirmed in the real system** - whether ReportingService and
     Ai-Service actually failed to start between B2 and now has not been checked.
     **Update 2026-10-14:** moot for ReportingService - since outbox step 4 its producers no longer inject a
-    `KafkaTemplate`, and the service ran in the step 5 real-system test. Still open for **Ai-Service only**
-    (`AiResponseProducer` injects one). Close this when Ai-Service has been seen starting fine.
-51. Services' `TraceIdFilter` (common-web) still reuses any incoming `X-Trace-Id` **without the safety
+    `KafkaTemplate`, and the service ran in the step 5 real-system test. **Update 2026-11-01:** moot for Ai-Service too: `AiResponseProducer` is deleted.
+51. **RESOLVED 2026-10-28**, test first (`TraceIdFilterTest`, 3 of 5 failed before: a line break, 5000 characters
+    and quotes were all kept). `TraceIdFilter` uses `TraceId.isSafe` and makes a new id otherwise. `common-web` was
+    re-installed so the services pick it up. The original entry:
+    Services' `TraceIdFilter` (common-web) still reuses any incoming `X-Trace-Id` **without the safety
     check** the gateway and Kafka code apply. Safe today (services only accept the gateway), but not
     defence in depth. Not fixed.
 52. Gateway log lines write the trace id **by hand** (`[id] ...`). The gateway is reactive, so the MDC
@@ -776,12 +813,19 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     this supervisor's team, or that the incident is the supervisor's. Any supervisor can assign any incident
     to any engineer, and can re-assign a `RESOLVED` incident. (Read, update-details and change-status do
     have data-level checks.)
-57. **PARTLY 2026-10-21:** assign and change-status now share one method, `supervisorMayTouch`. List, read-one and
-    update-details still have their own copies. The original entry:
+57. **RESOLVED 2026-11-01**, test first (`IncidentRulesTest` +4; break check: dropping a line from the list query failed
+    a test). Assign, change-status, read-one and update-details all use `supervisorMayTouch`; the list is the same rule
+    written as a query in `IncidentRepository.findIncidentsForUser` (change both together). **A supervisor now also sees
+    and reads incidents created by an engineer of their team, and incidents they assigned.** A supervisor with no team
+    sees what they created (an empty team list is replaced by an id that matches nobody, because `IN ()` is not valid SQL).
+    The original entry:
     **IncidentService: the "what may a supervisor touch" rule is typed four times and the copies disagree**
     (list, read-one, update, status), and a supervisor with no engineers gets an **empty list even for the
     incidents they created** (the code returns before the query runs).
-58. **IncidentService: a read returns only 8 fields** (`IncidentResponseDTO`). No endpoint returns the
+58. **RESOLVED 2026-11-01**, test first (`IncidentRulesTest` +2): list and read-one share `toResponse` and also return
+    description, service, category, environment, affected source, location, root cause, resolution notes and both
+    timestamps. Fields were only added, so old clients keep working. The original entry:
+    **IncidentService: a read returns only 8 fields** (`IncidentResponseDTO`). No endpoint returns the
     description, category, service, environment, location, timestamps, root cause or resolution notes.
 59. **RESOLVED 2026-10-17** (with issue 19): `CRITICAL` has its own rule, and an unknown or missing priority now
     **throws** `IllegalArgumentException` instead of getting a silent wrong time (in the Kafka listener that means
@@ -801,14 +845,29 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
     OPEN, an `assigned` event adds 1 to the workload again, a `RESOLVED` event double-counts the engineer's
     stats and republishes the resolved event. (Normal retries after a failure are fine - the transaction
     rolls back with the ledger row.) Fix: `existsById` first, or make `ProcessedEvent` implement `Persistable`.
-61. **ReportingService: `daily_metrics` is never written.** The table, entity and repository exist; nothing
+61. **RESOLVED 2026-11-01** (`DailyMetricsTest`, 11 tests; break check: `<=` at midnight failed a test). New
+    `DailyMetricsService` + `DailyMetricsSchedular` (every hour, ShedLock, works out the last 7 full days again, so a
+    machine that was off catches up) and `GET /reports/metrics/daily?days=7` (1-365, newest first, today worked out live).
+    `/reports/metrics` stays all-time; its method is now `getAllTimeMetrics`. The repository's id type is fixed (`LocalDate`,
+    it said `UUID`). Not yet run on real MySQL. The original entry:
+    **ReportingService: `daily_metrics` is never written.** The table, entity and repository exist; nothing
     inserts into it. `/reports/metrics` (its controller method is called `getDailyMetrics`) returns all-time
     totals counted from `incident_report`, not daily numbers.
-62. **ReportingService: the active-incident count drifts.** On assign it adds 1 to the assignee but never
+62. **RESOLVED 2026-11-01**, test first (`EngineerWorkloadTest`, 6 of 10 failed before; break check done).
+    `EngineerWorkloadService` no longer adds and subtracts: `refreshActiveIncidentCount` COUNTS the rows (assigned to the
+    engineer, not RESOLVED/CLOSED), after every assign and status change, for the old engineer on a reassign too. A wrong
+    number heals at that engineer's next event. `IncidentReport.engineerToCredit()` (the assignee, else the resolver) is
+    used for the stats and for the event's `resolvedBy` to Ai-Service; `IncidentReport.resolvedBy` still says who pressed
+    the button. **Old `engineer_performance_stats` rows and old vectors are not recalculated.** The original entry:
+    **ReportingService: the active-incident count drifts.** On assign it adds 1 to the assignee but never
     removes 1 from the previous assignee; on resolve it removes 1 from whoever sent `RESOLVED`
     (`resolvedBy`), not from the assignee. `resolvedBy` and the engineer's expertise stats are therefore
     credited to whoever pressed the button, which may be a supervisor or admin.
-63. **UserService returns fields that are never updated.** `UserResponseDTO` includes `enabled`,
+63. **RESOLVED 2026-11-01**, test first (`UserResponseDtoTest`): `enabled`, `accountLocked`, `failedLoginAttempts` AND
+    `passwordUpdatedAt` (same problem, found while fixing: set at signup, never again) are removed from `UserResponseDTO`.
+    AuthService owns them. **A client reading those 4 fields from `/users/**` no longer gets them.** The columns stay in
+    UserService's table, unused. The original entry:
+    **UserService returns fields that are never updated.** `UserResponseDTO` includes `enabled`,
     `accountLocked` and `failedLoginAttempts`, but nothing writes those columns after registration, so
     every user shows `enabled=false`, `accountLocked=false`, `failedLoginAttempts=0` - even though
     AuthService has `enabled=true`.
@@ -865,7 +924,12 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 
 ### Found while fixing the password change (2026-10-22)
 
-68. **A wrong OLD password on `POST /password/update` is not counted by the account lockout.** Only `/auth/login`
+68. **RESOLVED 2026-10-28** (decision: the SAME counter), test first (`ChangePasswordTest` +5; break check: counting
+    inside the transaction was rolled back, 3 tests failed). `ChangePasswordService` returns the verdict out of its
+    transaction and then calls `LoginAttemptService.recordFailedLogin` (own transaction) before the 401. 5 wrong (login
+    and old-password mixed) → locked 15 min; a locked account cannot change its password (`401 ACCOUNT_LOCKED`, not
+    counted again); the right old password resets the counter to 0. The original entry:
+    **A wrong OLD password on `POST /password/update` is not counted by the account lockout.** Only `/auth/login`
     calls `LoginAttemptService.recordFailedLogin`. Someone holding a stolen (still valid) token could keep guessing
     the old password there. The gateway's per-user limit (20/sec, 300/min) slows it, nothing stops it. **Not fixed** -
     needs a decision: count it in the same counter (and lock the account), or a separate small limit.
@@ -993,5 +1057,16 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 - **`Incident` has `@Version` (issue 64).** Never set `version` by hand and never build an `Incident` with an existing
   id to save it (Spring Data would treat a null version as a NEW row). Load it, change it, save it. A conflict is
   `409 CONCURRENT_UPDATE` from `common-web` - do not catch `OptimisticLockingFailureException` in a service.
+- **Ai-Service (AI plan phase 1, 2026-11-01, `notes/ai-service-phase-1.md`):** every Gemini call goes through `AiCallGuard` (Spring AI
+  has no time limit; too slow = 504, a failure = 503). Search only through `SimilarIncidentSearch`, once per request. A
+  recommendation is limited to the caller's team and to ACTIVE engineers, always checked at read time, because stored data goes
+  stale. `IncidentValues` must match IncidentService's `IncidentCategory` and `ServiceName` enums. Tests never call Gemini.
+  **Phase 2 (`notes/ai-service-phase-2.md`):** only the problem (title + description) is embedded, because a search compares it with a new problem; the root
+  cause and resolution live in the metadata and are added to the prompt. Do not put the solution back in the embedded text (break-checked).
+  Under `ai.memory.min-text-length` (10) an incident is not remembered. REOPENED removes it. Changing the embedded text means old rows must be
+  cleared or rebuilt, as Flyway `V2` did.
+  **Phase 3 (`notes/ai-service-phase-3.md`):** `POST /ai/classify` is only a suggestion, and every value in Gemini's answer is checked before use. Never call
+  Gemini from `incident.created`, and never inside a database transaction. A new enum value in IncidentService must be added to `IncidentValues` and the
+  classification prompt (`ClassificationTest` checks those two agree).
 - **A `FAILED` outbox row is never retried by itself.** It means the message could not be built or sent (for
   example the event class was renamed or removed). Do not rename or move an event class while rows for it exist.

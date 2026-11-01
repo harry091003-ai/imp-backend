@@ -49,6 +49,12 @@ import static org.junit.jupiter.api.Assertions.*;
  *   3. a wrong old password changes nothing (401)
  *   4. a new password equal to the old one is refused (400) and changes nothing
  *   5. both or neither: if the logout cannot be saved, the password stays the old one
+ *
+ * Issue 68 (2026-10-28): a wrong OLD password counts in the SAME lockout counter as a wrong login.
+ *   6. each wrong old password adds 1 to failed_login_attempts, and the 401 does not undo it
+ *   7. login and change-password share one counter: 4 wrong logins + 1 wrong old password = locked
+ *   8. a locked account cannot change its password, not even with the right old one
+ *   9. the right old password sets the counter back to 0
  */
 @DataJpaTest(properties = {
         "spring.datasource.url=jdbc:h2:mem:auth-password;MODE=MySQL;DB_CLOSE_DELAY=-1",
@@ -60,7 +66,7 @@ import static org.junit.jupiter.api.Assertions.*;
         "spring.sql.init.schema-locations=classpath:outbox/outbox_event_mysql.sql"
 })
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import({ChangePasswordService.class, LogoutUserService.class, RegisteringUserService.class,
+@Import({ChangePasswordService.class, LogoutUserService.class, RegisteringUserService.class, LoginAttemptService.class,
         UserLoggedOutEventProducer.class, UserRegisteredEventProducer.class, ChangePasswordTest.Setup.class})
 @Transactional(propagation = Propagation.NOT_SUPPORTED)   // no test-wide transaction: we test the real ones
 class ChangePasswordTest {
@@ -133,6 +139,10 @@ class ChangePasswordTest {
 
     private boolean storedPasswordIs(String plain) {
         return passwordEncoder.matches(plain, fromDatabase().getPassword());
+    }
+
+    private int failedAttempts() {
+        return fromDatabase().getFailedLoginAttempts();
     }
 
     private List<String> outboxTopics() {
@@ -209,5 +219,57 @@ class ChangePasswordTest {
 
         assertTrue(storedPasswordIs(OLD), "both or neither: no new password without the logout");
         assertEquals(tokenVersionBefore, fromDatabase().getTokenVersion());
+    }
+
+    // ------------------------------------------------------------------ issue 68: the lockout
+
+    @Test
+    void aWrongOldPasswordIsCountedAndThe401DoesNotUndoIt() {
+        assertThrows(UnauthorizedException.class, () -> change("guess-1", NEW));
+        assertThrows(UnauthorizedException.class, () -> change("guess-2", NEW));
+
+        assertEquals(2, failedAttempts(), "both wrong old passwords are counted");
+        assertFalse(Boolean.TRUE.equals(fromDatabase().getAccountLocked()), "2 is not enough to lock");
+    }
+
+    @Test
+    void fiveWrongOldPasswordsLockTheAccount() {
+        for (int i = 1; i <= 5; i++) {
+            int n = i;
+            assertThrows(UnauthorizedException.class, () -> change("guess-" + n, NEW));
+        }
+
+        User locked = fromDatabase();
+        assertTrue(locked.getAccountLocked(), "locked after 5 wrong old passwords");
+        assertNotNull(locked.getLockedUntil());
+        assertTrue(locked.getLockedUntil().isAfter(LocalDateTime.now().plusMinutes(14)), "locked for about 15 minutes");
+    }
+
+    @Test
+    void loginAndChangePasswordShareOneCounter() {
+        jdbc.update("UPDATE users SET failed_login_attempts = 4 WHERE userid = ?", user.getUserid());   // 4 wrong logins
+
+        assertThrows(UnauthorizedException.class, () -> change("guess", NEW));
+
+        assertTrue(fromDatabase().getAccountLocked(), "the 5th wrong password locks, wherever it was typed");
+    }
+
+    @Test
+    void aLockedAccountCannotChangeItsPasswordEvenWithTheRightOldOne() {
+        jdbc.update("UPDATE users SET account_locked = TRUE, failed_login_attempts = 5, locked_until = ? WHERE userid = ?",
+                LocalDateTime.now().plusMinutes(10), user.getUserid());
+
+        refusedAndNothingChanged(UnauthorizedException.class, "ACCOUNT_LOCKED", () -> change(OLD, NEW));
+        assertEquals(5, failedAttempts(), "a refused try while locked is not counted again");
+    }
+
+    @Test
+    void theRightOldPasswordSetsTheCounterBackToZero() {
+        jdbc.update("UPDATE users SET failed_login_attempts = 3 WHERE userid = ?", user.getUserid());
+
+        change(OLD, NEW);
+
+        assertEquals(0, failedAttempts());
+        assertTrue(storedPasswordIs(NEW));
     }
 }

@@ -76,5 +76,9 @@ AND
             @Param("authUserId") UUID authUserId,
             Pageable pageable
     );
+
+    // AI plan phase 1: JOIN FETCH loads the lazy roles in this one query.
+    @Query("SELECT DISTINCT u FROM User u LEFT JOIN FETCH u.roles WHERE u.userid IN :userIds")
+    List<User> findWithRolesByUseridIn(@Param("userIds") List<UUID> userIds);
 }
 

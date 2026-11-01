@@ -23,7 +23,7 @@ private final IncidentReportRepository incidentReportRepository;
 
     @Transactional
     public void updateEngineerStats(IncidentReport incidentReport)
-    { UUID engineerId=incidentReport.getResolvedBy();
+    { UUID engineerId=incidentReport.engineerToCredit();   // issue 62: not whoever pressed the button
         EngineerPerformanceStats engineerStats=engineerPerformanceStatsRepository.findByEngineerIdAndCategoryAndServiceName(engineerId,incidentReport.getCategory(),incidentReport.getServiceName())
                 .orElse(EngineerPerformanceStats.builder()
                         .engineerId(engineerId)

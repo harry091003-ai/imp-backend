@@ -39,7 +39,7 @@ public class IncidentReport {
     private UUID createdBy;
     private UUID assignedTo;
     private UUID assignedBy;
-    private UUID resolvedBy;
+    private UUID resolvedBy;   // who pressed the button. It may be a supervisor or an admin (see engineerToCredit)
 
     private String serviceName;
     private String category;
@@ -75,4 +75,9 @@ private LocalDateTime updatedAt;
     @Enumerated(EnumType.STRING)
     private SLA_RiskLevel resolutionRiskLevel=SLA_RiskLevel.NONE;
 
+
+    // Issue 62: who did the work: the assigned engineer. If nobody was assigned, whoever resolved it.
+    public UUID engineerToCredit() {
+        return assignedTo != null ? assignedTo : resolvedBy;
+    }
 }

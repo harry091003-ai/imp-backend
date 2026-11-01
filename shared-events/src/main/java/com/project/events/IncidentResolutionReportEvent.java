@@ -19,6 +19,11 @@ public class IncidentResolutionReportEvent {
     private String category;
     private String serviceName;
 
+    // AI plan phase 2: remembered with the incident. An older message has none: read as null.
+    private String severity;
+    private String priority;
+    private String environment;
+
     private String rootCause;
     private String resolutionNotes;
 
@@ -28,9 +33,6 @@ public class IncidentResolutionReportEvent {
 
     private boolean assignmentSlaBreached;
     private boolean resolutionSlaBreached;
-
-    private double assignmentRiskScore;
-    private double resolutionRiskScore;
 
     private LocalDateTime resolvedAt;
 }

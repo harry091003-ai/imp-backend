@@ -39,6 +39,9 @@ Last updated: 2026-10-24
 | Small bugs (2026-10-19) | Issues 4, 3, 56, 64, 1 - one at a time, test first | ✅ All 5 done (bug 5 on 2026-10-22) |
 | Auth v2 - RSA keys (2026-10-23) | Only AuthService can create tokens; the gateway can only check them | ✅ Done - all 6 steps. Step 5 (real keys + hand test through the gateway) passed 2026-10-26 |
 | Auth v2 part B - refresh tokens (2026-10-27) | Access token 15 min + refresh token 7 days, used once, cancelled on logout | ✅ Code + tests done (AuthService 65, gateway 69). **Not yet tried by hand on the real system** (Flyway `V6` runs at the next AuthService start) - see "Auth v2 part B" below |
+| Issue 68 + security batch (2026-10-28) | Wrong old password counts in the lockout; issues 49, 11, 10, 5, 7, 2, 51 | ✅ Code + tests done, all test-first (AuthService 80, gateway 76, all 6 services green). **Not yet tried by hand** - see "Issue 68 and the security clean-up batch" below |
+| AI service plan (2026-11-01) | Improve suggestions, storage and engineer ranking, in 4 phases | ✅ **Phases 1, 2 and 3 done** (Ai-Service 92 tests, no Gemini needed). **Not tried by hand, Gemini never really called. Flyway `V2` clears the AI memory and `V3` adds a table at the next Ai-Service start.** Phase 4 to do - see "AI service improvement plan" below |
+| Correctness batch (2026-11-01) | Issues 62, 61, 63, 57, 58, 38 | ✅ Code + tests done, test first where the old code could fail (Reporting 49, Incident 35, User 9). **Not yet tried by hand** - see "Correctness batch" below |
 | Role management (2026-10-21) | Issue 67: first admin from a setting, last-admin guard, audit row | ✅ Done (Flyway `V5` not yet run on your DB) |
 | SLA values (Phase 1) | Real SLA times for all 4 priorities, CRITICAL included (issues 19 + 59) | ✅ Done — 2026-10-17, test first. Old rows are NOT recalculated (issue 66) |
 | Lockout fix (Phase 1) | 5 wrong passwords really lock the account, and the lock ends after 15 minutes (issues 55 + 6) | ✅ Done — 2026-10-14, test first (not yet tried by hand on the real system) |
@@ -58,7 +61,8 @@ Tick a line and move it to the table above when it is done. Issue numbers are th
 | # | Task | Status |
 |---|---|---|
 | 1.1 | **Auth v2 step 5**: make the real RSA key pair, set `jwtprivatekey` (AuthService) and `jwtpublickey` (gateway), restart, test by hand | ✅ Done 2026-10-26 - keys made outside the project, set in IntelliJ; signup, login, token use (200), edited token (401), logout, token after logout (401) all passed through the gateway |
-| 1.2 | **Commit** the Auth v2 (RSA) work | ⏳ commit message not given yet - ask for it |
+| 1.2 | **Commit** the Auth v2 (RSA) work | ✅ Done 2026-10-28 - commit `7219fc7` (RSA + refresh tokens together, plus the pgvector schema backup) |
+| 1.4 | **Hand test of refresh tokens** (owner) | ⏳ owner will run it; steps in section "Auth v2 part B" below |
 | 1.3 | **Real-system check of earlier work** (do it together with 1.1, the services restart anyway). Back up the databases first | ⏳ never run on the real system: migrations Auth `V4` + `V5`, Incident `V4`, Notification `V2`; the lockout; first admin + role guards; assign rules; the 409 when two people save at once; the password change; SLA timers (test D); `GET /notifications/me`. Guide: `notes/sla-notifications.md` section 8 |
 
 ### 2. ~~Next big piece: Auth v2 part B - refresh tokens~~ ✅ built 2026-10-27 (hand test still to do - section "Auth v2 part B" below)
@@ -76,7 +80,7 @@ Tick a line and move it to the table above when it is done. Issue numbers are th
 
 | Issue | Question |
 |---|---|
-| 68 | A wrong OLD password on change-password is not counted by the lockout. Count it in the same lockout, or give it its own small limit? |
+| ~~68~~ | ✅ Decided 2026-10-28: the SAME lockout. Done the same day |
 | 66 | Old `incident_report` rows keep the old test-value SLA deadlines. Recalculate them, or leave them? |
 
 ### 4. Known gaps (not started), roughly by importance
@@ -85,30 +89,25 @@ Tick a line and move it to the table above when it is done. Issue numbers are th
 
 | Issue | What is wrong |
 |---|---|
-| 62 | ReportingService: the active-incident count drifts (reassign does not subtract; resolve subtracts from whoever pressed the button) |
-| 61 | ReportingService: `daily_metrics` is never written; `/reports/metrics` returns all-time totals |
-| 63 | UserService returns `enabled`, `accountLocked`, `failedLoginAttempts` that nothing updates |
-| 57 | The supervisor rule is still copied in list, read-one and update-details (assign and change-status share one) |
-| 58 | Reading an incident returns only 8 fields |
-| 38 | `AssignIncident` calls UserService twice for the same engineer |
+| ~~62, 61, 63, 57, 58, 38~~ | ✅ All done 2026-11-01 (hand test still to do) |
 
 **Security and safety**
 
 | Issue | What is wrong |
 |---|---|
-| 49 | The gateway has no time limit on routed calls, so its 504 never fires |
+| ~~49~~ | ✅ Done 2026-10-28: 10 s for every route, 60 s for AI |
 | 14 | Signup activates the account at once, no email check |
-| 11, 10 | `/auth/token-version/{id}` is public; AuthService has no `@EnableMethodSecurity` |
-| 5, 7, 2 | A logout endpoint accepts every HTTP verb; AI endpoints use GET with a body; one internal endpoint is broken |
+| ~~11, 10~~ | ✅ Done 2026-10-28 |
+| ~~5, 7, 2~~ | ✅ Done 2026-10-28 (logout and the 2 AI endpoints are POST now) |
 | - | HTTPS between the client and the gateway is not covered by anything yet |
-| 51 | Services' `TraceIdFilter` reuses an incoming trace id without the safety check |
+| ~~51~~ | ✅ Done 2026-10-28 |
 
 **Features not built**
 
 | Item | Note |
 |---|---|
 | Real email sending (issue 16) | deliberately later; for now logs + database rows |
-| AI classification (issue 17) | switched off; issue 50 (Ai-Service `KafkaTemplate`) to close when Ai-Service is seen starting |
+| ~~AI classification (issue 17)~~ | ✅ Done 2026-11-01: `POST /ai/classify`. Issue 50 is moot |
 | History of every root cause | `notes/LLD/LLD-improvements.md` E7 |
 | An API to READ the role audit rows | today SQL only (issue 67) |
 | The client sends back the incident `version` (`If-Match`) | covers a screen left open for minutes (issue 64) |
@@ -128,10 +127,14 @@ Tick a line and move it to the table above when it is done. Issue numbers are th
 
 ### Suggested order
 
-1. Step 5 + the real-system check together (1.1 + 1.3), then commit (1.2).
-2. Decide issue 68 (small and quick).
-3. Refresh tokens (section 2) - the biggest security gain left.
-4. The correctness items (62, 61, 63, 57, 58), then email last.
+Updated 2026-10-28 (1.1, 1.2 and refresh tokens are done):
+1. Owner: hand test of refresh tokens (1.4) together with the real-system check (1.3). Back up the databases first.
+2. Decide issue 66 (68 is done).
+3. ~~Security clean-up batch: 49, 11 + 10, 5 / 7 / 2, 51~~ ✅ done 2026-10-28 (hand test still to do).
+4. ~~Correctness: 62, 61, 63, 57, 58, 38~~ ✅ done 2026-11-01 (hand test still to do).
+5. Getting ready to deploy: issue 42 (Dockerfiles, profiles, CI) and HTTPS.
+6. Signup email check (14) together with real email sending (16).
+7. Later: Zipkin (53), trace-id tidy-up (52, 54), dead JWT files (20, 28), AI (17, 50).
 
 ---
 
@@ -2997,6 +3000,197 @@ You mentioned these but we never discussed what is in them. **Do not guess.** As
 # Change log — every file we changed
 
 This is your review record. Each entry says the file and what changed.
+
+---
+
+## AI service improvement plan (2026-11-01)
+
+**Status: Phases 1, 2 and 3 are DONE (same day, `notes/ai-service-phase-1.md`, `-2.md`, `-3.md`). Phase 4 is not started. Not committed.**
+Phase 3 fixed problem 14: `POST /ai/classify` before submit, `incident.created` measures the agreement with no Gemini call, the old classifier is deleted.
+Phase 2 fixed problems 6, 7, 8 and the unused fields of 15. Problem 13 (index) was only looked at: not needed yet, measure first. **Flyway `V2` empties
+`resolved_incidents_vectors` at the next Ai-Service start** (owner's decision 1).
+Problems 1-5 and 9-12 below are fixed; 15 partly (the copied search code and the wrong log line are gone). `avgHistoricalResolutionTime` is removed.
+**Decisions (owner, 2026-11-01):** 1 clear the old vectors (do it in phase 2), 2 ADMIN + SUPERVISOR only, 3 team members join when too few, 4 classification
+before submit, 5 sending incident text to Gemini is fine for personal use, with no secrets in the text (revisit if other people use it).
+**Also found while building:** the old suggestion answer class had `@Builder` and no empty constructor, so Jackson probably could not build it from (read, not run):
+Gemini's JSON; Spring AI retries 10 times with waits of up to 3 minutes by default (now 2 attempts).
+**Hand test still to do:** `notes/ai-service-phase-1.md` section 6. It is the first real call to Gemini with the new prompt.
+The section below is the plan as written before phase 1.
+
+**What exists today.** 2 endpoints (both POST since 2026-10-28, through the gateway at `/ai/**`, limited to 5/min and 100/day
+per user) and 1 Kafka listener. Nothing inside the system calls the endpoints; a client does.
+```
+ Incident-Resolved-Report-Topic ─► RagIntegrationService.storingResolvedIncidentsInVectorDb
+        text = title + description + category + service + ROOT CAUSE + RESOLUTION ─► Gemini embedding ─► pgvector table
+        (document id = incident id, so a repeat overwrites; metadata: category, service, resolvedById, times, SLA flags)
+
+ POST /ai/rag/suggestion              {title, description, category?, serviceName?}  -> {rootCause, resolutionNotes, anyError}
+        filter category+service (similarity >= 0.6, top 4) -> if empty: no filter (>= 0.7) -> if empty: stop, no LLM call
+        -> Gemini answers ONLY from those documents
+
+ POST /ai/EngineersSuggestion-ForIncidentAssignment   {title, description, category, serviceName, severity}
+        same search -> engineers who resolved those documents -> ask ReportingService for each one's expertise, SLA rate and
+        active count -> score = 0.35 similarity + 0.35 expertise + 0.20 SLA + 0.10 free time -> sorted list
+
+ incident.created listener: switched off (body commented out). Classification code (AiProcessingService) is dead code.
+```
+
+**Verdict: keep the design, fix the details.** Good already: answers only from retrieved context and refuses without it (no
+invented advice); filter with a fallback; the document id makes a repeat harmless; structured output; temperature 0.2; the
+stored event comes through the outbox and dead-letter handling; the ranking mixes four real signals.
+
+**Problems found (most important first)**
+| # | Problem | Why it matters |
+|---|---|---|
+| 1 | The engineer recommendation is open to any logged-in user, and it is not limited to the caller's team or to active engineers | An ENGINEER can read every engineer's SLA rate and workload (Reporting hides these on purpose). A supervisor can be shown engineers they are not allowed to assign (403 since issue 56) |
+| 2 | Candidates are only the engineers behind the top-4 documents (at most 4, often 1-2) | A free, skilled engineer with no similar case never appears |
+| 3 | The "similarity" part of the score cannot reach its weight: count is at most 4, so the factor is at most 0.35 (it needs 99 matches to reach 1.0) | The real weights are not 35/35/20/10; similarity counts about a third of what it should |
+| 4 | The suggestion endpoint searches twice (by hand to choose the filter, then again inside the advisor) | 2 embedding calls and 2 searches per request, and the two can disagree |
+| 5 | The fallback is "relax the filter" but also raises the threshold from 0.6 to 0.7 | The fallback finds LESS, not more. The thresholds are guesses and have never been measured on real data |
+| 6 | What is embedded includes the root cause and resolution, but the search text is only title + description | The match is diluted: a problem is compared with a problem plus its solution |
+| 7 | Every RESOLVED event is stored, with no quality check (root cause "asd" is accepted) | Junk in the memory gives junk advice |
+| 8 | A REOPENED incident keeps its old solution in the memory; old vectors carry `resolvedBy` = whoever pressed the button (before issue 62) | Stale or wrong advice, and a supervisor can be recommended as an engineer |
+| 9 | Reporting down or slow: 2 calls per candidate, one after the other, and any failure = 500 for the whole recommendation (worst case about 40 s) | One failing service breaks the answer even though the search worked |
+| 10 | A Gemini error, quota or a malformed answer = a raw 500 | The user sees a crash instead of "AI is busy, try later" |
+| 11 | The answer has no sources and no confidence; an empty result is a text inside `anyError` | The user cannot judge or check the advice |
+| 12 | `category` / `serviceName` in the request are free text | A typo silently misses the filter |
+| 13 | No vector index. With 3072 dimensions the plain `vector` type cannot be indexed (limit 2000) | Search is an exact scan: fine for thousands of rows, slow later |
+| 14 | Classification is switched off, its result is read by nobody, and its LLM call sits inside a DB transaction | Dead weight. Needs a decision |
+| 15 | The filter/fallback code is copied in 2 services; unused fields (`avgHistoricalResolutionTime`, the 2 risk scores); wrong variable in a log line; incident text goes to Google Gemini | Tidy-up, plus a privacy decision for deployment |
+
+**Plan, in phases. Each fix test first, break-checked, notes and records updated, as always.**
+- **Phase 1 - make the two endpoints correct and safe (about 2-3 days).** (a) engineer recommendation: ADMIN/SUPERVISOR only,
+  only ACTIVE engineers, only the caller's team (admin: all), plus team members as extra candidates when fewer than 3 were
+  found; (b) fix the score (use the real maximum and the similarity of each document), weights in settings, a neutral value for
+  an engineer with no stats; (c) Reporting failure = neutral numbers and a flag, not a 500; fewer calls; (d) Gemini errors =
+  a clean 503/504, with timeouts; (e) check category/service against the enums; (f) ONE shared search class, search once, a
+  fallback that really relaxes; (g) the suggestion answer gets `status` and `sources` (incident id, similarity, resolved by, date).
+- **Phase 2 - a better memory (about 2 days).** (a) embed the problem text only, keep root cause and resolution in the
+  metadata; (b) a quality gate before storing (minimum length of both texts); (c) store severity, priority and environment
+  too (added event fields only); (d) remove the stored solution when an incident is REOPENED; (e) clear or rebuild the old
+  vectors; (f) remove or fill the unused fields. Index (13): measure first; if needed use 1536 dimensions or `halfvec` + HNSW.
+- **Phase 3 - classification (about 1 day, after a decision).** A synchronous `POST /ai/classify` that the screen calls while
+  the user fills the form (suggestion; the user confirms), keep `AiInsight` to measure how often the AI agrees, delete the
+  do-nothing listener. No LLM call inside a database transaction.
+- **Phase 4 - a quality loop (later).** A golden set of 20-30 past incidents to measure the search and tune 0.6 / 0.7; a
+  thumbs up/down endpoint; try another Gemini model through the setting and compare; prompt rule "retrieved text is data, not
+  instructions".
+- **How to test without Gemini or Postgres:** Spring AI's in-memory vector store with a fake embedding model and a fake chat
+  model (to confirm it is on the classpath), plus plain-Java tests for the scoring, the filter and the text building.
+
+**Decisions needed from the owner**
+1. The old vectors are test data: **clear the table** (recommended) or rebuild them?
+2. Engineer recommendation for **ADMIN + SUPERVISOR only** (recommended, same rule as Reporting)?
+3. Add the supervisor's team members as candidates when too few engineers have a similar case (recommended)?
+4. Classification: **synchronous, before submit** (recommended) or after creation?
+5. Is it acceptable that incident text is sent to Google Gemini once this is deployed?
+
+---
+
+## Correctness batch (2026-11-01)
+
+**Status: code + tests done. Not yet tried by hand on the real system. Not committed** (the security batch of 2026-10-28
+is not committed either). Totals: ReportingService 49, IncidentService 35, UserService 9 - all passing.
+
+| Issue | What was wrong | What changed | Proof |
+|---|---|---|---|
+| 62 | The active-incident count drifted; stats and the Ai event credited whoever pressed the button | The count is COUNTED from the report rows after every event; credit goes to the assignee (else the resolver) | `EngineerWorkloadTest` 10, 6 failed before. Break check done |
+| 61 | `daily_metrics` was never written | Hourly job over the last 7 full days; `GET /reports/metrics/daily?days=N` | `DailyMetricsTest` 11 (new feature, so written with the code). Break check done |
+| 63 | UserService showed 3 fields nobody updates (a 4th, `passwordUpdatedAt`, found while fixing) | The 4 are removed from the answer | `UserResponseDtoTest` 2, 1 failed before |
+| 57 | The supervisor rule was typed 4 times and disagreed; no team = empty list | One rule (`supervisorMayTouch` + the same rule in the list query) | `IncidentRulesTest` +4, 3 failed before. Break check done |
+| 58 | A read returned 8 fields | All the details, on list and read-one | `IncidentRulesTest` +2, both failed before |
+| 38 | An assign asked UserService twice | Once | `IncidentRulesTest` +2, 1 failed before |
+
+### Decisions taken (say if you want any changed)
+- **Who gets the credit:** the assigned engineer. If nobody was assigned, whoever resolved it. `IncidentReport.resolvedBy`
+  still records who pressed the button.
+- **Issue 63:** remove the fields rather than send them over Kafka: AuthService owns them, and a counter that changes on
+  every wrong password is not worth an event.
+- **Issue 57:** the wider rule won (what a supervisor may change, they may also read and list).
+- **Daily job:** every hour rather than at midnight, because this machine is not always on at midnight.
+
+### Files
+| File | Change |
+|---|---|
+| `ReportingService/.../service/EngineerWorkloadService.java` | counts rows instead of +1 / -1 |
+| `ReportingService/.../kafka/consumer/IncidentEventConsumer.java` | refreshes the old and new engineer on assign, the assignee on any status change |
+| `ReportingService/.../entity/IncidentReport.java` | new `engineerToCredit()` |
+| `ReportingService/.../service/EngineerPerformanceService.java` | stats go to `engineerToCredit()` |
+| `ReportingService/.../kafka/producer/IncidentResolvedReportEventProducer.java` | event's `resolvedBy` = `engineerToCredit()` |
+| `ReportingService/.../service/DailyMetricsService.java` | NEW |
+| `ReportingService/.../schedular/dailyMetrics/DailyMetricsSchedular.java` | NEW |
+| `ReportingService/.../dto/DailyMetricsResponseDTO.java` | NEW |
+| `ReportingService/.../repository/DailtyMetricsReportRepository.java` | id type `LocalDate`; read by date range |
+| `ReportingService/.../repository/IncidentReportRepository.java` | 2 new count queries |
+| `ReportingService/.../controller/ReportingController.java` | `GET /reports/metrics/daily`; `getDailyMetrics` renamed `getAllTimeMetrics` |
+| `UserService/.../dto/UserResponseDTO.java`, `service/UserService.java` | 4 fields removed |
+| `IncidentService/.../service/IncidentService.java` | `toResponse`, `supervisorMayTouch` everywhere, no early empty page, one `getUser` |
+| `IncidentService/.../repository/IncidentRepository.java` | list query follows the same rule |
+| `IncidentService/.../dto/IncidentResponseDTO.java` | 10 more fields |
+| Tests | NEW `EngineerWorkloadTest`, `DailyMetricsTest`, `UserResponseDtoTest`; CHANGED `IncidentRulesTest` (+8) |
+
+### Hand test (owner, real system) - to do
+1. Restart ReportingService, IncidentService, UserService. No database change is needed.
+2. As admin/supervisor assign an incident to engineer A, then to engineer B. `GET /reports/engineer-workload/{A}` -> one
+   less; `{B}` -> one more.
+3. Let a supervisor resolve B's incident -> B's count goes down.
+4. About a minute after the start, `GET /reports/metrics/daily?days=7` -> 7 or more rows (and `SELECT * FROM daily_metrics`).
+5. `GET /incidents/{id}` shows the description, root cause and dates. `GET /users/...` no longer shows `enabled`.
+
+### Known limits (not fixed, written down)
+- Old `engineer_performance_stats` rows and old Ai-Service vectors keep the old credit. Not recalculated.
+- A workload number that is already wrong stays wrong until that engineer's next event.
+- A day older than 7 days is never recalculated.
+- Issue 66 (old SLA deadlines) is still open and also affects the old rows' SLA counts.
+
+---
+
+## Issue 68 and the security clean-up batch (2026-10-28)
+
+**Status: code + tests done, every fix test first. Not yet tried by hand on the real system.**
+Totals: AuthService 80, APIGateway 76, UserService 7, Ai-Service 4, IncidentService 27, NotificationService 44,
+ReportingService 28, common-web 25 - all passing. `common-web` was re-installed (`mvn install`) so the services use the
+new `TraceIdFilter`.
+
+| Issue | What was wrong | What changed | Test (failed before the fix) |
+|---|---|---|---|
+| 68 | A wrong OLD password on `POST /password/update` was never counted | It counts in the SAME lockout as login (5 -> locked 15 min). A locked account cannot change its password. The right old password resets the counter | `ChangePasswordTest` +5. Break check: counting inside the transaction -> rolled back, 3 failed |
+| 49 | No time limit on routed calls; the 504 never fired | 10 s for every route, 60 s for the AI route, 2 s to connect | `GatewayRoutesTest` +3 (real values), `GatewayRouteTimeoutTest` 3 (whole gateway + a slow local server). Break check done |
+| 11 | `/auth/token-version/{id}` open to anybody | Needs the internal secret + `X-Internal-Service`; the gateway sends both | `AuthEndpointSecurityTest` 6, `TokenVersionServiceHeadersTest` 1 |
+| 10 | `@PreAuthorize` on `RoleController` did nothing | `@EnableMethodSecurity` on AuthService | `AuthEndpointSecurityTest` 1 |
+| 5 | `/logout/user` accepted GET (and every method) | POST only; dead `LogoutAnyUser` removed | `LogoutControllerTest` 3 |
+| 7 | AI endpoints were GET with a body | Both POST | `RagControllerTest` 3 |
+| 2 | `/internal/UserSpecificDetails/{userId}` always 500 | `@PathVariable("userId")` | `InternalUserControllerTest` 2 |
+| 51 | Services kept any incoming trace id (line breaks, huge values) | Same safety rule as the gateway; a bad id is replaced | `TraceIdFilterTest` 5 |
+
+### Files
+| File | Change |
+|---|---|
+| `AuthService/.../service/ChangePasswordService.java` | issue 68: lock check first, verdict out of the transaction, count after it, counter reset on success |
+| `AuthService/.../config/SecurityConfig.java` | issue 10 `@EnableMethodSecurity`; issue 11 rule for `/auth/token-version/**` before `/auth/**` |
+| `AuthService/.../controller/LogoutController.java` | issue 5: `@PostMapping`, dead method removed |
+| `APIGateway/.../services/TokenVersionService.java` | issue 11: sends `X-Internal-Secret` + `X-Internal-Service: APIGATEWAY` |
+| `APIGateway/src/main/resources/application.properties` | issue 49: connect 2000 ms, response 10 s, AI route 60000 ms |
+| `Ai-Service/.../controller/RagController.java` | issue 7: both `@PostMapping` |
+| `UserService/.../controller/InternalUserController.java` | issue 2: `@PathVariable("userId")` |
+| `common-web/.../filter/TraceIdFilter.java` | issue 51: `TraceId.isSafe` |
+| Tests | NEW `AuthEndpointSecurityTest`, `LogoutControllerTest`, `GatewayRouteTimeoutTest`, `TokenVersionServiceHeadersTest`, `RagControllerTest`, `InternalUserControllerTest`, `TraceIdFilterTest`; CHANGED `ChangePasswordTest`, `GatewayRoutesTest` |
+
+### What changes for whoever calls the API
+- **`POST /logout/user`** (a GET now gets 405).
+- **`POST /ai/rag/suggestion`** and **`POST /ai/EngineersSuggestion-ForIncidentAssignment`** (same JSON body as before).
+- **Restart AuthService and the gateway together.** A new AuthService refuses the old gateway's token-version call
+  (403), and the old gateway would fall back to its cache / skip the check.
+
+### Hand test (owner, real system) - to do
+1. Restart AuthService, the gateway, UserService, Ai-Service (and the others, for the new `common-web`).
+2. Log in, use the token on any call -> 200 (the gateway's token-version call is accepted). The gateway log must NOT say
+   "AuthService returned error status: 403".
+3. `GET http://localhost:8082/auth/token-version/<your user id>` from Postman -> **403**.
+4. `GET /logout/user` -> 405; `POST /logout/user` -> 200.
+5. `POST /password/update` with a wrong old password 5 times -> 401 x5, then login gives `ACCOUNT_LOCKED`.
+   (Use a test account: it stays locked for 15 minutes.)
+6. Optional: AI endpoints with POST.
 
 ---
 

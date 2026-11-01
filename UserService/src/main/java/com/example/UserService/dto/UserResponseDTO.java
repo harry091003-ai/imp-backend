@@ -34,12 +34,7 @@ public class UserResponseDTO {
 
     private LocalDateTime lastLoginAt;
 
-    private LocalDateTime passwordUpdatedAt;
-
-    private Integer failedLoginAttempts ;
-
-    private Boolean accountLocked ;
-
-    private Boolean enabled;
+    // Issue 63 (2026-11-01): passwordUpdatedAt, failedLoginAttempts, accountLocked and enabled were removed from this
+    // answer. AuthService owns them and never sends changes here, so they were always wrong (enabled=false for everyone).
     private UUID supervisorId;
 }

@@ -20,7 +20,9 @@ public interface IncidentRepository extends JpaRepository<Incident, UUID> {
                      OR\s
                      (:isSupervisor = true AND (
                          i.assignedTo IN :teamEngineerIds\s
+                         OR i.createdBy IN :teamEngineerIds\s
                          OR i.createdBy = :userId
+                         OR i.assignedBy = :userId
                      ))
                      OR\s
                      (:isEngineer = true AND (

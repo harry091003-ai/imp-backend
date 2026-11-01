@@ -134,15 +134,39 @@ private final TransactionTemplate transactionTemplate;
        return isActive;
     }
 
-    // May this supervisor touch this incident? Used by assign and by change-status, so both follow one rule.
-    // Yes if they created or assigned it, or if it was created by / assigned to an engineer of their team.
-    // (List and read-one still have their own copies - issue 57.)
+    // May this supervisor touch this incident? Used by assign, change-status, read-one and update-details, so all follow
+    // one rule (issue 57). Yes if they created or assigned it, or if it was created by / assigned to an engineer of their
+    // team. The list has the same rule written as a query: IncidentRepository.findIncidentsForUser. Change both together.
     private static boolean supervisorMayTouch(Incident incident, UUID supervisorId, List<UUID> teamEngineerIds) {
         boolean isOwnIncident = supervisorId.equals(incident.getCreatedBy())
                 || supervisorId.equals(incident.getAssignedBy());
         boolean isTeamIncident = (incident.getCreatedBy() != null && teamEngineerIds.contains(incident.getCreatedBy()))
                 || (incident.getAssignedTo() != null && teamEngineerIds.contains(incident.getAssignedTo()));
         return isOwnIncident || isTeamIncident;
+    }
+
+    // Issue 58 (2026-11-01): list and read-one share this, and it returns all the details of the incident.
+    private static IncidentResponseDTO toResponse(Incident incident) {
+        return IncidentResponseDTO.builder()
+                .id(incident.getId())
+                .title(incident.getTitle())
+                .severity(incident.getSeverity())
+                .priority(incident.getPriority())
+                .createdBy(incident.getCreatedBy())
+                .assignedTo(incident.getAssignedTo())
+                .assignedBy(incident.getAssignedBy())
+                .incidentStatus(incident.getIncidentStatus())
+                .description(incident.getDescription())
+                .serviceName(incident.getServiceName())
+                .category(incident.getCategory())
+                .environment(incident.getEnvironment())
+                .affectedSource(incident.getAffectedSource())
+                .location(incident.getLocation())
+                .rootCause(incident.getRootCause())
+                .resolutionNotes(incident.getResolutionNotes())
+                .createdAt(incident.getCreatedAt())
+                .updatedAt(incident.getUpdatedAt())
+                .build();
     }
 
 public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedToUserId, Authentication auth) {
@@ -180,8 +204,9 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
     }
 
     //2.Is the Engineer to whom we want to assign exist and  2. is he is active and 3.has the role of Engineer or not
+    // Issue 38: this one answer has everything. Calling IsUserActive here asked UserService the same question again.
     UserValidationDTO engineer = userClient.getUser(assignedToUserId);
-    if (!IsUserActive(assignedToUserId)) {
+    if (!"ACTIVE".equals(engineer.getStatus())) {
         log.warn("User with id {} is not active so an incident cannot be assigned to him/her .", assignedToUserId);
         // 400 not 403: the caller is allowed to assign, they just picked an unusable target.
         // The fix is for the client to choose a different engineer, which is a 4xx-request problem.
@@ -275,9 +300,11 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
 
         if (isSupervisor) {
             teamEngineerIds = userClient.getEngineersUnderSupervisor(userId);
+            // Issue 57: this used to return an empty page here, hiding even the incidents they created themselves.
+            // The query needs a list with something in it ("IN ()" is not valid SQL), so: an id that matches nobody.
             if(teamEngineerIds.isEmpty()) {
                 log.info("Supervisor with id {} has no engineers in his team.", userId);
-            return Page.empty(pageable);
+                teamEngineerIds = List.of(new UUID(0, 0));
             }
         }
 //3. Create a new Pageable with sorting by createdAt in descending order
@@ -321,16 +348,7 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
                 );
             }
         // 5. Map to DTO
-        return incidents.map(incident -> IncidentResponseDTO.builder()
-                .id(incident.getId())
-                .title(incident.getTitle())
-                .severity(incident.getSeverity())
-                .priority(incident.getPriority())
-                .createdBy(incident.getCreatedBy())
-                .assignedTo(incident.getAssignedTo())
-                .assignedBy(incident.getAssignedBy())
-                .incidentStatus(incident.getIncidentStatus())
-                .build());
+        return incidents.map(IncidentService::toResponse);
 
 
 
@@ -344,16 +362,7 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
                 .orElseThrow(() -> new NotFoundException("INCIDENT_NOT_FOUND",
                         "Incident not found: " + incidentId));
 
-        IncidentResponseDTO response = IncidentResponseDTO.builder()
-                 .id(incident.getId())
-                .title(incident.getTitle())
-                .severity(incident.getSeverity())
-                .priority(incident.getPriority())
-                .createdBy(incident.getCreatedBy())
-                .assignedTo(incident.getAssignedTo())
-                .assignedBy(incident.getAssignedBy())
-                .incidentStatus(incident.getIncidentStatus())
-                .build();
+        IncidentResponseDTO response = toResponse(incident);
 
         Set<String> roles = auth.getAuthorities().stream()
                 .map(GrantedAuthority::getAuthority)
@@ -369,15 +378,7 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
 
             List<UUID> teamEngineerIds = userClient.getEngineersUnderSupervisor(userId);
 
-            boolean isOwnIncident =
-                    incident.getCreatedBy().equals(userId) ||
-                            (incident.getAssignedBy() != null && incident.getAssignedBy().equals(userId));
-
-            boolean isTeamIncident =
-                    incident.getAssignedTo() != null &&
-                            teamEngineerIds.contains(incident.getAssignedTo());
-
-            if (isOwnIncident || isTeamIncident) {
+            if (supervisorMayTouch(incident, userId, teamEngineerIds)) {
                 return response;
             }
         }
@@ -431,15 +432,7 @@ public AssignIncidentResponseDTO AssignIncident(UUID IncidentId, UUID assignedTo
 
             List<UUID> teamEngineerIds = userClient.getEngineersUnderSupervisor(userId);
 
-            boolean isOwnIncident =
-                    incident.getCreatedBy().equals(userId) ||
-                            (incident.getAssignedBy() != null && incident.getAssignedBy().equals(userId));
-
-            boolean isTeamIncident =
-
-                            (incident.getAssignedTo() != null && teamEngineerIds.contains(incident.getAssignedTo())) || (teamEngineerIds.contains(incident.getCreatedBy()) );
-
-            allowed = isOwnIncident || isTeamIncident;
+            allowed = supervisorMayTouch(incident, userId, teamEngineerIds);
         }
 
         // ENGINEER
@@ -603,6 +596,7 @@ return incident;
                 .UpdatedBy(StatusUpdaterId)
                 .serviceName(updated.getServiceName()!=null?updated.getServiceName().name():null)
                 .category(updated.getCategory()!=null?updated.getCategory().toString():null)
+                .environment(updated.getEnvironment()!=null?updated.getEnvironment().name():null)
                 .message("Incident status updated to "+updated.getIncidentStatus().name())
                 .build();
         if(request.getStatus()==IncidentStatus.RESOLVED){

@@ -57,6 +57,9 @@ public class SecurityConfig {
                 // Authorization rules
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/actuator/**").permitAll()
+                        // AI plan phase 1: this answer shows each engineer's SLA rate and workload. ReportingService
+                        // hides those numbers from engineers on purpose, and only these two roles can assign anyway.
+                        .requestMatchers("/ai/EngineersSuggestion-ForIncidentAssignment").hasAnyRole("ADMIN", "SUPERVISOR")
                         .anyRequest().authenticated()//ye line se authentication use karne ya na karne ka koi link nahi hai it check check karte hai ki SecurityContextHolder.getContext().getAuthentication() != null to nahi hai
                 );
 

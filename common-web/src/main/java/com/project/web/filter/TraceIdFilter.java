@@ -95,7 +95,10 @@ public class TraceIdFilter extends OncePerRequestFilter {
 
         String traceId = request.getHeader(TRACE_ID_HEADER);
 
-        if (traceId == null || traceId.isBlank()) {
+        // Issue 51 (2026-10-28): the same safety rule as the gateway and Kafka. An id with a line break, quotes or
+        // spaces, or longer than 64 characters, could write fake log lines - so it is replaced, not used.
+        // (isSafe is also false for a missing or blank id.)
+        if (!TraceId.isSafe(traceId)) {
             // 8 hex chars is enough to be unique within a log retention window and short
             // enough that a user can read it off a screen and tell it to you over the phone.
             traceId = TraceId.newId();

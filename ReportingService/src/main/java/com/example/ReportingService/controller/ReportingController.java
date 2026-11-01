@@ -1,6 +1,7 @@
 package com.example.ReportingService.controller;
 
 import com.example.ReportingService.dto.*;
+import com.example.ReportingService.service.DailyMetricsService;
 import com.example.ReportingService.service.EngineerPerformanceService;
 import com.example.ReportingService.service.EngineerWorkloadService;
 import com.example.ReportingService.service.ReportingService;
@@ -13,6 +14,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
 
@@ -50,8 +52,9 @@ public class ReportingController {
     }
 
     // 4. Metrics
+    // Issue 61: these are ALL-TIME totals. This method used to be called getDailyMetrics, which they never were.
     @GetMapping("/metrics")
-    public ResponseEntity<MetricsResponseDTO> getDailyMetrics() {
+    public ResponseEntity<MetricsResponseDTO> getAllTimeMetrics() {
 
         return ResponseEntity.ok(reportingService.getMetrics());
     }
@@ -80,6 +83,16 @@ return ResponseEntity.ok(trends);
     //---------------------------------
     private final EngineerPerformanceService engineerPerformanceService;
     private final EngineerWorkloadService engineerWorkloadService;
+    private final DailyMetricsService dailyMetricsService;
+
+    // Issue 61: one row per day, newest first, today included (worked out live).
+    @GetMapping("/metrics/daily")
+    public ResponseEntity<List<DailyMetricsResponseDTO>> getDailyMetrics(
+            @RequestParam(defaultValue = "7") @Min(value = 1, message = "days must be at least 1")
+            @Max(value = 365, message = "days must be at most 365") int days) {
+        return ResponseEntity.ok(dailyMetricsService.getDailyMetrics(LocalDate.now(), days));
+    }
+
     @GetMapping("/engineer-performance/{engineerId}/{category}/{service}")
     public EngineerPerformanceStatsDTO getEngineerPerformanceStats(@PathVariable UUID engineerId,
                                                                    @PathVariable String category,

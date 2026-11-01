@@ -1,6 +1,7 @@
 package com.example.Ai_Service.dto;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import lombok.*;
 
@@ -27,9 +28,11 @@ public class EngineerRecommendationRequestDTO {
 
     // Optional - the search filter skips them when null.
     // 50 is plenty: the longest real value is NOTIFICATION_SERVICE (20 chars).
+    @Pattern(regexp = IncidentValues.CATEGORY, message = IncidentValues.CATEGORY_MESSAGE)
     @Size(max = 50, message = "Category must be at most 50 characters")
     private String category;
 
+    @Pattern(regexp = IncidentValues.SERVICE, message = IncidentValues.SERVICE_MESSAGE)
     @Size(max = 50, message = "Service name must be at most 50 characters")
     private String serviceName;
 

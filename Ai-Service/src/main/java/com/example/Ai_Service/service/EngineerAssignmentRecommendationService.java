@@ -1,207 +1,195 @@
 package com.example.Ai_Service.service;
 
-import com.example.Ai_Service.dto.*;
+import com.example.Ai_Service.dto.EngineerCandidateDTO;
+import com.example.Ai_Service.dto.EngineerRecommendationRequestDTO;
+import com.example.Ai_Service.dto.EngineerSummaryDTO;
+import com.example.Ai_Service.dto.EngineerSummaryRequestDTO;
+import com.example.Ai_Service.dto.UserValidationDTO;
+import com.example.Ai_Service.exception.AiUnavailableException;
 import com.example.Ai_Service.feignClients.ReportingServiceFeignClient;
-import lombok.RequiredArgsConstructor;
+import com.example.Ai_Service.feignClients.UserServiceFeignClient;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.rag.Query;
-import org.springframework.ai.rag.retrieval.search.VectorStoreDocumentRetriever;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.ai.vectorstore.filter.Filter;
-import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
-import java.util.*;
-
-@RequiredArgsConstructor
+// AI plan phase 1 (2026-11-01). Who should get this incident?
+//
+//   a supervisor's team (admin: everyone)
+//        |
+//   engineers who solved similar incidents, inside that team
+//        |  fewer than 3 found: the rest of the team joins, with no similarity points
+//   only ACTIVE users with the ENGINEER role
+//        |
+//   their numbers from ReportingService (if it is down: neutral numbers and statsAvailable=false)
+//        |
+//   sorted by score, best first
+//
+// A supervisor may only assign to their own team (issue 56), so anyone else in this list would be a useless answer.
 @Service
 @Slf4j
 public class EngineerAssignmentRecommendationService {
-    private final VectorStore vectorStore;
-private final ReportingServiceFeignClient reportingServiceFeignClient;
-    public List<EngineerCandidateDTO> recommendedEngineers(EngineerRecommendationRequestDTO request) {
-        // C1 step 1b: was log.info of the whole request object. Today that printed only a memory
-        // address (no toString), but the request holds the incident title + description - one
-        // @Data away from printing them. Now debug, with just the 2 values this method uses.
+
+    // Neutral = "we do not know", not "bad". A new engineer must not lose points for having no history.
+    private static final double NEUTRAL = 0.5;
+    private static final int MAX_IDS_PER_CALL = 50;   // the limit of both batch endpoints
+
+    private final SimilarIncidentSearch search;
+    private final ReportingServiceFeignClient reportingServiceFeignClient;
+    private final UserServiceFeignClient userServiceFeignClient;
+    private final EngineerRanking ranking;
+    private final int topK;
+    private final int minCandidates;
+    private final int maxResults;
+
+    public EngineerAssignmentRecommendationService(SimilarIncidentSearch search,
+                                                   ReportingServiceFeignClient reportingServiceFeignClient,
+                                                   UserServiceFeignClient userServiceFeignClient,
+                                                   EngineerRanking ranking,
+                                                   @Value("${ai.search.recommendation-top-k:10}") int topK,
+                                                   @Value("${ai.ranking.min-candidates:3}") int minCandidates,
+                                                   @Value("${ai.ranking.max-results:5}") int maxResults) {
+        this.search = search;
+        this.reportingServiceFeignClient = reportingServiceFeignClient;
+        this.userServiceFeignClient = userServiceFeignClient;
+        this.ranking = ranking;
+        this.topK = topK;
+        this.minCandidates = minCandidates;
+        this.maxResults = maxResults;
+    }
+
+    public List<EngineerCandidateDTO> recommendedEngineers(EngineerRecommendationRequestDTO request, Authentication auth) {
         log.debug("Recommending engineers for category {}, service {}", request.getCategory(), request.getServiceName());
-        Filter.Expression filter = buildFilter(request.getCategory(), request.getServiceName());
 
-
-        // we are also applying the fallback mechanism here that is:
-        // suppose while using the filtering expression for retrieving similar data ,the filter is too strict that we are not  to retrieve any relevant document from vector db.
-        // in that case we will not have any context to give to the LLM and that may affect the quality of the response that we will get from LLM, so in that case  instead of giving
-        // no context to LLM we can give some context to LLM by relaxing the filter condition and trying to retrieve the relevant documents again, so in this way we can increase the
-        // chances of retrieving some relevant documents from vector db and giving that as context to LLM which may help in improving the quality of response from LLM.
-//        User Query
-//             ↓
-//        Try filtered retrieval
-//             ↓
-//        IF results found → use filtered
-//        ELSE → fallback to unfiltered
-//             ↓
-//        Send to LLM
-
-
-//        Step 1: Create both retrievers
-        //  VectorStoreDocumentRetriever with  Filter.Expression
-        VectorStoreDocumentRetriever retriever_WithFilter = VectorStoreDocumentRetriever.builder()
-                .vectorStore(vectorStore)
-                .topK(4)
-                .similarityThreshold(0.6)
-                .filterExpression(filter)
-                .build();
-
-        // VectorStoreDocumentRetriever without  Filter.Expression
-        VectorStoreDocumentRetriever retriever_fallback = VectorStoreDocumentRetriever.builder()
-                .vectorStore(vectorStore)
-                .topK(4)
-                .similarityThreshold(0.7)
-                .build();
-        // Step 2: Manually  Try retrieving with the  retrieval (that has filter expression)
-
-        // we also need to make the Query as they traditional way accept the Query object in retrieval method .
-        String queryText = request.getTitle() + " " + request.getDescription();
-        Query query = new Query(queryText);
-        List<Document> DocRetrievedFromVectorDb = retriever_WithFilter.retrieve(query);
-        log.info("Filtered retrieval returned {} docs", DocRetrievedFromVectorDb.size());
-        List<Document> finalDoc=new ArrayList<>();
-        if (DocRetrievedFromVectorDb.isEmpty()) {
-            log.warn("Filtered Document retrieval  from Vector Db returned no results so we are → using fallback retrival where no filter is applied");
-
-            List<Document> fallbackDocsFromVectorDb = retriever_fallback.retrieve(query);
-            log.info("Filtered retrieval returned {} docs", DocRetrievedFromVectorDb.size());
-            if (fallbackDocsFromVectorDb.isEmpty()) {
-                log.warn("Fallback Document retrival also empty → sono context available");
-                log.warn("so Not enough similar incidents found to provide suggestion. so EXITING without calling LLM as it will not give good response without context");
-            }
-            else
-            { finalDoc=fallbackDocsFromVectorDb;
-            }
-
+        boolean isAdmin = auth.getAuthorities().stream().anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN"));
+        List<UUID> team = isAdmin ? List.of() : teamOf(UUID.fromString(auth.getName()));
+        if (!isAdmin && team.isEmpty()) {
+            return List.of();   // nobody they could assign: no reason to pay for a search
         }
-        else{finalDoc=DocRetrievedFromVectorDb;
-        log.info("so we are using the DocRetrievedFromVectorDb with filter based search from metadata");}
-        // for each retrieved document we are extracting the metadata and creating the EngineerCandidateDTO object and putting that in the map where key is engineerId and value is the EngineerCandidateDTO .
-        Map<UUID, EngineerCandidateDTO>EngineerCandidates =  extractEngineerCandidates(finalDoc);
 
-//        performance stats and Workload related data from Reporting service
+        SimilarIncidentSearch.Result found = search.search(request.getTitle(), request.getDescription(),
+                request.getCategory(), request.getServiceName(), topK);
+        Map<UUID, EngineerCandidateDTO> candidates = candidatesFrom(found.documents());
 
-GetEngineerStatsFromReportingService(EngineerCandidates,request);
-
-//setting finalRankingScore of each candidate by using the calculateFinalRankingScore function.
-
-        for (EngineerCandidateDTO candidate : EngineerCandidates.values()) {
-      double finalRankingScore = calculateFinalRankingScore(candidate);
-            candidate.setFinalRankingScore(finalRankingScore);
-
-
+        if (!isAdmin) {
+            candidates.keySet().retainAll(team);
+            if (candidates.size() < minCandidates) {
+                team.stream().limit(MAX_IDS_PER_CALL).forEach(engineerId -> candidates.computeIfAbsent(engineerId, this::noSimilarCase));
+            }
         }
-// list of engineers sorted based on their finalRankingScore in descending order.
-List<EngineerCandidateDTO>SortedRecommendedEngineers=EngineerCandidates.values()
-        .stream().sorted(Comparator.comparingDouble(EngineerCandidateDTO::getFinalRankingScore).reversed()).toList();
+        if (candidates.isEmpty()) {
+            return List.of();
+        }
 
+        keepOnlyAssignableEngineers(candidates);
+        if (candidates.isEmpty()) {
+            return List.of();
+        }
 
+        Map<UUID, EngineerSummaryDTO> summaries = summariesOf(candidates, request);
+        boolean statsAvailable = summaries != null;
+        candidates.values().forEach(candidate ->
+                score(candidate, statsAvailable ? summaries.get(candidate.getEngineerId()) : null, statsAvailable));
 
-  return SortedRecommendedEngineers;
+        return candidates.values().stream()
+                .sorted(Comparator.comparingDouble(EngineerCandidateDTO::getFinalRankingScore).reversed())
+                .limit(maxResults)
+                .toList();
     }
 
-//------------------Helper functions----------
-    //Calling the Reporting service for getting the performance stats and Workload related data from Reporting service...
-    public void GetEngineerStatsFromReportingService(Map<UUID, EngineerCandidateDTO>Engineers, EngineerRecommendationRequestDTO requestDTO){
-        for(EngineerCandidateDTO engineer:Engineers.values()){
-            log.info("Calling the FeignClient for getting the performance stats and Workload related data");
-            EngineerPerformanceStatsDTO engineerPerformanceStats= reportingServiceFeignClient.getEngineerPerformanceStats(engineer.getEngineerId(),requestDTO.getCategory(),requestDTO.getServiceName());
-            EngineerWorkloadDTO engineerWorkload= reportingServiceFeignClient.getEngineerWorkload(engineer.getEngineerId());
-log.info("so EngineerPerformanceStatsDTO is null → {} and EngineerWorkloadDTO is null → {}",engineerPerformanceStats==null,engineerWorkload==null);
-            if(engineerPerformanceStats!=null)
-            {engineer.setExpertiseScore(engineerPerformanceStats.getExpertiseScore());
-                engineer.setSlaSuccessRate(engineerPerformanceStats.getSlaSuccessRate());
-                log.info("so Expertise Score is {},Sla Success Rate is {}",engineerPerformanceStats.getExpertiseScore(),engineerPerformanceStats.getSlaSuccessRate());
-            }
-            if(engineerWorkload!=null){
-                engineer.setActiveIncidents(engineerWorkload.getActiveIncidentCount());
-                log.info("so Active Incidents count is {}",engineerWorkload.getActiveIncidentCount());
-            }
-
+    private List<UUID> teamOf(UUID supervisorId) {
+        try {
+            return userServiceFeignClient.getEngineersUnderSupervisor(supervisorId);
+        } catch (RuntimeException e) {
+            throw userServiceDown(e);
         }
     }
 
-
-    //Extract Metadata From Retrieved Documents from RAG
-    private Map<UUID, EngineerCandidateDTO>
-    extractEngineerCandidates(List<Document> docs) {
-        log.info(" enter the extractEngineerCandidates function with retrieved docs from vector db ");
-        Map<UUID, EngineerCandidateDTO> map = new HashMap<>();
-        for (Document doc : docs) {
-            UUID engineerId = UUID.fromString(
-                    doc.getMetadata()
-                            .get("resolvedById")
-                            .toString()
-            );
-            EngineerCandidateDTO candidate =
-                    map.getOrDefault(
-                            engineerId,
-                            EngineerCandidateDTO.builder()
-                                    .engineerId(engineerId)
-                                    .similarIncidentCount(0)
-                                    .build()
-                    );
-            // increment similar incident count
-            candidate.setSimilarIncidentCount(
-                    candidate.getSimilarIncidentCount() + 1
-            );
-            map.put(engineerId, candidate);
+    // Old documents may name a supervisor or someone who has left, so the list is always checked.
+    private void keepOnlyAssignableEngineers(Map<UUID, EngineerCandidateDTO> candidates) {
+        List<UserValidationDTO> users;
+        try {
+            users = userServiceFeignClient.validateUsers(new ArrayList<>(candidates.keySet()));
+        } catch (RuntimeException e) {
+            throw userServiceDown(e);
         }
-        return map;
+        List<UUID> assignable = users.stream()
+                .filter(user -> "ACTIVE".equals(user.getStatus()) && user.getRoles() != null && user.getRoles().contains("ROLE_ENGINEER"))
+                .map(UserValidationDTO::getUserid)
+                .toList();
+        candidates.keySet().retainAll(assignable);
     }
 
-    private Filter.Expression buildFilter(String category, String service) {
-        FilterExpressionBuilder builder = new FilterExpressionBuilder();
-        if (category != null && service != null) {
-            return builder.and(
-                    builder.eq("category", category),
-                    builder.eq("service", service)
-            ).build();
-        } else if (category != null) {
-            return builder.eq("category", category).build();
-        } else if (service != null) {
-            return builder.eq("service", service).build();
-        }
-
-        return null;
+    // We cannot tell who may be assigned without UserService. Guessing could show the wrong people, so this one fails.
+    private static AiUnavailableException userServiceDown(RuntimeException cause) {
+        log.warn("UserService call failed: {}", cause.getClass().getSimpleName());
+        return new AiUnavailableException("USER_SERVICE_UNAVAILABLE", "Could not check the engineers right now. Please try again later.",
+                HttpStatus.SERVICE_UNAVAILABLE, cause);
     }
 
-    private double calculateFinalRankingScore(
-            EngineerCandidateDTO candidate
-    ) {
+    // Null = ReportingService did not answer. The recommendation still works, without its numbers.
+    private Map<UUID, EngineerSummaryDTO> summariesOf(Map<UUID, EngineerCandidateDTO> candidates, EngineerRecommendationRequestDTO request) {
+        try {
+            return reportingServiceFeignClient.getEngineerSummaries(EngineerSummaryRequestDTO.builder()
+                            .category(request.getCategory())
+                            .serviceName(request.getServiceName())
+                            .engineerIds(new ArrayList<>(candidates.keySet()))
+                            .build())
+                    .stream().collect(Collectors.toMap(EngineerSummaryDTO::getEngineerId, Function.identity()));
+        } catch (RuntimeException e) {
+            log.warn("ReportingService call failed, ranking without its numbers: {}", e.getClass().getSimpleName());
+            return null;
+        }
+    }
 
-        double similarityFactor =
-                Math.min(
-                        Math.log10(
-                                candidate.getSimilarIncidentCount() + 1
-                        ) / 2.0,
-                        1.0
-                );
+    private void score(EngineerCandidateDTO candidate, EngineerSummaryDTO summary, boolean statsAvailable) {
+        candidate.setStatsAvailable(statsAvailable);
+        boolean hasHistory = summary != null && summary.getTotalIncidentsResolved() > 0;
+        double expertise = NEUTRAL;
+        double sla = NEUTRAL;
+        double freeTime = NEUTRAL;
+        if (statsAvailable) {
+            // No history in this kind of incident: no expertise points, which is true. But an unknown SLA rate is not a bad one.
+            expertise = hasHistory ? summary.getExpertiseScore() / 100.0 : 0;
+            sla = hasHistory ? summary.getSlaSuccessRate() : NEUTRAL;
+            int active = summary == null ? 0 : summary.getActiveIncidentCount();
+            freeTime = EngineerRanking.freeTime(active);
+            candidate.setActiveIncidents(active);
+            candidate.setExpertiseScore(hasHistory ? summary.getExpertiseScore() : 0);
+            candidate.setSlaSuccessRate(hasHistory ? summary.getSlaSuccessRate() : 0);
+        }
+        double similarity = EngineerRanking.similarity(candidate.getBestSimilarity(), candidate.getSimilarIncidentCount());
+        candidate.setFinalRankingScore(ranking.score(similarity, expertise, sla, freeTime));
+    }
 
-        double expertiseFactor =
-                candidate.getExpertiseScore() / 100.0;
+    private EngineerCandidateDTO noSimilarCase(UUID engineerId) {
+        return EngineerCandidateDTO.builder().engineerId(engineerId).similarIncidentCount(0).build();
+    }
 
-        double slaFactor =
-                candidate.getSlaSuccessRate();
-
-        double workloadFactor =
-                1 - Math.min(
-                        candidate.getActiveIncidents() / 10.0,
-                        1.0
-                );
-
-        return (
-                similarityFactor * 0.35 +
-                        expertiseFactor * 0.35 +
-                        slaFactor * 0.20 +
-                        workloadFactor * 0.10
-        ) * 100;
+    private Map<UUID, EngineerCandidateDTO> candidatesFrom(List<Document> documents) {
+        Map<UUID, EngineerCandidateDTO> candidates = new LinkedHashMap<>();
+        for (Document document : documents) {
+            Object resolvedBy = document.getMetadata().get("resolvedById");
+            if (resolvedBy == null) {
+                continue;
+            }
+            EngineerCandidateDTO candidate = candidates.computeIfAbsent(UUID.fromString(resolvedBy.toString()), this::noSimilarCase);
+            candidate.setSimilarIncidentCount(candidate.getSimilarIncidentCount() + 1);
+            double match = document.getScore() == null ? 0 : document.getScore();
+            candidate.setBestSimilarity(Math.max(candidate.getBestSimilarity(), match));
+        }
+        return new HashMap<>(candidates);
     }
 }

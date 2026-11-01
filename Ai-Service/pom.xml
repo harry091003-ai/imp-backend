@@ -182,10 +182,6 @@
 
     <!--  To use the RetrievalAugmentationAdvisor RAG Advisors  -->
 
-    <dependency>
-        <groupId>org.springframework.ai</groupId>
-        <artifactId>spring-ai-rag</artifactId>
-    </dependency>
 
     <dependency>
         <groupId>org.springframework.ai</groupId>

@@ -87,10 +87,6 @@ private static final Logger log= LoggerFactory.getLogger(UserService.class);
                         .createdAt(user.getCreatedAt())
                         .updatedAt(user.getUpdatedAt())
                         .lastLoginAt(user.getLastLoginAt())
-                        .passwordUpdatedAt(user.getPasswordUpdatedAt())
-                        .failedLoginAttempts(user.getFailedLoginAttempts())
-                        .accountLocked(user.getAccountLocked())
-                        .enabled(user.getEnabled())
                         .supervisorId(user.getSupervisor()!=null? user.getSupervisor().getUserid():null)
                         .build())
                 .collect(Collectors.toList());
@@ -109,11 +105,7 @@ private static final Logger log= LoggerFactory.getLogger(UserService.class);
                 .createdAt(Engineer.getCreatedAt())
                 .updatedAt(Engineer.getUpdatedAt())
                 .lastLoginAt(Engineer.getLastLoginAt())
-                .passwordUpdatedAt(Engineer.getPasswordUpdatedAt())
-                .failedLoginAttempts(Engineer.getFailedLoginAttempts())
-                .accountLocked(Engineer.getAccountLocked())
                 .supervisorId(Engineer.getSupervisor()!=null? Engineer.getSupervisor().getUserid():null)
-                .enabled(Engineer.getEnabled())
                 .build();
     }
 
@@ -131,10 +123,6 @@ private static final Logger log= LoggerFactory.getLogger(UserService.class);
               .createdAt(user.getCreatedAt())
               .updatedAt(user.getUpdatedAt())
               .lastLoginAt(user.getLastLoginAt())
-              .passwordUpdatedAt(user.getPasswordUpdatedAt())
-              .failedLoginAttempts(user.getFailedLoginAttempts())
-              .accountLocked(user.getAccountLocked())
-              .enabled(user.getEnabled())
               .build();
 
 
@@ -347,10 +335,6 @@ return MessageDTO.builder().SuccessMessage("Supervisor removed successfully from
                 .createdAt(user.getCreatedAt())
                 .updatedAt(user.getUpdatedAt())
                 .lastLoginAt(user.getLastLoginAt())
-                .passwordUpdatedAt(user.getPasswordUpdatedAt())
-                .failedLoginAttempts(user.getFailedLoginAttempts())
-                .accountLocked(user.getAccountLocked())
-                .enabled(user.getEnabled())
                 .build())
                 .toList();
     }
@@ -385,12 +369,20 @@ return users.map(user -> UserSearchResponseDTO.builder()
         // "UserService is broken".
         User user=userRepository.findById(userId)
                 .orElseThrow(() -> new NotFoundException("USER_NOT_FOUND", "User not found: " + userId));
+        return toValidationDTO(user);
+    }
+
+    // AI plan phase 1: the same answer for many users, in one query (the roles are loaded with the users).
+    public List<UserValidationDTO> LimitedUsersInfoForValidation(List<UUID> userIds){
+        return userRepository.findWithRolesByUseridIn(userIds).stream().map(UserService::toValidationDTO).toList();
+    }
+
+    private static UserValidationDTO toValidationDTO(User user){
         return UserValidationDTO.builder()
                 .userid(user.getUserid())
                 .status(user.getStatus()!=null?user.getStatus().name():"INACTIVE")
                 .roles(user.getRoles().stream().map(r -> r.getRolename().name()).collect(Collectors.toSet()))
                 .build();
-
     }
 //-------------------------------------------------
 //    specificaly made for internal service communication

@@ -108,9 +108,15 @@ public class TokenVersionService {
             @Value("${gateway.circuitbreaker.minimum-calls}") int minimumCalls,
             @Value("${gateway.circuitbreaker.failure-rate-percent}") float failureRatePercent,
             @Value("${gateway.circuitbreaker.open-duration-ms}") long openDurationMs,
-            @Value("${gateway.circuitbreaker.half-open-test-calls}") int halfOpenTestCalls) {
+            @Value("${gateway.circuitbreaker.half-open-test-calls}") int halfOpenTestCalls,
+            @Value("${internal.secret}") String internalSecret) {
 
-        this.webClient = builder.baseUrl("http://AUTHSERVICE").build();
+        // Issue 11 (2026-10-28): AuthService now answers /auth/token-version only to an internal service.
+        // These two headers say "I am the gateway, one of our services" - the same pair the Feign services send.
+        this.webClient = builder.baseUrl("http://AUTHSERVICE")
+                .defaultHeader("X-Internal-Secret", internalSecret)
+                .defaultHeader("X-Internal-Service", "APIGATEWAY")
+                .build();
         this.freshMs = freshMs;
 
         this.cache = Caffeine.newBuilder()

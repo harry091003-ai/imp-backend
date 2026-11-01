@@ -4,43 +4,41 @@ import com.example.ReportingService.dto.EngineerWorkloadDTO;
 import com.example.ReportingService.entity.EngineerWorkload;
 import com.example.ReportingService.entity.IncidentReport;
 import com.example.ReportingService.repository.EngineerWorkloadRepository;
+import com.example.ReportingService.repository.IncidentReportRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
 
-// This Service mainly Helps in Updating the the Total active Incident Count For Different Cases
-// like when the Incident is resolved (decrease value by 1)
-// or when  the Incident is assigned )Increase value by 1)
-// Future Case(which is pending for now):
-//  when the incident is Reassigned (Decrease value by 1 for old engineer and Increase value by 1 for new engineer)
+// This Service keeps the Total active Incident Count of each engineer.
+// Issue 62 (2026-11-01): it used to add and subtract 1 by hand, and the number drifted: a reassign never took 1 from the
+// old engineer, a resolve took 1 from whoever pressed the button, a reopen never added 1 back.
+// Now it COUNTS the real rows (assigned to this engineer, not RESOLVED or CLOSED). So every case is covered by one rule,
+// and a number that is already wrong corrects itself at that engineer's next event.
 @Service
 @RequiredArgsConstructor
 public class EngineerWorkloadService {
 private  final EngineerWorkloadRepository engineerWorkloadRepository;
-    public void IncrementActiveIncidentCount(IncidentReport incidentReport, UUID engineerId){
-          EngineerWorkload engineerWorkload= engineerWorkloadRepository.findByEngineerId(engineerId).orElse(EngineerWorkload.builder()
-                          .engineerId(engineerId)
-                          .activeIncidentCount(0)
-                          .updatedAt(LocalDateTime.now())
-                  .build());
+private final IncidentReportRepository incidentReportRepository;
 
-          engineerWorkload.setActiveIncidentCount(engineerWorkload.getActiveIncidentCount()+1);
-          engineerWorkload.setLastAssignedAt(incidentReport.getAssignedAt());
-          engineerWorkload.setUpdatedAt(LocalDateTime.now());
-            engineerWorkloadRepository.save(engineerWorkload);
+    // Call it AFTER saving the report: the count reads the report table (Hibernate writes the pending change first).
+    public void refreshActiveIncidentCount(UUID engineerId){
+        EngineerWorkload engineerWorkload= engineerWorkloadRepository.findByEngineerId(engineerId).orElse(EngineerWorkload.builder()
+                        .engineerId(engineerId)
+                        .build());
+
+        engineerWorkload.setActiveIncidentCount(incidentReportRepository.countActiveIncidents(engineerId));
+        engineerWorkload.setUpdatedAt(LocalDateTime.now());
+        engineerWorkloadRepository.save(engineerWorkload);
     }
 
-
-    public void DecrementActiveIncidentCount(IncidentReport incidentReport, UUID engineerId){
-        EngineerWorkload engineerWorkload= engineerWorkloadRepository.findByEngineerId(engineerId).orElse(null);
-        if(engineerWorkload!=null && engineerWorkload.getActiveIncidentCount()>0)
-        {
-            engineerWorkload.setActiveIncidentCount(engineerWorkload.getActiveIncidentCount()-1);
-            engineerWorkload.setUpdatedAt(LocalDateTime.now());
-            engineerWorkloadRepository.save(engineerWorkload);
-        }
+    // The new engineer of an assign: the count, plus the time of this assign.
+    public void refreshAfterAssignment(IncidentReport incidentReport, UUID engineerId){
+        refreshActiveIncidentCount(engineerId);
+        EngineerWorkload engineerWorkload= engineerWorkloadRepository.findByEngineerId(engineerId).orElseThrow();
+        engineerWorkload.setLastAssignedAt(incidentReport.getAssignedAt());
+        engineerWorkloadRepository.save(engineerWorkload);
     }
 
 

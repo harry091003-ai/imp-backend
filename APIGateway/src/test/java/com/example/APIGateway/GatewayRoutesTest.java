@@ -58,4 +58,38 @@ class GatewayRoutesTest {
         assertTrue(uris.containsAll(List.of("lb://AUTHSERVICE", "lb://USERSERVICE", "lb://IncidentService",
                 "lb://ReportingService", "lb://AiService")), uris.toString());
     }
+
+    // ---------------- Issue 49 (2026-10-28): every routed call has a time limit ----------------
+    // GatewayRouteTimeoutTest proves these setting names really work; here we check the REAL values.
+
+    private static long routeTimeoutMs(String routeId) {
+        for (int i = 0; props.getProperty("spring.cloud.gateway.routes[" + i + "].id") != null; i++) {
+            if (routeId.equals(props.getProperty("spring.cloud.gateway.routes[" + i + "].id"))) {
+                String own = props.getProperty("spring.cloud.gateway.routes[" + i + "].metadata.response-timeout");
+                return own == null ? -1 : Long.parseLong(own.trim());
+            }
+        }
+        throw new AssertionError("no route " + routeId);
+    }
+
+    @Test
+    void everyRoutedCallHasATimeLimit() {
+        String limit = props.getProperty("spring.cloud.gateway.server.webflux.httpclient.response-timeout");
+        assertNotNull(limit, "without it a slow service makes the caller wait for ever");
+        assertEquals("10s", limit.trim());
+        assertEquals("2000", props.getProperty("spring.cloud.gateway.server.webflux.httpclient.connect-timeout").trim());
+    }
+
+    @Test
+    void theAiRouteGetsALongerLimit() {
+        // A Gemini answer can take 10-30 seconds: 10 s would cut off normal AI calls.
+        assertEquals(60_000, routeTimeoutMs("ai-service"));
+    }
+
+    @Test
+    void theOtherRoutesUseTheDefault() {
+        for (String id : List.of("auth-service", "user-service", "incident-service", "report-service", "notification-service")) {
+            assertEquals(-1, routeTimeoutMs(id), id + " should use the 10 s default");
+        }
+    }
 }

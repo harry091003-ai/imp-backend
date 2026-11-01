@@ -26,6 +26,7 @@ public class IncidentStatusUpdatedEvent {
     private LocalDateTime UpdatedAt;
     private String serviceName;
     private String category;
+    private String environment; // AI plan phase 2. An older message has none: read as null
     private String message; // Optional field to include any additional information about the incident status update
     //if updated status is RESOLVED then below fields also
     private String rootCause;
