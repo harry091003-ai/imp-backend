@@ -18,7 +18,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class LogoutControllerTest {
 
     private final LogoutUserService service = mock(LogoutUserService.class);
-    private final MockMvc mvc = MockMvcBuilders.standaloneSetup(new LogoutController(service)).build();
+    private final MockMvc mvc = MockMvcBuilders.standaloneSetup(
+            new LogoutController(service, new RefreshCookie(true, "/api/auth/refresh", 7))).build();
 
     @Test
     void postLogsOut() throws Exception {

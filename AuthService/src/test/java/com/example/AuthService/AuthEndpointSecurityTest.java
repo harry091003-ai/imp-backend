@@ -21,6 +21,7 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
@@ -106,10 +107,15 @@ class AuthEndpointSecurityTest {
     @Test
     void loginSignupAndRefreshAreStillOpen() throws Exception {
         // An empty body answers 400 (validation): not blocked by security, which would be 403.
-        for (String path : List.of("/auth/login", "/auth/signup", "/auth/refresh")) {
+        for (String path : List.of("/auth/login", "/auth/signup")) {
             mvc.perform(post(path).contentType(MediaType.APPLICATION_JSON).content("{}"))
                     .andExpect(status().isBadRequest());
         }
+        // BCR-02: refresh reads a cookie, not a body. With no cookie the controller itself answers 401
+        // INVALID_REFRESH_TOKEN - it was reached, so security did not block it.
+        mvc.perform(post("/auth/refresh"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").value("INVALID_REFRESH_TOKEN"));
     }
 
     // ---------------------------------------------------------------- issue 10

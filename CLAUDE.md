@@ -119,6 +119,10 @@ types, the status `RECORDED` (= saved and visible in the app, no email sent) and
    works once, a reused one cancels its whole family (one login), only its SHA-256 hash is stored (`refresh_token`,
    Flyway `V6`), and `LogoutUserService` cancels all of a user's refresh tokens - so logout, password, role and
    credentials changes do too. The JWT claims are built in ONE place, `AccessTokenIssuer`, for login and refresh.
+   **Since 2026-11-02 (BCR-02, branch `auth-refresh-cookie`, not merged yet) the refresh token is never in JSON:** login
+   and refresh send it as the HttpOnly cookie `imp_refresh` (Secure, SameSite=Strict, Path=`/api/auth/refresh`, the
+   path the browser sees), refresh reads it from that cookie only (the body is ignored), and refusals and logout clear it
+   (except `ACCOUNT_LOCKED`). Built in ONE place, `controller/RefreshCookie`. The access token's JSON key is `jwttoken`.
 2. Every request hits **APIGateway** → `JwtGatewayFilter` (`GlobalFilter`, order `-1`):
    skips paths starting with `/auth`, validates signature + expiry, then checks the token version
    against AuthService and rejects on mismatch. This is the logout / password-change revocation
@@ -482,7 +486,7 @@ folder, gitignored - see PROGRESS.md).
 
 **Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
 `common-web` 25, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
-Kafka + real JPA), `APIGateway` 75 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit + 3 `GatewayRouteTimeoutTest` + 1 `TokenVersionServiceHeadersTest`), `IncidentService` 35 (9 + 26 `IncidentRulesTest`), `AuthService` 79 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 11 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest` + 7 `AuthEndpointSecurityTest` + 3 `LogoutControllerTest`)
+Kafka + real JPA), `APIGateway` 78 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit + 3 `GatewayRouteTimeoutTest` + 1 `TokenVersionServiceHeadersTest` + 1 `GatewayCookieTest` + 1 `GatewayLogSecretsTest`; a real run on 2026-11-02 counted one more than the older list adds up to, so this list is one short), `IncidentService` 35 (9 + 26 `IncidentRulesTest`), `AuthService` 93 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 11 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest` + 7 `AuthEndpointSecurityTest` + 3 `LogoutControllerTest` + 12 `RefreshCookieTest` + 2 `RefreshCookieSettingsTest`; the last 3 counts on branch `auth-refresh-cookie`)
 `ReportingService` 52 (19 outbox, incl. 4 "the SLA event says who": H2 + embedded Kafka + a full-start test each, + 8
 `SLAConfigurationTest`, plain Java, + 11 `EngineerWorkloadTest` + 11 `DailyMetricsTest` + 3 `EngineerSummariesEndpointTest`), `NotificationService` 43 (`TrustedPackagesTest` 5 + `UserCredentialDtoTest` 2 +
 `NotificationMigrationV2Test` 6, plain Java; `NotificationLogStoreTest` 4 + `SlaNotificationTest` 11, H2;
@@ -490,7 +494,7 @@ Kafka + real JPA), `APIGateway` 75 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest
 whole service + real HTTP requests) `UserService` 10 (`SupervisorInBatchTest` 4, H2; `InternalUserControllerTest` 2; `UserResponseDtoTest` 2; `ValidationBatchTest` 2) and
 `Ai-Service` 91 (`RagControllerTest` 3, `AiEndpointSecurityTest` 12, `ClassificationTest` 20, `RagSuggestionTest` 9, `EngineerRecommendationTest` 18,
 `EngineerRankingTest` 7, `AiCallGuardTest` 5, `ResolvedIncidentMemoryTest` 11, `ReopenedIncidentTest` 6: no Gemini, no Postgres,
-`SimpleVectorStore` + `FakeEmbeddingModel`) = 470, **+ the 8 `contextLoads()` (one per service, safe since option B, 2026-10-19) = 478**. ReportingService's wiring test uses a test-only
+`SimpleVectorStore` + `FakeEmbeddingModel`) = 488 (AuthService 94 and APIGateway 78 are real counts from a run on 2026-11-02; the other modules are as listed), **+ the 8 `contextLoads()` (one per service, safe since option B, 2026-10-19) = 496**. ReportingService's wiring test uses a test-only
 `src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
 with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest`, or ALL of them with
 `./mvnw.cmd -o test`: **since option B (2026-10-19) every `contextLoads()` runs in the test world too** (in-memory
@@ -1051,6 +1055,14 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   of the transaction and thrown after it commits - never throw it inside (break-checked). Keep the row lock on
   `findByTokenHashForUpdate` (two refreshes at once). Anything new that should end a user's sessions must go through
   `LogoutUserService`, so refresh tokens are cancelled too. Never store or log a refresh token itself - only its hash.
+  **BCR-02:** never put the refresh token back in a JSON answer (`@JsonIgnore`, break-checked) and never read it from a
+  body. Build or clear the cookie only through `RefreshCookie`, so the path and flags stay the same (a browser deletes a
+  cookie only with the path it was set with). **Gateway log leak, fixed 2026-11-02 (first piece of BCR-04):** at DEBUG,
+  Spring Cloud Gateway's `ObservedRequestHttpHeadersFilter` printed every request header - the cookie, `Authorization`
+  and `X-Internal-Secret`. `application.properties` now sets that one logger to INFO, and `GatewayLogSecretsTest`
+  (real logging settings, three secrets sent, break-checked) fails if any of them reaches the log. **Keep that line.
+  Never log a header value**, and read a new DEBUG logger's output before turning it on. The rest of BCR-04 (a `prod`
+  profile with INFO, `/actuator` login check) is still open.
 - **Roles change only through `UpdateRoleService` (issue 67)** - never by a hand edit in MySQL: a hand edit sends no
   `roles.update` (UserService keeps the old roles) and leaves no audit row. Its transaction locks the ADMIN role row
   first; keep that line, or two admins removing each other at once can leave zero admins (proved by a test).

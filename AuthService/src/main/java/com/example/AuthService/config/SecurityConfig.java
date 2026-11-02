@@ -108,6 +108,10 @@ public class SecurityConfig {
         Logger.getLogger("Now our we are in Security filter chain of Authservice");
         http
                 // JWT → stateless so CSRF not needed
+                // BCR-02 (2026-11-02): the refresh token is now a cookie, and CSRF is about cookies, so checked again:
+                // still safe off. The cookie is SameSite=Strict (another site can not make the browser send it), it
+                // is sent only to /auth/refresh, there is no CORS (another site can not read the answer), and a
+                // refresh only renews a session - it changes no data. Every other endpoint uses the Bearer header.
                 .csrf(AbstractHttpConfigurer::disable)
 
                 // No HTTP sessions

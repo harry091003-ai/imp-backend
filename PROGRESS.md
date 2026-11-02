@@ -38,6 +38,7 @@ Last updated: 2026-10-24
 | Option B (2026-10-19) | The 8 auto-generated `contextLoads()` tests no longer touch the real system | ✅ Done - "run all tests" is safe on every service (proof below) |
 | Small bugs (2026-10-19) | Issues 4, 3, 56, 64, 1 - one at a time, test first | ✅ All 5 done (bug 5 on 2026-10-22) |
 | Auth v2 - RSA keys (2026-10-23) | Only AuthService can create tokens; the gateway can only check them | ✅ Done - all 6 steps. Step 5 (real keys + hand test through the gateway) passed 2026-10-26 |
+| BCR-02 - refresh token in an HttpOnly cookie (2026-11-02) | For the browser frontend: the token never appears in JSON | ✅ Code + tests done on branch `auth-refresh-cookie` (AuthService 94, gateway 78, plus the gateway log leak fix), **not committed or merged**, not tried by hand - see "BCR-02" below |
 | Auth v2 part B - refresh tokens (2026-10-27) | Access token 15 min + refresh token 7 days, used once, cancelled on logout | ✅ Code + tests done (AuthService 65, gateway 69). **Not yet tried by hand on the real system** (Flyway `V6` runs at the next AuthService start) - see "Auth v2 part B" below |
 | Issue 68 + security batch (2026-10-28) | Wrong old password counts in the lockout; issues 49, 11, 10, 5, 7, 2, 51 | ✅ Code + tests done, all test-first (AuthService 80, gateway 76, all 6 services green). **Not yet tried by hand** - see "Issue 68 and the security clean-up batch" below |
 | AI service plan (2026-11-01) | Improve suggestions, storage and engineer ranking, in 4 phases | ✅ **Phases 1, 2 and 3 done** (Ai-Service 92 tests, no Gemini needed). **Not tried by hand, Gemini never really called. Flyway `V2` clears the AI memory and `V3` adds a table at the next Ai-Service start.** Phase 4 to do - see "AI service improvement plan" below |
@@ -3191,6 +3192,117 @@ new `TraceIdFilter`.
 5. `POST /password/update` with a wrong old password 5 times -> 401 x5, then login gives `ACCOUNT_LOCKED`.
    (Use a test account: it stays locked for 15 minutes.)
 6. Optional: AI endpoints with POST.
+
+---
+
+## BCR-02 - the refresh token moves into an HttpOnly cookie (2026-11-02)
+
+**Status: code + tests done on branch `auth-refresh-cookie`, NOT committed or merged (owner decides). Not yet tried by
+hand on the real system.** Asked for by the browser frontend (`IMP Frontend/docs/bcr-02-plan.md` has the full reasoning
+and flow charts). This is the "HttpOnly cookie for a browser front end later" from part B below.
+
+### Why
+A browser page had to keep the 7-day refresh token where JavaScript can read it: memory is lost on reload,
+localStorage and sessionStorage can be read by an injected script, and a duplicated tab copied the token, so the next
+refresh looked like reuse and logged the user out of both tabs. An HttpOnly cookie is kept by the browser, sent only to
+the refresh endpoint, shared by all tabs, and no script can read or copy it.
+
+**What it does NOT do:** a script injected into the open page can still call refresh itself (the browser adds the
+cookie). It can no longer COPY the 7-day token and use it elsewhere later. Plain-text rendering and a strict page
+security policy are still needed on the frontend.
+
+### The flow now
+```
+ POST /auth/login               -> JSON {jwttoken, ...}  (no refreshToken)
+                                   Set-Cookie: imp_refresh=<token>; Path=/api/auth/refresh; Max-Age=604800;
+                                               Secure; HttpOnly; SameSite=Strict
+ POST /auth/refresh (no body)   -> the browser adds the cookie
+                                   200: JSON {userid, jwttoken} + Set-Cookie with the NEW token
+                                   401 + cookie cleared (Max-Age=0): missing, too long, unknown, used, expired
+                                   401 ACCOUNT_LOCKED: cookie KEPT (the token works again when the lock ends)
+ POST /logout/user              -> tokens cancelled as before + cookie cleared
+ a token in the JSON body       -> ignored (401 INVALID_REFRESH_TOKEN if there is no cookie)
+```
+The access token's JSON key is **`jwttoken`** (pinned by a test): the Java field is `JWTtoken`, but Jackson names it from
+the getter `getJWTtoken()`.
+
+### Files
+| File | Change |
+|---|---|
+| `AuthService/.../controller/RefreshCookie.java` | NEW - the one place that builds and clears the cookie |
+| `AuthService/.../controller/RefreshController.java` | reads the cookie (max 200 characters, as the old body), sets the new one, clears it on refusal except a lock |
+| `AuthService/.../controller/LoginController.java` | sets the cookie after a successful login |
+| `AuthService/.../controller/LogoutController.java` | clears the cookie |
+| `AuthService/.../dto/LoginResponseDTO.java`, `RefreshResponseDTO.java` | `@JsonIgnore` on `refreshToken` (Java still sees it) |
+| `AuthService/.../dto/RefreshRequestDTO.java` | DELETED - the body is no longer read |
+| `AuthService/.../config/SecurityConfig.java` | comment only: why CSRF can stay off with this cookie |
+| `AuthService/.../application.properties` | `auth.refresh-cookie.secure=${refreshcookiesecure:true}`, `auth.refresh-cookie.path=${refreshcookiepath:/api/auth/refresh}` |
+| `AuthService/src/test/.../controller/RefreshCookieTest.java` | NEW - 12 tests, the whole service over HTTP |
+| `AuthService/src/test/.../controller/RefreshCookieSettingsTest.java` | NEW - 2 tests, the settings reach the cookie |
+| `AuthService/src/test/.../AuthEndpointSecurityTest.java` | refresh with no cookie: 401 now, was 400 |
+| `AuthService/src/test/.../controller/LogoutControllerTest.java` | passes the new `RefreshCookie` |
+| `APIGateway/src/test/.../GatewayCookieTest.java` | NEW - 1 test: `Cookie` reaches AuthService, `Set-Cookie` comes back |
+| `APIGateway/src/test/.../GatewayLogSecretsTest.java` | NEW - 1 test: no cookie, access token or internal secret reaches the log |
+| `APIGateway/.../application.properties` | one line: the header-printing logger set to INFO (the log leak fix) |
+
+Not changed: `RefreshTokenService` and its 13 tests, the database (no migration), all gateway code.
+
+### Tests
+Run 2026-11-02 with `./mvnw.cmd test`: **AuthService 94 pass (was 80), APIGateway 78 pass (was 76; +1 `GatewayCookieTest`, +1 `GatewayLogSecretsTest`).**
+- **Test first:** the new tests were run against an untouched copy of `master`: 11 of 13 failed (no cookie, token in
+  the JSON, 400 instead of 401). The 2 that passed describe what was already true: a failed login sets no cookie, and
+  the access token's key is `jwttoken`. `GatewayCookieTest` passed on `master` too: it guards existing gateway behaviour.
+- **Break checks** (each protection removed, then put back): no `@JsonIgnore` -> `loginJsonNoLongerCarriesTheRefreshToken`
+  fails; no 200-character limit -> `anOversizedCookieIsRefusedBeforeItIsHashed` fails (the value reached the hashing);
+  clearing the cookie on a lock too -> `aLockedAccountIsRefusedButKeepsItsCookie` fails; a gateway filter that drops
+  `Cookie` -> `GatewayCookieTest` fails.
+- **Found while testing:** with `logging.level.org.springframework.cloud.gateway=DEBUG` the gateway's
+  `ObservedRequestHttpHeadersFilter` wrote EVERY request header to the log: the refresh cookie, the `Authorization`
+  header (access token) and `X-Internal-Secret`. Older than this change (the last two were always logged).
+  **Fixed the same day, see "Gateway log leak" below.**
+
+### Gateway log leak - fixed 2026-11-02 (first piece of BCR-04)
+- **Test first:** `APIGateway/src/test/.../GatewayLogSecretsTest.java` (NEW). The whole gateway with the REAL logging
+  settings, in front of a stand-in AuthService. It sends a cookie, a bearer token and (set by the gateway itself) the
+  internal secret, then checks the console. **Before the fix it failed: "the refresh cookie is in the log".**
+- **Fix:** one line in `APIGateway/.../application.properties`:
+  `logging.level.org.springframework.cloud.gateway.filter.headers.observation.ObservedRequestHttpHeadersFilter=INFO`.
+  A more specific logger wins over the DEBUG line above it, so only this class is silenced. Our own filters never
+  logged header values (they log "present: true").
+- **After:** the test passes, none of the three values appears in the log, and 11 other DEBUG lines still print.
+  Gateway 78 pass (was 77). Break check = the before-run: without the line the test fails.
+- **Checked:** the gateway is the only place in the project with a DEBUG/TRACE log level.
+- **Still open in BCR-04:** a `prod` profile with INFO logs, and a login check on `/actuator`. Old logs that were written
+  before this fix may still hold tokens and the internal secret: the access tokens have expired (15 min), but if a gateway
+  log file exists, delete it, and consider changing `internalsecret` if the log was ever shared.
+
+### Hand test (owner, real system) - to do
+Restart AuthService and the gateway. With `curl` straight to the gateway (`http://localhost:8082`); `-i` shows the
+headers. curl does not apply the cookie's path here, so the cookie is passed by hand with `-H "Cookie: ..."`.
+1. `curl -i -X POST http://localhost:8082/auth/login -H "Content-Type: application/json" -d "{\"username\":\"x\",\"email\":\"<you>\",\"password\":\"<yours>\"}"`
+   -> 200, JSON has `jwttoken` and NO `refreshToken`; a `Set-Cookie: imp_refresh=...; ... HttpOnly; SameSite=Strict` header.
+   Copy the value between `imp_refresh=` and the first `;` (call it R1).
+2. `curl -i -X POST http://localhost:8082/auth/refresh -H "Cookie: imp_refresh=R1"` -> 200, a new `jwttoken`, a new
+   `Set-Cookie` (R2).
+3. the new `jwttoken` on `GET /notifications/me` (`-H "Authorization: Bearer <it>"`) -> 200
+4. refresh with R1 again -> 401 `REFRESH_TOKEN_REUSED`, and `Set-Cookie: imp_refresh=; Max-Age=0`
+5. refresh with R2 -> 401 `INVALID_REFRESH_TOKEN` (step 4 cancelled the login)
+6. `curl -i -X POST http://localhost:8082/auth/refresh -H "Content-Type: application/json" -d "{\"refreshToken\":\"R2\"}"`
+   -> 401 `INVALID_REFRESH_TOKEN` (the body is ignored)
+7. log in again, `POST /logout/user` with its `jwttoken` -> 200 and `Set-Cookie: imp_refresh=; Max-Age=0`; refresh with
+   that login's cookie -> 401
+8. In the browser: the frontend with `VITE_API_MOCKING=false`, sign in, then DevTools > Application > Cookies shows
+   `imp_refresh` marked HttpOnly; reload the page -> still signed in; Local/Session storage hold no token.
+9. Check the gateway log for the cookie value, the access token and `X-Internal-Secret`: none should appear (the log
+   leak fix; the gateway still runs at DEBUG for everything else).
+
+### Known limits (not fixed, written down)
+- An answer lost after the server used the token up (network drop, F5 at that moment) leaves the browser with the used
+  cookie: the next refresh counts as reuse, one extra login. Safe and rare; a grace period would weaken reuse detection.
+- Behind nginx every visitor shares the refresh rate limit until BCR-01 (real client IP) is done.
+- `Secure` needs HTTPS in production. Chrome and Firefox accept it on `http://localhost`; for a browser that does not,
+  set `refreshcookiesecure=false` on the laptop only.
+- `SameSite` treats sibling subdomains as the same site: host the app where every subdomain is yours.
 
 ---
 
