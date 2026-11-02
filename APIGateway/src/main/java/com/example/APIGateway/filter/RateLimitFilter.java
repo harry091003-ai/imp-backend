@@ -2,6 +2,7 @@ package com.example.APIGateway.filter;
 
 import com.example.APIGateway.services.KeyedRateLimiter;
 import com.example.APIGateway.services.KeyedRateLimiter.Limit;
+import com.example.APIGateway.utils.ClientIpResolver;
 import com.example.APIGateway.utils.GatewayErrorWriter;
 import io.github.bucket4j.ConsumptionProbe;
 import io.github.bucket4j.TimeMeter;
@@ -19,7 +20,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
-import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.List;
 import java.util.function.Predicate;
@@ -75,6 +75,9 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
     // Checked in order. The first rule that covers the path is used.
     private final List<Rule> rules;
 
+    // Which address an IP-counted request belongs to (BCR-01: the real visitor behind nginx).
+    private final ClientIpResolver clientIpResolver;
+
     // Used by Spring.
     @Autowired
     public RateLimitFilter(@Value("${gateway.ratelimit.ai.per-minute}") long aiPerMinute,
@@ -88,6 +91,7 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                            @Value("${gateway.ratelimit.default.per-second}") long defaultPerSecond,
                            @Value("${gateway.ratelimit.default.per-minute}") long defaultPerMinute,
                            @Value("${gateway.ratelimit.max-tracked-keys}") long maxTrackedKeys,
+                           ClientIpResolver clientIpResolver,
                            MeterRegistry meterRegistry) {
         this(new KeyedRateLimiter(List.of(new Limit(aiPerMinute, Duration.ofMinutes(1)),
                                           new Limit(aiPerDay, Duration.ofDays(1))),
@@ -104,6 +108,7 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                 new KeyedRateLimiter(List.of(new Limit(defaultPerSecond, Duration.ofSeconds(1)),
                                              new Limit(defaultPerMinute, Duration.ofMinutes(1))),
                         maxTrackedKeys, TimeMeter.SYSTEM_NANOTIME),
+                clientIpResolver,
                 meterRegistry);
     }
 
@@ -113,7 +118,9 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                     KeyedRateLimiter signupLimiter,
                     KeyedRateLimiter refreshLimiter,
                     KeyedRateLimiter defaultLimiter,
+                    ClientIpResolver clientIpResolver,
                     MeterRegistry meterRegistry) {
+        this.clientIpResolver = clientIpResolver;
         this.rules = List.of(
                 new Rule("ai", RateLimitFilter::isAiPath, true,
                         aiLimiter, rejectedCounter(meterRegistry, "ai"), "AI requests"),
@@ -197,9 +204,10 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
     //
     // countByUser = false (login, signup): ALWAYS the IP. There is no token yet.
     //
-    // The IP is the address that actually opened the connection to us.
-    // We deliberately IGNORE the X-Forwarded-For header: a caller can type anything in it,
-    // so trusting it would let them claim a new IP on every request and never be limited.
+    // The IP is the address that actually opened the connection to us, unless that is our own
+    // trusted proxy (nginx): then it is the visitor address nginx wrote in X-Real-IP. See ClientIpResolver.
+    // A header from anyone else is IGNORED: a caller can type anything in it, so trusting it
+    // would let them claim a new IP on every request and never be limited.
     private String callerKey(ServerHttpRequest request, boolean countByUser) {
         if (countByUser) {
             String userId = request.getHeaders().getFirst(USER_ID_HEADER);
@@ -207,9 +215,7 @@ public class RateLimitFilter implements GlobalFilter, Ordered {
                 return "user:" + userId;
             }
         }
-        InetSocketAddress remote = request.getRemoteAddress();
-        return "ip:" + (remote != null && remote.getAddress() != null
-                ? remote.getAddress().getHostAddress() : "unknown");
+        return "ip:" + clientIpResolver.clientIp(request);
     }
 
     // 1 = right AFTER JwtGatewayFilter (-1).

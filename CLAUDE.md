@@ -148,9 +148,12 @@ types, the status `RECORDED` (= saved and visible in the app, no email sent) and
    match wins: `/ai/**` per user (5/min, 100/day — the paid Gemini calls), `/auth/login` per IP
    (10/min, 100/hour — catches credential stuffing, which per-account lockout cannot), `/auth/signup`
    per IP (5/hour, 20/day), everything else per user (20/sec, 300/min — a safety floor, must stay
-   **last** in the rule list or it would swallow every request before the tighter rules ran). Login
-   and signup deliberately ignore `X-Forwarded-For` (a caller-supplied header, easy to fake) and use
-   the real connection address instead. Buckets are Bucket4j, held per caller in a bounded Caffeine
+   **last** in the rule list or it would swallow every request before the tighter rules ran). Login,
+   signup and refresh are counted by the real connection address, never `X-Forwarded-For` (a
+   caller-supplied header, easy to fake). **BCR-01 (2026-11-02, branch `gateway-real-client-ip`):**
+   behind nginx that address is always nginx, so `utils/ClientIpResolver` reads `X-Real-IP` instead,
+   but ONLY when the connection comes from an address in `gateway.trusted-proxies` (env
+   `trustedproxies`, plain IPs, default empty = the old behaviour). Buckets are Bucket4j, held per caller in a bounded Caffeine
    cache (`services/KeyedRateLimiter.java`, reused across all 4 rules). Over a limit → 429 +
    `Retry-After`, in the same JSON shape as every other gateway error. See §6 and
    `notes/rate-limiting-on-ai-endpoints.md`.
@@ -486,7 +489,7 @@ folder, gitignored - see PROGRESS.md).
 
 **Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
 `common-web` 25, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
-Kafka + real JPA), `APIGateway` 78 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit + 3 `GatewayRouteTimeoutTest` + 1 `TokenVersionServiceHeadersTest` + 1 `GatewayCookieTest` + 1 `GatewayLogSecretsTest`; a real run on 2026-11-02 counted one more than the older list adds up to, so this list is one short), `IncidentService` 35 (9 + 26 `IncidentRulesTest`), `AuthService` 93 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 11 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest` + 7 `AuthEndpointSecurityTest` + 3 `LogoutControllerTest` + 12 `RefreshCookieTest` + 2 `RefreshCookieSettingsTest`; the last 3 counts on branch `auth-refresh-cookie`)
+Kafka + real JPA), `APIGateway` 89 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit + 3 `GatewayRouteTimeoutTest` + 1 `TokenVersionServiceHeadersTest` + 1 `GatewayCookieTest` + 1 `GatewayLogSecretsTest` + 10 `ClientIpResolverTest` + 1 `GatewayClientIpTest`, the last two on branch `gateway-real-client-ip`; a real run on 2026-11-02 counted one more than the older list adds up to, so this list is one short), `IncidentService` 35 (9 + 26 `IncidentRulesTest`), `AuthService` 93 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 11 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest` + 7 `AuthEndpointSecurityTest` + 3 `LogoutControllerTest` + 12 `RefreshCookieTest` + 2 `RefreshCookieSettingsTest`; the last 3 counts on branch `auth-refresh-cookie`)
 `ReportingService` 52 (19 outbox, incl. 4 "the SLA event says who": H2 + embedded Kafka + a full-start test each, + 8
 `SLAConfigurationTest`, plain Java, + 11 `EngineerWorkloadTest` + 11 `DailyMetricsTest` + 3 `EngineerSummariesEndpointTest`), `NotificationService` 43 (`TrustedPackagesTest` 5 + `UserCredentialDtoTest` 2 +
 `NotificationMigrationV2Test` 6, plain Java; `NotificationLogStoreTest` 4 + `SlaNotificationTest` 11, H2;
@@ -494,7 +497,7 @@ Kafka + real JPA), `APIGateway` 78 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest
 whole service + real HTTP requests) `UserService` 10 (`SupervisorInBatchTest` 4, H2; `InternalUserControllerTest` 2; `UserResponseDtoTest` 2; `ValidationBatchTest` 2) and
 `Ai-Service` 91 (`RagControllerTest` 3, `AiEndpointSecurityTest` 12, `ClassificationTest` 20, `RagSuggestionTest` 9, `EngineerRecommendationTest` 18,
 `EngineerRankingTest` 7, `AiCallGuardTest` 5, `ResolvedIncidentMemoryTest` 11, `ReopenedIncidentTest` 6: no Gemini, no Postgres,
-`SimpleVectorStore` + `FakeEmbeddingModel`) = 488 (AuthService 94 and APIGateway 78 are real counts from a run on 2026-11-02; the other modules are as listed), **+ the 8 `contextLoads()` (one per service, safe since option B, 2026-10-19) = 496**. ReportingService's wiring test uses a test-only
+`SimpleVectorStore` + `FakeEmbeddingModel`) = 499 (AuthService 94 and APIGateway 89 are real counts from runs on 2026-11-02; the other modules are as listed), **+ the 8 `contextLoads()` (one per service, safe since option B, 2026-10-19) = 507**. ReportingService's wiring test uses a test-only
 `src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
 with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest`, or ALL of them with
 `./mvnw.cmd -o test`: **since option B (2026-10-19) every `contextLoads()` runs in the test world too** (in-memory
@@ -1013,7 +1016,11 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
 - **Rate-limit or trust decisions by IP must use the real connection address**
   (`request.getRemoteAddress()`), never a caller-supplied header like `X-Forwarded-For` — a caller
   can write anything into a header. Only trust that header once a specific, known reverse proxy or
-  load balancer sits in front of the gateway, and only for that one known source.
+  load balancer sits in front of the gateway, and only for that one known source. **Since BCR-01 this
+  is built:** get an IP only through `ClientIpResolver.clientIp(request)`, never read
+  `getRemoteAddress()` or a forwarded header yourself. It believes `X-Real-IP` only from a listed
+  proxy, only as one plain address (checked with no DNS lookup), and never reads `X-Forwarded-For`.
+  Never list an address strangers can also connect from. A bad entry stops the gateway at start-up.
 - **No `System.out.println` / `printStackTrace` (Track C).** Use SLF4J. Per-request chatter is
   `log.debug` (off by default in production). Log **user ids only** — never emails, roles, passwords,
   tokens or whole objects.

@@ -38,7 +38,8 @@ Last updated: 2026-10-24
 | Option B (2026-10-19) | The 8 auto-generated `contextLoads()` tests no longer touch the real system | ✅ Done - "run all tests" is safe on every service (proof below) |
 | Small bugs (2026-10-19) | Issues 4, 3, 56, 64, 1 - one at a time, test first | ✅ All 5 done (bug 5 on 2026-10-22) |
 | Auth v2 - RSA keys (2026-10-23) | Only AuthService can create tokens; the gateway can only check them | ✅ Done - all 6 steps. Step 5 (real keys + hand test through the gateway) passed 2026-10-26 |
-| BCR-02 - refresh token in an HttpOnly cookie (2026-11-02) | For the browser frontend: the token never appears in JSON | ✅ Code + tests done on branch `auth-refresh-cookie` (AuthService 94, gateway 78, plus the gateway log leak fix), **not committed or merged**, not tried by hand - see "BCR-02" below |
+| BCR-01 - real visitor address behind nginx (2026-11-02) | Login, signup and refresh limits were shared by every visitor behind nginx | ✅ Code + tests done on branch `gateway-real-client-ip` (gateway 89), **not committed or merged**, not tried by hand - see "BCR-01" below |
+| BCR-02 - refresh token in an HttpOnly cookie (2026-11-02) | For the browser frontend: the token never appears in JSON | ✅ Committed `c6b022e` on branch `auth-refresh-cookie` (AuthService 94, gateway 78, plus the gateway log leak fix), **not merged**, not tried by hand - see "BCR-02" below |
 | Auth v2 part B - refresh tokens (2026-10-27) | Access token 15 min + refresh token 7 days, used once, cancelled on logout | ✅ Code + tests done (AuthService 65, gateway 69). **Not yet tried by hand on the real system** (Flyway `V6` runs at the next AuthService start) - see "Auth v2 part B" below |
 | Issue 68 + security batch (2026-10-28) | Wrong old password counts in the lockout; issues 49, 11, 10, 5, 7, 2, 51 | ✅ Code + tests done, all test-first (AuthService 80, gateway 76, all 6 services green). **Not yet tried by hand** - see "Issue 68 and the security clean-up batch" below |
 | AI service plan (2026-11-01) | Improve suggestions, storage and engineer ranking, in 4 phases | ✅ **Phases 1, 2 and 3 done** (Ai-Service 92 tests, no Gemini needed). **Not tried by hand, Gemini never really called. Flyway `V2` clears the AI memory and `V3` adds a table at the next Ai-Service start.** Phase 4 to do - see "AI service improvement plan" below |
@@ -3192,6 +3193,76 @@ new `TraceIdFilter`.
 5. `POST /password/update` with a wrong old password 5 times -> 401 x5, then login gives `ACCOUNT_LOCKED`.
    (Use a test account: it stays locked for 15 minutes.)
 6. Optional: AI endpoints with POST.
+
+---
+
+## BCR-01 - the real visitor address behind nginx (2026-11-02)
+
+**Status: code + tests done on branch `gateway-real-client-ip` (made from `auth-refresh-cookie` at `c6b022e`), NOT
+committed or merged. Not tried by hand.** Plain-English explanation with pictures: `notes/real-client-ip-behind-nginx.md`.
+
+### The problem
+Login, signup and refresh are rate-limited per IP, using the address that opened the connection. Behind nginx that is
+always nginx, so every visitor shared ONE bucket: one bot using up 10 logins a minute locked everyone out (also 5
+signups an hour and 30 refreshes a minute for the whole site).
+
+### The fix
+- NEW `APIGateway/.../utils/ClientIpResolver.java`. If the connection comes from an address in `gateway.trusted-proxies`,
+  the visitor address is taken from `X-Real-IP` (nginx overwrites it on every request). From anyone else the header is
+  ignored and the connection address is used, as before.
+- `X-Real-IP` must be ONE plain IPv4/IPv6 address (no lists, names or junk; at most 45 characters), checked with no DNS
+  lookup. Otherwise the proxy's own address is used (still limited, never free). Addresses are written one way, so
+  two spellings of one IPv6 address are one visitor. `X-Forwarded-For` is never read (nginx adds to it, so a value the
+  visitor made up stays in it).
+- `RateLimitFilter` gets the address from `ClientIpResolver` instead of reading it itself.
+- Setting: `gateway.trusted-proxies=${trustedproxies:}`. Empty (default) = exactly the old behaviour. Plain IPs only,
+  comma-separated. A wrong entry (for example a name like `nginx`) stops the gateway at start-up with a clear message.
+  At start-up the gateway logs which addresses it trusts.
+
+### Files
+| File | Change |
+|---|---|
+| `APIGateway/.../utils/ClientIpResolver.java` | NEW - which address a request is counted by |
+| `APIGateway/.../filter/RateLimitFilter.java` | uses `ClientIpResolver`; comments updated |
+| `APIGateway/.../application.properties` | `gateway.trusted-proxies`, with the cases explained |
+| `APIGateway/src/test/.../utils/ClientIpResolverTest.java` | NEW - 10 tests |
+| `APIGateway/src/test/.../GatewayClientIpTest.java` | NEW - 1 test, the whole gateway with the setting on |
+| `APIGateway/src/test/.../filter/RateLimitFilterTest.java` | passes `new ClientIpResolver("")` (no trusted proxy), so all 26 old tests run unchanged |
+
+### Tests
+**Gateway 89 pass (was 78).**
+- **Test first:** `GatewayClientIpTest` was run on the old code and failed exactly as the bug says: Alice used her 2
+  logins, then Bob got `429` on his first try. After the fix it passes.
+- `ClientIpResolverTest` could not run before (the class did not exist). Its 10 tests cover: setting empty = header
+  ignored; header believed from the trusted proxy; a stranger's fake header ignored; `X-Forwarded-For` ignored;
+  missing header -> proxy address; junk / lists / names / huge values not believed; IPv6 written one way; several
+  proxies; a bad setting stops start-up; no connection address -> `unknown`.
+- **Break checks:** believing the header from anyone -> `aStrangersFakeHeaderIsIgnored` and
+  `withNoTrustedProxyTheHeaderIsIgnored` fail. Believing the raw header text -> `aHeaderThatIsNotOnePlainAddressIsNotBelieved`
+  and `ipv6AddressesAreWrittenOneWay` fail.
+
+### What you set, and where
+| Where nginx runs | Setting (environment variable for the gateway) |
+|---|---|
+| No nginx (today, the Vite dev server) | nothing - leave it empty |
+| nginx on the same computer as the gateway | `trustedproxies=127.0.0.1,::1` |
+| nginx in Docker or on another server | that container's or server's FIXED address, for example `trustedproxies=10.0.0.5` |
+
+nginx needs this line in its `location /api/` block (frontend Phase 5 nginx files):
+`proxy_set_header X-Real-IP $remote_addr;`
+
+### Hand test (owner) - to do, once nginx exists
+1. Start the gateway with `trustedproxies` set. Its log says `X-Real-IP is believed only from: [...]`.
+2. Through nginx, log in with a wrong password 11 times in a minute -> the 11th gives `429`.
+3. From a second device (different network), log in at once -> it works (before the fix it got `429` too).
+4. Straight to the gateway (port 8082, not through nginx): `curl -i -X POST http://localhost:8082/auth/login -H "X-Real-IP: 1.2.3.4" ...`
+   repeated 11 times from another machine -> still `429`: a fake header from outside does not help.
+
+### Known limits
+- People behind one office or home router share one address. That was always so, and the limits are set with that in mind.
+- If the gateway port is reachable from the internet AND its trusted address is one strangers can use, the protection
+  is weaker. Keep the gateway port closed to the outside; only nginx should reach it.
+- A Docker container's address can change on restart unless it is fixed in the compose file.
 
 ---
 

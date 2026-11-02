@@ -2,6 +2,7 @@ package com.example.APIGateway.filter;
 
 import com.example.APIGateway.services.KeyedRateLimiter;
 import com.example.APIGateway.services.KeyedRateLimiter.Limit;
+import com.example.APIGateway.utils.ClientIpResolver;
 import io.github.bucket4j.TimeMeter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
@@ -52,6 +53,7 @@ class RateLimitFilterTest {
                 limiter(5, Duration.ofHours(1), 20, Duration.ofDays(1)),        // signup
                 limiter(30, Duration.ofMinutes(1), 300, Duration.ofHours(1)),   // refresh
                 limiter(20, Duration.ofSeconds(1), 300, Duration.ofMinutes(1)), // default
+                new ClientIpResolver(""),                                       // no trusted proxy
                 registry);
     }
 
