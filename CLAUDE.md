@@ -439,8 +439,8 @@ blocks are common and are usually "parked" code, not dead-on-arrival.
 
 ## 8. Build / run / test
 
-No Docker images for the services, no CI, no `.env`, no Spring profiles
-(`application-*.properties` does not exist — a single `application.properties` per service).
+No Docker images for the services, no CI, no `.env`. One `application.properties` per service; since 2026-11-02
+(BCR-04) the gateway also has `application-prod.properties`, used only with `SPRING_PROFILES_ACTIVE=prod`.
 
 **Required environment variables** (referenced as `${...}` with **no defaults**; every service
 fails to start without them):
@@ -489,15 +489,15 @@ folder, gitignored - see PROGRESS.md).
 
 **Tests**: real tests now exist in **five** modules (as of 2026-10-12): `common-trace` 8,
 `common-web` 25, `common-kafka` 28 (includes a real embedded-Kafka test), `common-outbox` 24 (H2 + embedded
-Kafka + real JPA), `APIGateway` 89 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit + 3 `GatewayRouteTimeoutTest` + 1 `TokenVersionServiceHeadersTest` + 1 `GatewayCookieTest` + 1 `GatewayLogSecretsTest` + 10 `ClientIpResolverTest` + 1 `GatewayClientIpTest`, the last two on branch `gateway-real-client-ip`; a real run on 2026-11-02 counted one more than the older list adds up to, so this list is one short), `IncidentService` 35 (9 + 26 `IncidentRulesTest`), `AuthService` 93 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 11 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest` + 7 `AuthEndpointSecurityTest` + 3 `LogoutControllerTest` + 12 `RefreshCookieTest` + 2 `RefreshCookieSettingsTest`; the last 3 counts on branch `auth-refresh-cookie`)
+Kafka + real JPA), `APIGateway` 89 (53 + 6 `GatewayRoutesTest` + 10 `JwtUtilTest` + 2 refresh rate-limit + 3 `GatewayRouteTimeoutTest` + 1 `TokenVersionServiceHeadersTest` + 1 `GatewayCookieTest` + 1 `GatewayLogSecretsTest` + 10 `ClientIpResolverTest` + 1 `GatewayClientIpTest` + 3 `GatewayProdProfileTest` + 1 `GatewayLaptopSettingsTest` = 93, the last two on branch `gateway-prod-settings`; a real run on 2026-11-02 counted one more than the older list adds up to, so this list is one short), `IncidentService` 41 (9 + 32 `IncidentRulesTest`, 6 of them BCR-03), `AuthService` 93 (17 outbox + 8 `AccountLockoutTest` + 12 `RoleManagementTest` + 11 `ChangePasswordTest` + 8 `TokenSigningTest` + 13 `RefreshTokenTest` + 7 `AuthEndpointSecurityTest` + 3 `LogoutControllerTest` + 12 `RefreshCookieTest` + 2 `RefreshCookieSettingsTest`; the last 3 counts on branch `auth-refresh-cookie`)
 `ReportingService` 52 (19 outbox, incl. 4 "the SLA event says who": H2 + embedded Kafka + a full-start test each, + 8
 `SLAConfigurationTest`, plain Java, + 11 `EngineerWorkloadTest` + 11 `DailyMetricsTest` + 3 `EngineerSummariesEndpointTest`), `NotificationService` 43 (`TrustedPackagesTest` 5 + `UserCredentialDtoTest` 2 +
 `NotificationMigrationV2Test` 6, plain Java; `NotificationLogStoreTest` 4 + `SlaNotificationTest` 11, H2;
 `SlaListenersOverKafkaTest` 2, whole service + embedded Kafka; `IncidentNotificationTest` 4, H2; `MyNotificationsApiTest` 9,
-whole service + real HTTP requests) `UserService` 10 (`SupervisorInBatchTest` 4, H2; `InternalUserControllerTest` 2; `UserResponseDtoTest` 2; `ValidationBatchTest` 2) and
+whole service + real HTTP requests) `UserService` 20 (`SupervisorInBatchTest` 4, H2; `InternalUserControllerTest` 2; `UserResponseDtoTest` 2; `ValidationBatchTest` 2; `UserLookupControllerTest` 5 and `UserLookupTest` 5, BCR-05) and
 `Ai-Service` 91 (`RagControllerTest` 3, `AiEndpointSecurityTest` 12, `ClassificationTest` 20, `RagSuggestionTest` 9, `EngineerRecommendationTest` 18,
 `EngineerRankingTest` 7, `AiCallGuardTest` 5, `ResolvedIncidentMemoryTest` 11, `ReopenedIncidentTest` 6: no Gemini, no Postgres,
-`SimpleVectorStore` + `FakeEmbeddingModel`) = 499 (AuthService 94 and APIGateway 89 are real counts from runs on 2026-11-02; the other modules are as listed), **+ the 8 `contextLoads()` (one per service, safe since option B, 2026-10-19) = 507**. ReportingService's wiring test uses a test-only
+`SimpleVectorStore` + `FakeEmbeddingModel`) = 519, **+ the 8 `contextLoads()` (one per service, safe since option B, 2026-10-19) = 527**. (Real `mvn test` totals on 2026-11-02, which already include each service's `contextLoads()`: AuthService 94, APIGateway 93, IncidentService 42, UserService 21. The other modules are as listed, so the grand total is approximate.) ReportingService's wiring test uses a test-only
 `src/test/resources/shedlock_for_tests.sql` so its 3 SLA timers can really run. Run a service's outbox tests
 with `-Dtest=<ServiceName>OutboxTest,OutboxWiringTest,<...>EventsOverKafkaTest`, or ALL of them with
 `./mvnw.cmd -o test`: **since option B (2026-10-19) every `contextLoads()` runs in the test world too** (in-memory
@@ -1068,11 +1068,23 @@ project has been run from IntelliJ (`out/production/` exists at root), not via M
   Spring Cloud Gateway's `ObservedRequestHttpHeadersFilter` printed every request header - the cookie, `Authorization`
   and `X-Internal-Secret`. `application.properties` now sets that one logger to INFO, and `GatewayLogSecretsTest`
   (real logging settings, three secrets sent, break-checked) fails if any of them reaches the log. **Keep that line.
-  Never log a header value**, and read a new DEBUG logger's output before turning it on. The rest of BCR-04 (a `prod`
-  profile with INFO, `/actuator` login check) is still open.
+  Never log a header value**, and read a new DEBUG logger's output before turning it on. **Rest of BCR-04, done
+  2026-11-02 (branch `gateway-prod-settings`):** `APIGateway/src/main/resources/application-prod.properties`, used only
+  with `SPRING_PROFILES_ACTIVE=prod`: gateway logs at INFO, and `/actuator` on its own port (`managementport`, default
+  8092) bound to 127.0.0.1, so nginx (which only forwards to 8082) can never reach it. No profile = the laptop, unchanged
+  (DEBUG, `/actuator` on 8082). `GatewayProdProfileTest` and `GatewayLaptopSettingsTest` check both sides. **Always
+  start the gateway with the `prod` profile on a server.**
 - **Roles change only through `UpdateRoleService` (issue 67)** - never by a hand edit in MySQL: a hand edit sends no
   `roles.update` (UserService keeps the old roles) and leaves no audit row. Its transaction locks the ADMIN role row
   first; keep that line, or two admins removing each other at once can leave zero admins (proved by a test).
+- **Status changes follow one table (BCR-03, 2026-11-02):** `IncidentStatus.allowedNext()` - OPEN/ASSIGNED/REOPENED
+  -> IN_PROGRESS or RESOLVED; IN_PROGRESS -> RESOLVED; RESOLVED -> CLOSED or REOPENED; CLOSED -> REOPENED. Anything
+  else (the same status again, or ASSIGNED, which only the assign endpoint sets) -> `409 INVALID_STATUS_TRANSITION`.
+  "Who" (403) is checked before "which" (409). Engineers may close and reopen their own incidents (owner's decision).
+  `IncidentRulesTest.everyStatusChangeFollowsTheTable` holds its OWN copy of the table on purpose; change both, and the
+  frontend's `statusFlow.ts`, together.
+- **`POST /users/lookup` (BCR-05, 2026-11-02)** gives any logged-in user `{userid, username}` for at most 100 ids.
+  `UserNameDTO` must only ever hold those two fields (no email, status or roles; `UserLookupTest` checks the JSON).
 - **`Incident` has `@Version` (issue 64).** Never set `version` by hand and never build an `Incident` with an existing
   id to save it (Spring Data would treat a null version as a NEW row). Load it, change it, save it. A conflict is
   `409 CONCURRENT_UPDATE` from `common-web` - do not catch `OptimisticLockingFailureException` in a service.

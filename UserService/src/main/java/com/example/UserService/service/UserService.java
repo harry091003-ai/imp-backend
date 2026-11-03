@@ -372,6 +372,17 @@ return users.map(user -> UserSearchResponseDTO.builder()
         return toValidationDTO(user);
     }
 
+    // BCR-05: names for the ids one screen shows, in one query. Only the id and the name come back (see UserNameDTO).
+    // An unknown id is left out; the same id twice comes back once (the database returns each row once).
+    public List<UserNameDTO> lookupUserNames(List<UUID> userIds){
+        if (userIds.isEmpty()) {
+            return List.of();
+        }
+        return userRepository.findAllById(userIds).stream()
+                .map(user -> UserNameDTO.builder().userid(user.getUserid()).username(user.getUsername()).build())
+                .toList();
+    }
+
     // AI plan phase 1: the same answer for many users, in one query (the roles are loaded with the users).
     public List<UserValidationDTO> LimitedUsersInfoForValidation(List<UUID> userIds){
         return userRepository.findWithRolesByUseridIn(userIds).stream().map(UserService::toValidationDTO).toList();

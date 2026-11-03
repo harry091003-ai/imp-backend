@@ -65,6 +65,14 @@ public class UserController {
     }
 
 
+    // BCR-05: names for user ids, so screens show "Priya" instead of a long id. Any logged-in user
+    // (SecurityConfig lets every role into /users/**): inside one company everyone may see who is who.
+    // POST, not GET, because the ids travel in the body. At most 100 ids; only id + name come back, never an email.
+    @PostMapping("/lookup")
+    public ResponseEntity<List<UserNameDTO>> lookupUserNames(@Valid @RequestBody UserLookupRequestDTO request) {
+        return ResponseEntity.ok(service.lookupUserNames(request.getIds()));
+    }
+
     @GetMapping("/me")
     public ResponseEntity<UserResponseDTO> getOwnDetails(Authentication authentication) {
         UserResponseDTO UserDto = service.GetOwnDetails(authentication);

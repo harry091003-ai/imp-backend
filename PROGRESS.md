@@ -38,7 +38,10 @@ Last updated: 2026-10-24
 | Option B (2026-10-19) | The 8 auto-generated `contextLoads()` tests no longer touch the real system | ✅ Done - "run all tests" is safe on every service (proof below) |
 | Small bugs (2026-10-19) | Issues 4, 3, 56, 64, 1 - one at a time, test first | ✅ All 5 done (bug 5 on 2026-10-22) |
 | Auth v2 - RSA keys (2026-10-23) | Only AuthService can create tokens; the gateway can only check them | ✅ Done - all 6 steps. Step 5 (real keys + hand test through the gateway) passed 2026-10-26 |
-| BCR-01 - real visitor address behind nginx (2026-11-02) | Login, signup and refresh limits were shared by every visitor behind nginx | ✅ Code + tests done on branch `gateway-real-client-ip` (gateway 89), **not committed or merged**, not tried by hand - see "BCR-01" below |
+| BCR-05 - names for user ids (2026-11-02) | Screens showed long ids; no endpoint turned an id into a name | ✅ Code + tests done on branch `gateway-prod-settings` (UserService 21), **not committed or merged**, not tried by hand - see "BCR-05" below |
+| BCR-03 - server-side status rules (2026-11-02) | Any allowed caller could make any status change (CLOSED -> OPEN, ASSIGNED with nobody) | ✅ Code + tests done on branch `gateway-prod-settings` (IncidentService 42), **not committed or merged**, not tried by hand - see "BCR-03" below |
+| BCR-04 rest - gateway production settings (2026-11-02) | A `prod` profile: INFO logs, `/actuator` on its own port for this machine only | ✅ Code + tests done on branch `gateway-prod-settings` (gateway 93), **not committed or merged**, not tried by hand - see "BCR-04 rest" below |
+| BCR-01 - real visitor address behind nginx (2026-11-02) | Login, signup and refresh limits were shared by every visitor behind nginx | ✅ Committed `eaeaa89` on branch `gateway-real-client-ip` (gateway 89), **not merged**, not tried by hand - see "BCR-01" below |
 | BCR-02 - refresh token in an HttpOnly cookie (2026-11-02) | For the browser frontend: the token never appears in JSON | ✅ Committed `c6b022e` on branch `auth-refresh-cookie` (AuthService 94, gateway 78, plus the gateway log leak fix), **not merged**, not tried by hand - see "BCR-02" below |
 | Auth v2 part B - refresh tokens (2026-10-27) | Access token 15 min + refresh token 7 days, used once, cancelled on logout | ✅ Code + tests done (AuthService 65, gateway 69). **Not yet tried by hand on the real system** (Flyway `V6` runs at the next AuthService start) - see "Auth v2 part B" below |
 | Issue 68 + security batch (2026-10-28) | Wrong old password counts in the lockout; issues 49, 11, 10, 5, 7, 2, 51 | ✅ Code + tests done, all test-first (AuthService 80, gateway 76, all 6 services green). **Not yet tried by hand** - see "Issue 68 and the security clean-up batch" below |
@@ -3193,6 +3196,147 @@ new `TraceIdFilter`.
 5. `POST /password/update` with a wrong old password 5 times -> 401 x5, then login gives `ACCOUNT_LOCKED`.
    (Use a test account: it stays locked for 15 minutes.)
 6. Optional: AI endpoints with POST.
+
+---
+
+## BCR-03 - server-side status rules (2026-11-02)
+
+**Status: code + tests done on branch `gateway-prod-settings` (same branch as BCR-04 rest, which was not committed
+yet), NOT committed or merged. Not tried by hand.** Simple explanation: `notes/status-rules-and-names.md`.
+
+### The problem
+`updateIncidentStatusBasedOnRole` checked WHO may change the status, never WHICH change. Any allowed caller could move
+CLOSED back to OPEN, or set ASSIGNED with nobody assigned. Hiding buttons in the frontend protected nothing.
+
+### The rules (owner's decision: engineers may also close and reopen)
+| From | Allowed next |
+|---|---|
+| OPEN | IN_PROGRESS, RESOLVED |
+| ASSIGNED | IN_PROGRESS, RESOLVED |
+| IN_PROGRESS | RESOLVED |
+| RESOLVED | CLOSED, REOPENED |
+| CLOSED | REOPENED |
+| REOPENED | IN_PROGRESS, RESOLVED |
+
+ASSIGNED only through the assign endpoint. The same status again is refused. Anything else ->
+`409 INVALID_STATUS_TRANSITION` with a message naming the allowed next statuses (for ASSIGNED: "use assign").
+**One change from the proposed table:** REOPENED may go straight to RESOLVED (proposed: IN_PROGRESS only). The existing
+test `resolvingAgainMayUseTheTextsSavedEarlier` covers that real case, and OPEN may already do the same.
+Engineers: no change needed. The "who" rule already lets an engineer change an incident they created or are assigned.
+
+### Files
+| File | Change |
+|---|---|
+| `IncidentService/.../entity/IncidentStatus.java` | `allowedNext()` - the table |
+| `IncidentService/.../service/IncidentService.java` | the 409 check, after the 403 check, before the root-cause check |
+| `IncidentService/src/test/.../IncidentRulesTest.java` | + 6 tests |
+| `IMP Frontend/src/features/incidents/components/statusFlow.ts` | REOPENED also offers Resolve; comment now says the backend enforces it |
+| `IMP Frontend/src/mocks/handlers.ts` | the mock refuses the same changes with the same 409 |
+
+### Tests
+**IncidentService 42 pass (was 36).** Test first: on the old code 4 of the 6 failed (OPEN -> OPEN, CLOSED -> OPEN,
+same status, ASSIGNED by hand were all accepted). `anEngineerMayCloseAndReopenTheirOwnIncident` and
+`anOutsiderGets403EvenForAWrongChange` passed before: they pin existing behaviour. `everyStatusChangeFollowsTheTable`
+tries all 36 pairs as an admin and holds its own copy of the table. Break check: letting CLOSED go to OPEN -> 2 tests fail.
+
+### Hand test (owner)
+1. An incident in IN_PROGRESS: `PUT /incidents/{id}/status` `{"status":"CLOSED"}` -> `409 INVALID_STATUS_TRANSITION`.
+2. The same with `{"status":"ASSIGNED"}` -> 409, message says to use assign.
+3. Resolve it (root cause + notes) -> 200; then CLOSED -> 200; then REOPENED -> 200 (as the assigned engineer).
+4. In the app, the detail page only offers the allowed buttons.
+
+---
+
+## BCR-05 - names for user ids (2026-11-02)
+
+**Status: code + tests done on branch `gateway-prod-settings`, NOT committed or merged. Not tried by hand.**
+
+### The problem
+Incidents, alerts, audit rows and AI results hold only user ids. Engineers had no endpoint to turn an id into a name
+(the batch one is internal only), so screens showed a short id.
+
+### The fix
+`POST /users/lookup` with `{"ids": [...]}` -> `[{"userid": ..., "username": ...}]`.
+- Any logged-in user (`/users/**` already admits every role). Owner's decision: inside one company everyone may see names.
+- At most 100 ids (`@Size`), no empty ids, `ids` required -> otherwise 400. An unknown id is left out; the same id
+  twice comes back once. ONLY id and name: no email, status or roles.
+- Frontend: `capabilities.ts` `userNames: true`; `fetchUserNames` sends a longer list in calls of at most 100.
+
+### Files
+| File | Change |
+|---|---|
+| `UserService/.../dto/UserLookupRequestDTO.java`, `UserNameDTO.java` | NEW |
+| `UserService/.../service/UserService.java` | `lookupUserNames` (one query, `findAllById`) |
+| `UserService/.../controller/UserController.java` | `POST /users/lookup` |
+| `UserService/src/test/.../UserLookupControllerTest.java` | NEW - 5 tests (web side) |
+| `UserService/src/test/.../UserLookupTest.java` | NEW - 5 tests (real database, H2) |
+| `IMP Frontend/src/shared/lib/api/capabilities.ts`, `src/features/users/api/index.ts`, `src/test/api-contract.test.ts` | switch on, batches of 100, + 1 test |
+
+### Tests
+**UserService 21 pass (was 11).** Test first: on the old code all 5 controller tests failed with 404 (no endpoint).
+`UserLookupTest` could not compile before (the method did not exist). It checks the names, that the JSON has no email,
+status or roles, unknown ids left out, duplicates once, an empty list. Break check: without the 100 limit,
+`moreThanOneHundredIdsAreRefused` fails. Frontend 154 pass (+1: 250 ids go as 100 + 100 + 50).
+
+### Hand test (owner)
+`POST /users/lookup` through the gateway with any user's token and two real ids -> both names. With 101 ids -> 400.
+In the app (`VITE_API_MOCKING=false`): names instead of short ids on the incident list, detail and alerts.
+
+---
+
+## BCR-04 rest - the gateway's production settings (2026-11-02)
+
+**Status: code + tests done on branch `gateway-prod-settings` (made from `gateway-real-client-ip` at `eaeaa89`), NOT
+committed or merged. Not tried by hand.** Plain-English explanation with pictures: `notes/production-settings.md`.
+
+### The problem
+- The gateway logs at DEBUG: a lot of detail about every request. Fine on the laptop, too much on a server (and the
+  kind of log where secrets leaked before - the first piece of BCR-04).
+- `/actuator` (health, metrics, circuit breaker pages) has no login check. Today only this machine can reach the
+  gateway (`server.address=127.0.0.1`), but after deployment nginx forwards `/api/...` to it, so anyone could open
+  `/api/actuator/...` through nginx.
+
+### The fix
+NEW `APIGateway/src/main/resources/application-prod.properties`, used only with the `prod` profile
+(`SPRING_PROFILES_ACTIVE=prod`, or `--spring.profiles.active=prod`):
+- `logging.level.org.springframework.cloud.gateway=INFO`
+- `management.server.port=${managementport:8092}` and `management.server.address=127.0.0.1`: `/actuator` gets its own
+  port, open to this machine only. nginx only forwards to 8082, so it can never reach it.
+
+No profile (the laptop) = nothing changes: DEBUG logs, `/actuator` on 8082. `application.properties` got a comment only.
+
+### Files
+| File | Change |
+|---|---|
+| `APIGateway/src/main/resources/application-prod.properties` | NEW - the two production settings |
+| `APIGateway/src/main/resources/application.properties` | a comment pointing to the prod file |
+| `APIGateway/src/test/.../GatewayProdProfileTest.java` | NEW - 3 tests with the real prod file |
+| `APIGateway/src/test/.../GatewayLaptopSettingsTest.java` | NEW - 1 test: no profile works as before |
+
+### Tests
+**Gateway 93 pass (was 89).**
+- **Test first:** on the old code all 3 prod tests failed: `/actuator/health` answered 200 on the main port (should be
+  404), there was no separate port, and the gateway logged at DEBUG. The laptop test passed (it describes today, which
+  must stay the same).
+- **Break check:** without `management.server.address=127.0.0.1` the test "open to this machine only" fails.
+- Honest limit: a test cannot connect from a second computer, so "this machine only" is checked through the setting
+  in effect, not by a real outside connection.
+
+### Hand test (owner) - to do
+1. Start the gateway with `SPRING_PROFILES_ACTIVE=prod` (plus the usual variables).
+2. `curl -i http://127.0.0.1:8082/actuator/health` -> `404`.
+3. `curl -i http://127.0.0.1:8092/actuator/health` -> `200` `{"status":"UP"}`.
+4. Log in once through the gateway: the log shows INFO lines only, no `DEBUG`.
+5. Start without the profile: `/actuator/health` on 8082 -> `200` again, DEBUG lines back.
+
+### Known limits
+- **Remember the profile on the server.** Without it the gateway runs with the laptop settings.
+- In Docker, `127.0.0.1` means the gateway's own container: use `docker exec <container> curl http://127.0.0.1:8092/...`.
+  A Docker health check inside the container works the same way.
+- `server.address=127.0.0.1` (the main port, from Track B1) will need a change if nginx runs in a SEPARATE container:
+  a job for the Phase 5 Docker files.
+- Only the gateway has DEBUG logs and an open `/actuator` route through nginx; the other services are not reachable
+  through nginx at all, so they need no prod profile for this.
 
 ---
 
