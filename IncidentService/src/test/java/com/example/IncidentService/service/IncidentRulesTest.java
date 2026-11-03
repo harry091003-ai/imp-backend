@@ -529,4 +529,89 @@ class IncidentRulesTest {
         String payload = jdbc.queryForObject("SELECT payload FROM outbox_event", String.class);
         assertTrue(payload.contains("\"environment\":\"PRODUCTION\""), payload);
     }
+
+    // ================================================================== BCR-03: which status change is allowed
+
+    // Written here on purpose, not read from the code, so a wrong rule in the code cannot also make this test right.
+    // ASSIGNED is reached only through the assign endpoint, so no status change leads to it.
+    // REOPENED may go straight to RESOLVED, like OPEN (see resolvingAgainMayUseTheTextsSavedEarlier).
+    private static final Map<IncidentStatus, Set<IncidentStatus>> ALLOWED_NEXT = Map.of(
+            IncidentStatus.OPEN, Set.of(IncidentStatus.IN_PROGRESS, IncidentStatus.RESOLVED),
+            IncidentStatus.ASSIGNED, Set.of(IncidentStatus.IN_PROGRESS, IncidentStatus.RESOLVED),
+            IncidentStatus.IN_PROGRESS, Set.of(IncidentStatus.RESOLVED),
+            IncidentStatus.RESOLVED, Set.of(IncidentStatus.CLOSED, IncidentStatus.REOPENED),
+            IncidentStatus.CLOSED, Set.of(IncidentStatus.REOPENED),
+            IncidentStatus.REOPENED, Set.of(IncidentStatus.IN_PROGRESS, IncidentStatus.RESOLVED));
+
+    // All 36 pairs: every allowed change works, every other one is refused with 409 and changes nothing.
+    // An admin does it, so only the status rule can say no.
+    @Test
+    void everyStatusChangeFollowsTheTable() {
+        for (IncidentStatus from : IncidentStatus.values()) {
+            for (IncidentStatus to : IncidentStatus.values()) {
+                jdbc.update("DELETE FROM outbox_event");
+                Incident incident = incident(engineerA, from, engineerA, "pool too small", "raised pool to 50");
+                String pair = from + " -> " + to;
+
+                if (ALLOWED_NEXT.get(from).contains(to)) {
+                    changeStatus(incident, admin, "ROLE_ADMIN", to, null, null);
+                    assertEquals(to, reload(incident).getIncidentStatus(), pair + " should be allowed");
+                } else {
+                    ConflictException error = assertThrows(ConflictException.class,
+                            () -> changeStatus(incident, admin, "ROLE_ADMIN", to, null, null), pair + " should be refused");
+                    assertEquals("INVALID_STATUS_TRANSITION", error.getErrorCode(), pair);
+                    assertEquals(from, reload(incident).getIncidentStatus(), pair + ": status not changed");
+                    assertEquals(0, outboxRows(), pair + ": a refused change sends no event");
+                }
+            }
+        }
+    }
+
+    @Test
+    void aClosedIncidentCannotGoBackToOpen() {
+        Incident incident = incident(engineerA, IncidentStatus.CLOSED, engineerA, "pool too small", "raised pool to 50");
+
+        refused(ConflictException.class, "INVALID_STATUS_TRANSITION", () ->
+                changeStatus(incident, admin, "ROLE_ADMIN", IncidentStatus.OPEN, null, null));
+    }
+
+    // ASSIGNED with nobody assigned would be a lie on the screen. The assign endpoint sets it, with an engineer.
+    @Test
+    void theStatusChangeCannotSetAssigned() {
+        Incident incident = incident(engineerA, IncidentStatus.OPEN, null, null, null);
+
+        ConflictException error = assertThrows(ConflictException.class, () ->
+                changeStatus(incident, admin, "ROLE_ADMIN", IncidentStatus.ASSIGNED, null, null));
+        assertEquals("INVALID_STATUS_TRANSITION", error.getErrorCode());
+        assertTrue(error.getMessage().contains("assign"), "the message says to use assign: " + error.getMessage());
+    }
+
+    @Test
+    void theSameStatusAgainIsRefused() {
+        Incident incident = incident(engineerA, IncidentStatus.IN_PROGRESS, engineerA, null, null);
+
+        refused(ConflictException.class, "INVALID_STATUS_TRANSITION", () ->
+                changeStatus(incident, engineerA, "ROLE_ENGINEER", IncidentStatus.IN_PROGRESS, null, null));
+    }
+
+    // The owner's decision (2026-11-02): an engineer may close and reopen an incident of theirs.
+    @Test
+    void anEngineerMayCloseAndReopenTheirOwnIncident() {
+        Incident incident = incident(engineerA, IncidentStatus.RESOLVED, engineerA, "pool too small", "raised pool to 50");
+
+        changeStatus(incident, engineerA, "ROLE_ENGINEER", IncidentStatus.CLOSED, null, null);
+        assertEquals(IncidentStatus.CLOSED, reload(incident).getIncidentStatus());
+
+        changeStatus(incident, engineerA, "ROLE_ENGINEER", IncidentStatus.REOPENED, null, null);
+        assertEquals(IncidentStatus.REOPENED, reload(incident).getIncidentStatus());
+    }
+
+    // "Who" is still checked before "which": someone with no right to the incident learns nothing about its status.
+    @Test
+    void anOutsiderGets403EvenForAWrongChange() {
+        Incident incident = incident(engineerA, IncidentStatus.CLOSED, engineerA, null, null);
+
+        refused(ForbiddenException.class, "INCIDENT_STATUS_UPDATE_DENIED", () ->
+                changeStatus(incident, engineerB, "ROLE_ENGINEER", IncidentStatus.OPEN, null, null));
+    }
 }

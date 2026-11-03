@@ -537,6 +537,17 @@ return incident;
                     "You are not allowed to update the status of this incident.");
         }
 
+        // BCR-03: "who" is checked above, "which change" here. Hiding buttons in the UI protects nothing.
+        IncidentStatus currentStatus = incident.getIncidentStatus();
+        IncidentStatus newStatus = request.getStatus();
+        if (!currentStatus.allowedNext().contains(newStatus)) {
+            String message = newStatus == IncidentStatus.ASSIGNED
+                    ? "An incident becomes ASSIGNED only when it is assigned to an engineer. Use assign instead."
+                    : "An incident that is " + currentStatus + " cannot be changed to " + newStatus
+                            + ". Allowed next: " + currentStatus.allowedNext() + ".";
+            throw new ConflictException("INVALID_STATUS_TRANSITION", message);
+        }
+
         // Issue 3 (bug 1): a missing or blank text keeps the saved one (REOPENED no longer erases it).
         String rootCause = StringUtils.hasText(request.getRootCause()) ? request.getRootCause() : incident.getRootCause();
         String resolutionNotes = StringUtils.hasText(request.getResolutionNotes()) ? request.getResolutionNotes() : incident.getResolutionNotes();
