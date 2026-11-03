@@ -1,10 +1,11 @@
 # =============================================================================
 # Incident Management Platform - root .gitignore
 #
-# This repo is LOCAL ONLY. It has no remote and is not meant to get one.
-# Its purpose is an undo button and a readable diff of every change.
+# Since 2026-11-04 this repo also lives on GitHub (private), as the off-laptop
+# backup and for CI. Secrets never go there: they come from environment variables.
+# The full rules: IMP Frontend/docs/secrets-and-github.md.
 #
-# That second purpose is why this file matters: ~750 MB of build output lives
+# This file also keeps "git diff" readable: ~750 MB of build output lives
 # under the target/ folders. If those were tracked, every "git diff" would be
 # unreadable and the repo would be useless for reviewing changes.
 # =============================================================================
@@ -86,3 +87,7 @@ notes/
 # these lines are only a safety net if one lands here by mistake.
 *.pem
 *.key
+# Certificate and key stores (HTTPS, deployment). They hold private keys too.
+*.p12
+*.pfx
+*.jks
